@@ -1,0 +1,199 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff + mypy)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: detector
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "detector/pyproject.toml"
+
+      - run: uv sync --all-extras
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      - name: mypy --strict
+        run: uv run mypy --strict src
+
+  test:
+    name: Test (pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: detector
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "detector/pyproject.toml"
+
+      - run: uv sync --all-extras
+      - run: uv run pytest --cov=promanomaly --cov-report=xml
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coverage
+          path: detector/coverage.xml
+          if-no-files-found: ignore
+
+  chart-lint:
+    name: Lint Helm charts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # chart-testing diffs against the base branch to find changed
+          # charts; without history its --target-branch comparison sees
+          # nothing and the lint job becomes a no-op.
+          fetch-depth: 0
+
+      - uses: azure/setup-helm@v5
+        with:
+          version: latest
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install chart-testing
+        uses: helm/chart-testing-action@v2.8.0
+
+      - name: Register Helm repositories
+        run: |
+          helm repo add victoria-metrics https://victoriametrics.github.io/helm-charts/
+          helm repo update
+
+      - name: helm dependency update
+        run: |
+          helm dependency update charts/promanomaly       || true
+          helm dependency update charts/promanomaly-stack || true
+
+      - name: ct lint
+        run: |
+          ct lint \
+            --charts charts/promanomaly,charts/promanomaly-stack \
+            --validate-maintainers=false \
+            --check-version-increment=false \
+            --target-branch ${{ github.event.repository.default_branch }}
+
+      - name: helm lint --strict
+        run: |
+          helm lint --strict charts/promanomaly
+          helm lint --strict charts/promanomaly-stack
+
+      - name: Install kubeconform
+        run: |
+          curl -sSLo kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz
+          tar xf kubeconform.tar.gz
+          sudo install kubeconform /usr/local/bin/
+
+      - name: kubeconform
+        run: |
+          helm template charts/promanomaly       | kubeconform -strict -summary -ignore-missing-schemas
+          helm template charts/promanomaly-stack | kubeconform -strict -summary -ignore-missing-schemas
+
+      - name: chart-testing values matrix (lint + render + kubeconform)
+        # ct lint already exercises the ci/ values files, but we
+        # additionally render each one through kubeconform so any
+        # conditional template that produces an invalid manifest under
+        # a non-default values combination fails the build. Lint-only
+        # equivalent of `ct install` for clusters where spinning up
+        # kind in CI is too expensive.
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          fail=0
+          for chart in charts/promanomaly charts/promanomaly-stack; do
+            for vf in "$chart"/ci/*-values.yaml; do
+              echo "::group::render $chart with $(basename "$vf")"
+              if ! helm template "$chart" --values "$vf" \
+                  | kubeconform -strict -summary -ignore-missing-schemas; then
+                echo "::error file=$vf::kubeconform failed for $chart with $(basename "$vf")"
+                fail=1
+              fi
+              echo "::endgroup::"
+            done
+          done
+          exit $fail
+
+  labels-contract:
+    name: LABELS_CONTRACT.md parity with promforecast
+    # Output labels on metrics describing the same underlying signal must
+    # match between promforecast and promanomaly so the two can be joined
+    # in PromQL without label-rewriting recording rules. CI checks both
+    # repos commit the same contract file.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Fetch promforecast LABELS_CONTRACT.md
+        run: |
+          curl -fsSLo /tmp/promforecast-LABELS_CONTRACT.md \
+            https://raw.githubusercontent.com/esops-dev/promforecast/main/LABELS_CONTRACT.md
+
+      - name: Diff against local copy
+        run: |
+          diff -u /tmp/promforecast-LABELS_CONTRACT.md LABELS_CONTRACT.md \
+            && echo "LABELS_CONTRACT.md matches promforecast"
+
+  container:
+    name: Build container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: detector
+          push: false
+          load: true
+          tags: promanomaly:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install Trivy
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Trivy scan
+        run: |
+          trivy image \
+            --format table \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --exit-code 0 \
+            promanomaly:ci

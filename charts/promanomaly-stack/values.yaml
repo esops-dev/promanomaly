@@ -1,0 +1,24 @@
+# Umbrella chart values. Subchart values are nested under each
+# subchart's release name; promanomaly's own values flow through under
+# .promanomaly, VictoriaMetrics' under .victoria-metrics-single.
+
+promanomaly:
+  enabled: true
+  datasource:
+    # ``fullnameOverride`` below pins the VictoriaMetrics Service name
+    # to ``promanomaly-vm`` regardless of release name, so this URL is
+    # stable across deployments. Override only when wiring the detector
+    # to a different TSDB.
+    url: http://promanomaly-vm-server:8428/
+
+victoria-metrics-single:
+  enabled: true
+  # Pin the rendered fullname so the subchart's Service is named
+  # ``promanomaly-vm-server`` regardless of helm release name.
+  fullnameOverride: promanomaly-vm
+  server:
+    retentionPeriod: 30
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi

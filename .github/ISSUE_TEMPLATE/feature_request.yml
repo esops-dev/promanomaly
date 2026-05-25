@@ -1,0 +1,45 @@
+name: Feature request
+description: Propose a new detector, feature, or configuration knob.
+labels: [enhancement, triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before opening a feature request, please check whether the
+        problem can be solved with a Prometheus recording rule on the
+        existing anomaly metrics, an Alertmanager silence, or a `for:`
+        clause on the alert rule — that is often the right answer.
+
+        Forecasting requests belong in
+        [promforecast](https://github.com/esops-dev/promforecast).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Focus on the user problem, not the implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How could promanomaly help? Sketch config / metric names if relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Recording rules, Alertmanager silences, `for:` clauses, sibling tools, doing nothing.
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+    validations:
+      required: false

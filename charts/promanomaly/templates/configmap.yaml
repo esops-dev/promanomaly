@@ -1,0 +1,53 @@
+{{- if not .Values.existingConfigMap -}}
+{{- /*
+  Empty .Values.groups renders a config that the detector's pydantic
+  schema will reject with a clear error, so the pod CrashLoopBackOffs
+  with an actionable message rather than running uselessly. We do NOT
+  `fail` here because that would also break ``helm template`` and the
+  chart-lint CI job, which renders with default values.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "promanomaly.configMapName" . }}
+  labels: {{- include "promanomaly.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    apiVersion: promanomaly.io/v1alpha1
+    datasource:
+      url: {{ .Values.datasource.url | quote }}
+      timeout: {{ .Values.datasource.timeout | quote }}
+      auth:
+        type: {{ .Values.datasource.auth.type | quote }}
+    server:
+      listen: {{ .Values.server.listen | quote }}
+      refresh_interval: {{ .Values.server.refresh_interval | quote }}
+      reload:
+        enabled: {{ .Values.server.reload.enabled }}
+        watch_configmap: {{ .Values.server.reload.watch_configmap }}
+        auth:
+          type: {{ .Values.server.reload.auth.type | quote }}
+    safety:
+      max_series_per_query: {{ .Values.safety.max_series_per_query }}
+      max_total_series: {{ .Values.safety.max_total_series }}
+      series_overflow: {{ .Values.safety.series_overflow | quote }}
+      detect_timeout: {{ .Values.safety.detect_timeout | quote }}
+      query_timeout: {{ .Values.safety.query_timeout | quote }}
+      on_source_failure: {{ .Values.safety.on_source_failure | quote }}
+      {{- with .Values.safety.fail_ready_after }}
+      fail_ready_after: {{ . }}
+      {{- end }}
+    defaults:
+      window: {{ .Values.defaults.window | quote }}
+      step: {{ .Values.defaults.step | quote }}
+      min_points: {{ .Values.defaults.min_points }}
+      warmup_policy: {{ .Values.defaults.warmup_policy | quote }}
+      emit_baseline: {{ .Values.defaults.emit_baseline }}
+      emit_change_points: {{ .Values.defaults.emit_change_points }}
+      emit_baseline_stability: {{ .Values.defaults.emit_baseline_stability }}
+      emit_duration: {{ .Values.defaults.emit_duration }}
+      alert_thresholds:
+        score: {{ .Values.defaults.alert_thresholds.score }}
+    groups:
+{{ toYaml .Values.groups | indent 6 }}
+{{- end }}

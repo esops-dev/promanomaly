@@ -1,0 +1,164 @@
+{{- /*
+  DRIFT GUARD: the standalone reference manifest at
+  ``examples/alerts/promanomaly-rules.yaml`` is the canonical source for
+  the alert name set and ``expr`` shape. This template renders the same
+  alerts with parameterised thresholds. The
+  ``tests/test_prometheus_rules_parity.py`` test fails when either file
+  drops or renames an alert the other still has — adding or removing an
+  alert is a coordinated change against both files.
+*/ -}}
+{{- if .Values.prometheusRule.enabled -}}
+{{- $rules := .Values.prometheusRule.rules -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "promanomaly.fullname" . }}
+  {{- with .Values.prometheusRule.namespace }}
+  namespace: {{ . }}
+  {{- end }}
+  labels:
+    {{- include "promanomaly.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: promanomaly.anomalies
+      interval: 30s
+      rules:
+        {{- with $rules.anomalyOutsideThreshold }}
+        {{- if .enabled }}
+        - alert: AnomalyOutsideThreshold
+          expr: anomaly_outside_threshold == 1
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "Anomaly score above threshold for {{ "{{" }} $labels.id {{ "}}" }} ({{ "{{" }} $labels.group {{ "}}" }})"
+            description: |
+              Detector {{ "{{" }} $labels.detector {{ "}}" }} reported
+              anomaly_outside_threshold=1 for at least {{ .for }} on series
+              id={{ "{{" }} $labels.id {{ "}}" }} group={{ "{{" }} $labels.group {{ "}}" }}.
+        {{- end }}
+        {{- end }}
+        {{- with $rules.anomalyLongRunning }}
+        {{- if .enabled }}
+        - alert: AnomalyLongRunning
+          expr: anomaly_duration_seconds > {{ .durationSeconds }}
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "Anomaly sustained for {{ "{{" }} $labels.id {{ "}}" }} ({{ "{{" }} $labels.group {{ "}}" }})"
+            description: |
+              anomaly_duration_seconds has exceeded {{ .durationSeconds }}s
+              for at least {{ .for }} — the underlying threshold breach has
+              been continuous well beyond normal alert flap windows.
+        {{- end }}
+        {{- end }}
+        {{- with $rules.anomalyEnsembleAgreement }}
+        {{- if .enabled }}
+        - alert: AnomalyEnsembleAgreement
+          expr: anomaly_composite_outside_threshold == 1
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "Ensemble agreement on anomaly for {{ "{{" }} $labels.id {{ "}}" }} ({{ "{{" }} $labels.group {{ "}}" }})"
+            description: |
+              Multiple detectors agree the signal is anomalous.
+              High precision; investigate even with a short for: clause.
+        {{- end }}
+        {{- end }}
+        {{- with $rules.anomalyChangePoint }}
+        {{- if .enabled }}
+        - alert: AnomalyChangePoint
+          expr: increase(anomaly_change_point_total[{{ .window }}]) > 0
+          for: 0m
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "Change-point detected on {{ "{{" }} $labels.id {{ "}}" }} ({{ "{{" }} $labels.group {{ "}}" }})"
+            description: |
+              A change-point detector reported a regime shift in the
+              last {{ .window }}. Useful as context, not necessarily a page.
+        {{- end }}
+        {{- end }}
+        {{- with $rules.anomalySignalMissing }}
+        {{- if .enabled }}
+        - alert: AnomalySignalMissing
+          expr: anomaly_signal_missing == 1
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "Expected signal {{ "{{" }} $labels.id {{ "}}" }} ({{ "{{" }} $labels.group {{ "}}" }}) missing"
+            description: |
+              A query configured with expect:true has returned no
+              series for at least the configured grace runs.
+        {{- end }}
+        {{- end }}
+    - name: promanomaly.operational
+      interval: 30s
+      rules:
+        {{- with $rules.anomalyStale }}
+        {{- if .enabled }}
+        - alert: AnomalyStale
+          expr: time() - anomaly_last_run_timestamp_seconds > {{ .maxStaleSeconds }}
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "promanomaly group {{ "{{" }} $labels.group {{ "}}" }} stale"
+            description: |
+              No successful detection run for group {{ "{{" }} $labels.group {{ "}}" }}
+              in over {{ .maxStaleSeconds }}s. Check scheduler health
+              and source connectivity.
+        {{- end }}
+        {{- end }}
+        {{- with $rules.anomalyDetectorFailing }}
+        {{- if .enabled }}
+        - alert: AnomalyDetectorFailing
+          expr: rate(anomaly_failures_total[{{ .window }}]) > {{ .rateThreshold }}
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "promanomaly detector {{ "{{" }} $labels.detector {{ "}}" }} failing"
+            description: |
+              Detector failures are exceeding {{ .rateThreshold }}/s for group
+              {{ "{{" }} $labels.group {{ "}}" }} / detector {{ "{{" }} $labels.detector {{ "}}" }}
+              with reason {{ "{{" }} $labels.reason {{ "}}" }}.
+        {{- end }}
+        {{- end }}
+        {{- with $rules.anomalySourceFailing }}
+        {{- if .enabled }}
+        - alert: AnomalySourceFailing
+          expr: rate(anomaly_source_failure_total[{{ .window }}]) > 0
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "promanomaly TSDB queries failing for {{ "{{" }} $labels.group {{ "}}" }}"
+            description: |
+              Source-query failures are non-zero over {{ .window }}. With the
+              default serve_stale policy /metrics is still serving the
+              last good snapshot — scores are stale, not fresh.
+        {{- end }}
+        {{- end }}
+        {{- with $rules.anomalyNotReady }}
+        {{- if .enabled }}
+        - alert: AnomalyNotReady
+          expr: max(anomaly_group_ready) == 0
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "promanomaly has no ready groups"
+            description: |
+              No promanomaly group has completed a successful run in
+              the last {{ .for }}. The pod will fail readiness if the
+              fail_ready policy is configured.
+        {{- end }}
+        {{- end }}
+{{- end }}

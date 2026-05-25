@@ -1,0 +1,11 @@
+promanomaly-stack installed.
+
+The umbrella deploys:
+  - promanomaly  (detector)
+  - victoria-metrics-single (TSDB)
+
+Once both pods are Ready, port-forward the detector to inspect /metrics:
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ .Release.Name }}-promanomaly 9092:9092
+
+Configure detector groups under ``promanomaly.groups`` in your values.
+See the promanomaly chart README for the full value reference.

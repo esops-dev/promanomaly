@@ -1,0 +1,15 @@
+promanomaly detector installed.
+
+To verify:
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "promanomaly.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  curl http://localhost:{{ .Values.service.port }}/metrics
+
+Add detector groups under ``.Values.groups`` and ``helm upgrade`` to pick
+up the new configuration. The detector watches the mounted ConfigMap and
+hot-reloads on change (validation failure rolls back automatically).
+
+Datasource:
+  URL: {{ .Values.datasource.url }}
+
+For a quick-start that includes VictoriaMetrics, install
+``promanomaly-stack`` instead of this chart.

@@ -1,0 +1,11 @@
+# Smoke-test rendering with the chart's hard defaults plus one inline
+# group — without a group the detector pod crashloops at boot, so the
+# default chart-testing scenario must supply one.
+
+groups:
+  - name: ci_default
+    queries:
+      - id: ci_metric
+        promql: up{job="example"}
+        detectors:
+          - name: MAD

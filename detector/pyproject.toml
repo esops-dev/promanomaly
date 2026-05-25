@@ -1,0 +1,93 @@
+[project]
+name = "promanomaly"
+version = "0.0.0"
+description = "Anomaly detection for Prometheus-compatible metrics, exposed as Prometheus metrics."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{ name = "promanomaly maintainers" }]
+keywords = ["prometheus", "anomaly-detection", "observability", "monitoring"]
+
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.10.0",
+    "structlog>=24.4.0",
+    "apscheduler>=3.10.4",
+    "prometheus-client>=0.21.0",
+    "httpx>=0.27.0",
+    "click>=8.1.7",
+    "PyYAML>=6.0.2",
+    "numpy>=2.1.0",
+    "pandas>=2.2.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.7.0",
+    "mypy>=1.13.0",
+    "types-PyYAML",
+    "pandas-stubs",
+]
+
+[project.scripts]
+promanomaly = "promanomaly.cli:main"
+
+[project.entry-points."promanomaly.detectors"]
+MAD = "promanomaly.detectors.mad:MAD"
+Hampel = "promanomaly.detectors.hampel:Hampel"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/promanomaly"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "RUF", "SIM"]
+ignore = [
+    # FastAPI uses B008 (function call in default arg) for Depends().
+    "B008",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["promanomaly"]
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = [
+    "apscheduler.*",
+    "prometheus_client.*",
+    "uvicorn.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["promanomaly"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false

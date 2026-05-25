@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "promanomaly chart values",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["image", "datasource"],
+  "properties": {
+    "image": {
+      "type": "object",
+      "required": ["repository"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string"},
+        "pullPolicy": {"type": "string", "enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "imagePullSecrets": {"type": "array"},
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1,
+      "description": "Single-replica only — HA mode is not yet supported."
+    },
+    "datasource": {
+      "type": "object",
+      "required": ["url"],
+      "properties": {
+        "url": {"type": "string", "minLength": 1},
+        "timeout": {"type": "string"},
+        "auth": {
+          "type": "object",
+          "properties": {
+            "type": {"type": "string", "enum": ["none", "bearer", "basic", "mtls"]},
+            "existingSecret": {"type": "string"}
+          }
+        }
+      }
+    },
+    "server": {
+      "type": "object",
+      "properties": {
+        "listen": {"type": "string"},
+        "refresh_interval": {"type": "string"}
+      }
+    },
+    "safety": {
+      "type": "object",
+      "properties": {
+        "max_series_per_query": {"type": "integer", "minimum": 1},
+        "max_total_series": {"type": "integer", "minimum": 1},
+        "series_overflow": {"type": "string", "enum": ["drop_lowest_priority", "reject", "sample"]},
+        "on_source_failure": {"type": "string", "enum": ["serve_stale", "drop_scores", "fail_ready"]},
+        "fail_ready_after": {"type": "integer", "minimum": 1}
+      }
+    },
+    "defaults": {
+      "type": "object",
+      "properties": {
+        "warmup_policy": {
+          "type": "string",
+          "enum": ["emit_warming_up", "suppress", "emit_with_flag"]
+        }
+      }
+    },
+    "groups": {"type": "array"},
+    "existingConfigMap": {"type": "string"},
+    "service": {"type": "object"},
+    "serviceAccount": {"type": "object"},
+    "resources": {"type": "object"},
+    "podAnnotations": {"type": "object"},
+    "podLabels": {"type": "object"},
+    "securityContext": {"type": "object"},
+    "containerSecurityContext": {"type": "object"},
+    "nodeSelector": {"type": "object"},
+    "tolerations": {"type": "array"},
+    "affinity": {"type": "object"},
+    "serviceMonitor": {"type": "object"},
+    "networkPolicy": {"type": "object"},
+    "prometheusRule": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "namespace": {"type": "string"},
+        "labels": {"type": "object"},
+        "rules": {"type": "object"}
+      }
+    },
+    "strategy": {"type": "object"},
+    "nameOverride": {"type": "string"},
+    "fullnameOverride": {"type": "string"}
+  }
+}

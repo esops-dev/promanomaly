@@ -1,0 +1,25 @@
+apiVersion: v2
+name: promanomaly
+description: |
+  Anomaly detection for Prometheus-compatible metrics, exposed as
+  Prometheus metrics. This chart installs the detector only — bring
+  your own Prometheus/VictoriaMetrics (the umbrella chart
+  ``promanomaly-stack`` bundles VictoriaMetrics for greenfield).
+type: application
+icon: https://raw.githubusercontent.com/esops-dev/promanomaly/main/.github/logo.png
+home: https://github.com/esops-dev/promanomaly
+sources:
+  - https://github.com/esops-dev/promanomaly
+maintainers:
+  - name: promanomaly maintainers
+    url: https://github.com/esops-dev/promanomaly
+keywords:
+  - prometheus
+  - victoriametrics
+  - anomaly-detection
+  - observability
+  - sre
+# Chart and app versions are placeholders intentionally — the release
+# pipeline rewrites both at tag time.
+version: 0.0.0
+appVersion: "0.0.0"
