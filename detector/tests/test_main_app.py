@@ -189,3 +189,33 @@ def test_promqlsource_unused_import_kept() -> None:
     # Lightweight sanity check that the real client class is importable
     # even though every test in this file stubs it out.
     assert PromQLSource is not None
+
+
+def test_debug_detectors_endpoint_lists_built_ins(
+    stub_app: tuple[Application, StubSource],
+) -> None:
+    app, _stub = stub_app
+    with TestClient(app.build_app()) as client:
+        resp = client.get("/debug/detectors")
+        assert resp.status_code == 200
+        payload = resp.json()
+        names = {entry["name"] for entry in payload}
+        # Every built-in detector should be visible from the endpoint —
+        # operators rely on this to confirm their custom image actually
+        # registered what they expect.
+        assert {"MAD", "Hampel", "ZScoreEWMA", "IQR", "HourOfDayMAD"}.issubset(names)
+        mad = next(entry for entry in payload if entry["name"] == "MAD")
+        # Description, defaults, and the canonical params list all come
+        # back. The CLI --target proxies the body verbatim, so this
+        # shape IS the public contract.
+        assert isinstance(mad["description"], str) and mad["description"]
+        assert isinstance(mad["defaults"], dict)
+        assert isinstance(mad["params"], list)
+        # IQR exposes a single ``k`` tunable with type/doc — pin the
+        # detailed shape on one detector that has parameters.
+        iqr = next(entry for entry in payload if entry["name"] == "IQR")
+        params = {p["name"]: p for p in iqr["params"]}
+        assert set(params) == {"k"}
+        assert params["k"]["type"] == "float"
+        assert params["k"]["default"] == 1.5
+        assert params["k"]["doc"]

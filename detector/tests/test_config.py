@@ -146,6 +146,90 @@ def test_aggressive_refresh_flag() -> None:
     assert Config.model_validate(safe).aggressive_refresh is False
 
 
+def test_ensemble_voting_rejects_unreachable_min_detectors() -> None:
+    """voting + min_detectors > every query's detector list is a silent
+    never-fire footgun. The validator should reject the config so the
+    user sees the typo at apply time."""
+    raw = {
+        **MIN_CONFIG,
+        "groups": [
+            {
+                "name": "g1",
+                "ensemble": {"method": "voting", "min_detectors": 5},
+                "queries": [
+                    {
+                        "id": "m",
+                        "promql": "up",
+                        "detectors": [
+                            {"name": "MAD"},
+                            {"name": "Hampel"},
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    with pytest.raises(ValueError, match=r"ensemble\.min_detectors=5"):
+        Config.model_validate(raw)
+
+
+def test_ensemble_voting_allows_mixed_queries() -> None:
+    """voting + min_detectors reachable by at least one query is fine,
+    even when other queries in the same group have fewer detectors
+    (the operator may want a partial composite signal)."""
+    raw = {
+        **MIN_CONFIG,
+        "groups": [
+            {
+                "name": "g1",
+                "ensemble": {"method": "voting", "min_detectors": 3},
+                "queries": [
+                    {
+                        "id": "m_big",
+                        "promql": "up",
+                        "detectors": [
+                            {"name": "MAD"},
+                            {"name": "Hampel"},
+                            {"name": "IQR"},
+                        ],
+                    },
+                    {
+                        "id": "m_small",
+                        "promql": "up{job='x'}",
+                        "detectors": [{"name": "MAD"}],
+                    },
+                ],
+            }
+        ],
+    }
+    cfg = Config.model_validate(raw)
+    assert cfg.groups[0].ensemble is not None
+    assert cfg.groups[0].ensemble.min_detectors == 3
+
+
+def test_ensemble_max_method_does_not_trip_reachability_check() -> None:
+    """``max`` has no min_detectors semantics — any non-empty detector
+    list fires it. The validator must not block ``max`` configs."""
+    raw = {
+        **MIN_CONFIG,
+        "groups": [
+            {
+                "name": "g1",
+                "ensemble": {"method": "max", "min_detectors": 99},
+                "queries": [
+                    {
+                        "id": "m",
+                        "promql": "up",
+                        "detectors": [{"name": "MAD"}],
+                    }
+                ],
+            }
+        ],
+    }
+    cfg = Config.model_validate(raw)
+    assert cfg.groups[0].ensemble is not None
+
+
 def test_load_config_reads_dev_yaml(tmp_path: Path) -> None:
     dev = Path(__file__).resolve().parents[2] / "docker" / "dev-config.yaml"
     cfg = load_config(dev)

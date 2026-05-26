@@ -1,0 +1,138 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "schemaVersion": 38,
+  "title": "promanomaly confidence",
+  "tags": ["promanomaly", "anomaly-detection", "confidence"],
+  "templating": {
+    "list": [
+      {
+        "name": "group",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "query": "label_values(anomaly_confidence_score, group)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true
+      },
+      {
+        "name": "id",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "query": "label_values(anomaly_confidence_score{group=~\"$group\"}, id)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Confidence score per detector",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "anomaly_confidence_score{group=~\"$group\", id=~\"$id\"}",
+          "legendFormat": "{{detector}} {{id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 0.5},
+              {"color": "green", "value": 0.7}
+            ]
+          }
+        }
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Baseline stability per detector",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "anomaly_baseline_stability{group=~\"$group\", id=~\"$id\"}",
+          "legendFormat": "{{detector}} {{id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 0.4},
+              {"color": "green", "value": 0.6}
+            ]
+          }
+        }
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Low-confidence firing right now",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "topk(20, anomaly_confidence_score{group=~\"$group\"} < 0.5 and on (id, group, detector) anomaly_outside_threshold == 1)",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "High-confidence anomalies",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "count(anomaly_outside_threshold{group=~\"$group\"} == 1 and on (id, group, detector) anomaly_confidence_score >= 0.7)",
+          "instant": true
+        }
+      ],
+      "gridPos": {"h": 4, "w": 8, "x": 0, "y": 16}
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Low-confidence anomalies",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "count(anomaly_outside_threshold{group=~\"$group\"} == 1 and on (id, group, detector) anomaly_confidence_score < 0.5)",
+          "instant": true
+        }
+      ],
+      "gridPos": {"h": 4, "w": 8, "x": 8, "y": 16}
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Series with no calibration yet",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "count(anomaly_score{group=~\"$group\"}) - count(anomaly_confidence_score{group=~\"$group\"})",
+          "instant": true
+        }
+      ],
+      "gridPos": {"h": 4, "w": 8, "x": 16, "y": 16}
+    }
+  ]
+}

@@ -39,6 +39,9 @@ promanomaly = "promanomaly.cli:main"
 [project.entry-points."promanomaly.detectors"]
 MAD = "promanomaly.detectors.mad:MAD"
 Hampel = "promanomaly.detectors.hampel:Hampel"
+ZScoreEWMA = "promanomaly.detectors.zscore_ewma:ZScoreEWMA"
+IQR = "promanomaly.detectors.iqr:IQR"
+HourOfDayMAD = "promanomaly.detectors.hour_of_day_mad:HourOfDayMAD"
 
 [build-system]
 requires = ["hatchling"]

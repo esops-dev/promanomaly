@@ -1,0 +1,139 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "schemaVersion": 38,
+  "title": "promanomaly detector comparison",
+  "tags": ["promanomaly", "anomaly-detection", "detectors"],
+  "templating": {
+    "list": [
+      {
+        "name": "group",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "query": "label_values(anomaly_score, group)",
+        "refresh": 2,
+        "multi": false,
+        "includeAll": false
+      },
+      {
+        "name": "id",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "query": "label_values(anomaly_score{group=~\"$group\"}, id)",
+        "refresh": 2,
+        "multi": false,
+        "includeAll": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "anomaly_score by detector",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "anomaly_score{group=~\"$group\", id=~\"$id\"}",
+          "legendFormat": "{{detector}}{{detector_instance}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0}
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "anomaly_outside_threshold by detector",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "anomaly_outside_threshold{group=~\"$group\", id=~\"$id\"}",
+          "legendFormat": "{{detector}}{{detector_instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"min": 0, "max": 1}
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Composite (ensemble) verdict",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "anomaly_composite_score{group=~\"$group\", id=~\"$id\"}",
+          "legendFormat": "composite score"
+        },
+        {
+          "expr": "anomaly_composite_outside_threshold{group=~\"$group\", id=~\"$id\"}",
+          "legendFormat": "composite fires"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "anomaly_duration_seconds by detector",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "anomaly_duration_seconds{group=~\"$group\", id=~\"$id\"}",
+          "legendFormat": "{{detector}}{{detector_instance}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "anomaly_confidence_score by detector",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "anomaly_confidence_score{group=~\"$group\", id=~\"$id\"}",
+          "legendFormat": "{{detector}}{{detector_instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"min": 0, "max": 1}
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "Current per-detector verdict",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "anomaly_score{group=~\"$group\", id=~\"$id\"}",
+          "instant": true,
+          "format": "table",
+          "refId": "score"
+        },
+        {
+          "expr": "anomaly_outside_threshold{group=~\"$group\", id=~\"$id\"}",
+          "instant": true,
+          "format": "table",
+          "refId": "outside"
+        },
+        {
+          "expr": "anomaly_confidence_score{group=~\"$group\", id=~\"$id\"}",
+          "instant": true,
+          "format": "table",
+          "refId": "confidence"
+        },
+        {
+          "expr": "anomaly_baseline_stability{group=~\"$group\", id=~\"$id\"}",
+          "instant": true,
+          "format": "table",
+          "refId": "stability"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 24}
+    }
+  ]
+}

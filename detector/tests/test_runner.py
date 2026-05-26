@@ -72,11 +72,23 @@ async def test_run_group_produces_score_samples(stub_source: StubSource) -> None
     assert result.succeeded
     assert result.series_count == 1
     metrics = {s.metric for s in result.samples}
-    assert metrics == {
+    # The core score-family metrics are always present; confidence /
+    # baseline-stability are emitted when calibration has run, which
+    # the default config (emit_baseline_stability=True) triggers on
+    # this series's first pass.
+    assert {
         "anomaly_score",
         "anomaly_outside_threshold",
         "anomaly_baseline",
         "anomaly_duration_seconds",
+    }.issubset(metrics)
+    assert metrics <= {
+        "anomaly_score",
+        "anomaly_outside_threshold",
+        "anomaly_baseline",
+        "anomaly_duration_seconds",
+        "anomaly_confidence_score",
+        "anomaly_baseline_stability",
     }
     score_sample = next(s for s in result.samples if s.metric == "anomaly_score")
     assert score_sample.label_dict["id"] == "metric_a"

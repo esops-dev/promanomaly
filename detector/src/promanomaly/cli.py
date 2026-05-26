@@ -2,7 +2,8 @@
 
 Subcommands
 -----------
-- ``validate`` — parse YAML and run pydantic validation only.
+- ``validate`` — parse YAML and run pydantic validation; ``--probe``
+  additionally executes every query against the live datasource.
 - ``dry-run`` — validate + execute every group once in-process, then exit.
 - ``detect-once`` — run one detector against an ad-hoc PromQL query.
 - ``detectors list`` — dump the entry-point registry.
@@ -21,13 +22,13 @@ from typing import Any
 
 import click
 
-from .config import load_config, parse_duration
+from .config import Config, load_config, parse_duration
 from .detectors import get as get_detector
 from .detectors import list_meta
 from .exporter import OperationalMetrics
 from .logging import configure_logging
-from .runner import Runner
-from .source import PromQLSource
+from .runner import Runner, _build_detector
+from .source import PromQLSource, SourceQueryError
 from .state import SnapshotStore
 
 
@@ -66,14 +67,154 @@ def cli(ctx: click.Context, config_path: str | None, log_level: str) -> None:
     type=click.Path(exists=True, dir_okay=False),
     required=True,
 )
-def validate(config_path: str) -> None:
-    """Validate a config file against the schema."""
+@click.option(
+    "--probe",
+    is_flag=True,
+    default=False,
+    help=(
+        "After schema validation, execute every query against the live "
+        "datasource and report per-query series counts."
+    ),
+)
+@click.option(
+    "--strict",
+    is_flag=True,
+    default=False,
+    help=(
+        "With --probe, exit non-zero when any query returns zero series "
+        "or errors. Suitable as a pre-deploy CI gate."
+    ),
+)
+@click.option(
+    "--datasource-url",
+    default=None,
+    help=(
+        "Override the datasource URL for probing — useful for testing a "
+        "config against a staging TSDB without editing the file."
+    ),
+)
+def validate(
+    config_path: str,
+    probe: bool,
+    strict: bool,
+    datasource_url: str | None,
+) -> None:
+    """Validate a config file (and optionally probe the datasource)."""
     try:
         cfg = load_config(config_path)
     except Exception as exc:
         click.echo(f"INVALID: {exc}", err=True)
         sys.exit(1)
-    click.echo(f"OK: apiVersion={cfg.apiVersion} groups={[g.name for g in cfg.groups]}")
+
+    if not probe:
+        if strict:
+            # --strict without --probe is a user error: schema validation
+            # is binary (pass / fail) and already exits non-zero on fail.
+            raise click.UsageError("--strict requires --probe")
+        click.echo(f"OK: apiVersion={cfg.apiVersion} groups={[g.name for g in cfg.groups]}")
+        return
+
+    exit_code = asyncio.run(_run_probe(cfg, strict=strict, datasource_override=datasource_url))
+    sys.exit(exit_code)
+
+
+async def _run_probe(
+    cfg: Config,
+    *,
+    strict: bool,
+    datasource_override: str | None,
+) -> int:
+    """Execute every configured query against the live datasource.
+
+    Reports one JSON line per query with the series count or an error
+    reason. Under ``--strict``, exits non-zero when any query is empty
+    or errors — the intended pre-deploy CI gate. Without ``--strict``,
+    only schema-validation failures or transport-level failures abort.
+    """
+    url = datasource_override or cfg.datasource.url
+    source = PromQLSource(url, cfg.datasource.timeout_seconds, auth=cfg.datasource.auth)
+    empty = 0
+    errored = 0
+    total_series = 0
+    try:
+        try:
+            await source.start()
+        except Exception as exc:
+            # Connection / cert / config-level failure before any query
+            # has even run. Surface a clean error line + summary rather
+            # than dumping a traceback at the operator, and exit 1
+            # regardless of --strict (failure here means we couldn't
+            # probe anything at all).
+            click.echo(
+                json.dumps(
+                    {"status": "datasource_unreachable", "url": url, "detail": str(exc)},
+                    sort_keys=True,
+                )
+            )
+            click.echo(
+                json.dumps(
+                    {
+                        "summary": {
+                            "total_series": 0,
+                            "max_total_series": cfg.safety.max_total_series,
+                            "empty_unexpected": 0,
+                            "errored": 0,
+                            "datasource_unreachable": True,
+                        }
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 1
+        end = time.time()
+        window = cfg.defaults.window_seconds
+        step = cfg.defaults.step_seconds
+        for group in cfg.groups:
+            for query in group.queries:
+                entry: dict[str, Any] = {
+                    "group": group.name,
+                    "query": query.id,
+                    "promql": query.promql,
+                }
+                try:
+                    result = await source.range_query(
+                        promql=query.promql,
+                        end=end,
+                        window_seconds=window,
+                        step_seconds=step,
+                        max_series=cfg.safety.max_series_per_query,
+                    )
+                except SourceQueryError as exc:
+                    entry["status"] = "error"
+                    entry["reason"] = exc.reason
+                    entry["detail"] = exc.message
+                    errored += 1
+                else:
+                    series_count = len(result.series)
+                    total_series += series_count
+                    entry["status"] = "ok"
+                    entry["series"] = series_count
+                    entry["truncated"] = result.truncated
+                    if series_count == 0:
+                        # Empty results aren't always wrong (e.g. expect:true
+                        # queries) but they are the most common deployment
+                        # foot-gun — surface them at probe time.
+                        entry["empty"] = True
+                        if not query.expect:
+                            empty += 1
+                click.echo(json.dumps(entry, sort_keys=True))
+    finally:
+        await source.close()
+    summary = {
+        "total_series": total_series,
+        "max_total_series": cfg.safety.max_total_series,
+        "empty_unexpected": empty,
+        "errored": errored,
+    }
+    click.echo(json.dumps({"summary": summary}, sort_keys=True))
+    if strict and (empty > 0 or errored > 0):
+        return 1
+    return 0
 
 
 @cli.command(name="dry-run")
@@ -192,7 +333,10 @@ def detect_once(
             click.echo("no series returned", err=True)
             return 1
 
-        detector = cls()
+        # Use the same kwarg-forwarding builder the runner uses so
+        # ``detect-once --param k=2.5`` works for detectors that consume
+        # tuning knobs in ``__init__``.
+        detector = _build_detector(cls, parsed_params)
         rows: list[dict[str, Any]] = []
         for series in result.series:
             try:
@@ -240,14 +384,7 @@ def detectors_list(target_url: str | None) -> None:
         click.echo(resp.text)
         return
 
-    rows = [
-        {
-            "name": meta.name,
-            "description": meta.description,
-            "defaults": meta.defaults,
-        }
-        for meta in list_meta()
-    ]
+    rows = [meta.as_dict() for meta in list_meta()]
     click.echo(json.dumps(rows, indent=2, sort_keys=True))
 
 

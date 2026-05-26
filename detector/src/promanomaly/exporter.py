@@ -27,6 +27,7 @@ from prometheus_client import (
     generate_latest,
 )
 
+from .source import PromQLSource
 from .state import Sample, SnapshotStore
 
 # Same character class Prometheus enforces on metric and label names.
@@ -97,6 +98,29 @@ _HELP: dict[str, tuple[str, str]] = {
     "anomaly_duration_seconds": (
         "gauge",
         "Seconds since anomaly_outside_threshold last transitioned 0 -> 1; 0 when clear.",
+    ),
+    "anomaly_confidence_score": (
+        "gauge",
+        "Per-detector confidence (0-1) from the synthetic-injection calibration cycle.",
+    ),
+    "anomaly_baseline_stability": (
+        "gauge",
+        "Per-detector baseline stability (0-1, higher = more stable) from calibration.",
+    ),
+    "anomaly_composite_score": (
+        "gauge",
+        (
+            "Ensemble-fused score across the detectors in the group "
+            "(max of per-detector scores). Emitted only when an "
+            "ensemble: block is configured."
+        ),
+    ),
+    "anomaly_composite_outside_threshold": (
+        "gauge",
+        (
+            "1 when the configured ensemble method (max | voting) fires, "
+            "else 0. Emitted only when an ensemble: block is configured."
+        ),
     ),
 }
 
@@ -230,6 +254,35 @@ class OperationalMetrics:
             ["group", "detector"],
             registry=self.registry,
         )
+        # Query-cache observability. Cardinality is bounded — one set of
+        # series per cache (single instance per process today; the v0.4
+        # Redis variant will publish the same metric family without
+        # changing dashboards).
+        self.query_cache_hits_total = Counter(
+            "anomaly_query_cache_hits_total",
+            "PromQL responses served from the in-process query cache.",
+            registry=self.registry,
+        )
+        self.query_cache_misses_total = Counter(
+            "anomaly_query_cache_misses_total",
+            "PromQL responses that missed the cache and hit the TSDB.",
+            registry=self.registry,
+        )
+        self.query_cache_evictions_total = Counter(
+            "anomaly_query_cache_evictions_total",
+            "Cache entries dropped by LRU eviction (max_entries exceeded).",
+            registry=self.registry,
+        )
+        self.query_cache_expirations_total = Counter(
+            "anomaly_query_cache_expirations_total",
+            "Cache entries dropped by TTL expiry on lookup.",
+            registry=self.registry,
+        )
+        self.query_cache_entries = Gauge(
+            "anomaly_query_cache_entries",
+            "Number of entries currently held in the in-process query cache.",
+            registry=self.registry,
+        )
 
     def render(self) -> bytes:
         return generate_latest(self.registry)
@@ -238,15 +291,69 @@ class OperationalMetrics:
 class Exporter:
     """Glue between the snapshot store, the operational registry, and HTTP."""
 
-    def __init__(self, store: SnapshotStore, operational: OperationalMetrics) -> None:
+    def __init__(
+        self,
+        store: SnapshotStore,
+        operational: OperationalMetrics,
+        source: PromQLSource | None = None,
+    ) -> None:
         self._store = store
         self._operational = operational
+        self._source = source
+        # Counter snapshots used to map cache stats (absolute counters
+        # maintained inside the cache) onto prometheus_client Counters
+        # (which only expose .inc()). We forward the delta on each
+        # render so the wire output is monotonic. ``_cache_id`` lets us
+        # detect when the cache instance has been replaced by a reload
+        # (``replace_cache`` swaps in a fresh TTLCache); without it the
+        # snapshot would lag behind, treating the new cache's growing
+        # stats as deltas relative to the old cache's final totals.
+        self._cache_id: int | None = None
+        self._cache_stat_snapshot: dict[str, int] = {
+            "hits": 0,
+            "misses": 0,
+            "evictions": 0,
+            "expirations": 0,
+        }
 
     def render(self) -> tuple[bytes, str]:
+        self._refresh_cache_metrics()
         op_bytes = self._operational.render()
         snapshot_text = render_samples(self._store.all_samples())
         body = op_bytes + snapshot_text.encode("utf-8")
         return body, CONTENT_TYPE_LATEST
+
+    def _refresh_cache_metrics(self) -> None:
+        if self._source is None or self._source.cache is None:
+            return
+        cache = self._source.cache
+        if id(cache) != self._cache_id:
+            # Reload swapped the cache out. The previous cache's totals
+            # were already inc'd onto the counters and stay there; the
+            # new cache restarts at 0, so reset the snapshot too —
+            # otherwise the next several renders skip updates while the
+            # new cache "catches up" to the stale snapshot.
+            self._cache_id = id(cache)
+            self._cache_stat_snapshot = {
+                "hits": 0,
+                "misses": 0,
+                "evictions": 0,
+                "expirations": 0,
+            }
+        stats = cache.stats
+        for key, counter in (
+            ("hits", self._operational.query_cache_hits_total),
+            ("misses", self._operational.query_cache_misses_total),
+            ("evictions", self._operational.query_cache_evictions_total),
+            ("expirations", self._operational.query_cache_expirations_total),
+        ):
+            current = getattr(stats, key)
+            previous = self._cache_stat_snapshot[key]
+            delta = current - previous
+            if delta > 0:
+                counter.inc(delta)
+                self._cache_stat_snapshot[key] = current
+        self._operational.query_cache_entries.set(float(len(cache)))
 
 
 __all__ = [

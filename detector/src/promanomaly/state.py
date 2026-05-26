@@ -14,6 +14,8 @@ import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
+from .calibration import DetectorCalibration
+
 
 @dataclass(frozen=True)
 class Sample:
@@ -57,10 +59,20 @@ class SnapshotStore:
         # (group, query_id, series_key) -> number of consecutive runs where
         # this series has been observed. Used to gate warm-up.
         self._observed_runs: dict[tuple[str, str, tuple[tuple[str, str], ...]], int] = {}
-        # (group, query_id, series_key) -> wall-clock seconds since
-        # anomaly_outside_threshold last transitioned 0 -> 1. 0 (or absent)
-        # means clear. Reset on restart.
-        self._anomaly_start: dict[tuple[str, str, tuple[tuple[str, str], ...]], float] = {}
+        # (group, query_id, series_key, detector_name, detector_instance)
+        # -> wall-clock seconds since anomaly_outside_threshold last
+        # transitioned 0 -> 1. Absent means clear. Reset on restart.
+        #
+        # The key MUST include the detector identity: when a series is
+        # scored by multiple detectors per run, each one publishes its
+        # own anomaly_duration_seconds with its own detector label and
+        # its own verdict — so they cannot share a transition timer or
+        # a non-firing detector would silently reset a firing detector's
+        # counter.
+        self._anomaly_start: dict[
+            tuple[str, str, tuple[tuple[str, str], ...], str, str | None],
+            float,
+        ] = {}
         # (group, query_id) -> number of consecutive runs in which the
         # query returned an empty result vector. Used by the
         # ``expect: true`` flag.
@@ -69,6 +81,15 @@ class SnapshotStore:
         # ``fail_ready`` policy to decide when sustained failures should
         # flip the group's readiness off.
         self._source_failure_streak: dict[str, int] = {}
+        # (group, query_id, series_key, detector_name, detector_instance)
+        # -> DetectorCalibration. Populated by the auto-select /
+        # confidence-score code path. Rebuilt from zero on restart —
+        # the next calibration cycle catches up within
+        # ``auto_select_interval`` of the new boot.
+        self._calibrations: dict[
+            tuple[str, str, tuple[tuple[str, str], ...], str, str | None],
+            DetectorCalibration,
+        ] = {}
 
     # ------------------------------------------------------------------
     # Snapshots
@@ -105,6 +126,9 @@ class SnapshotStore:
                 if miss_key[0] == group:
                     del self._expect_misses[miss_key]
             self._source_failure_streak.pop(group, None)
+            for cal_key in list(self._calibrations):
+                if cal_key[0] == group:
+                    del self._calibrations[cal_key]
 
     # ------------------------------------------------------------------
     # Readiness
@@ -184,11 +208,20 @@ class SnapshotStore:
         group: str,
         query_id: str,
         series_key: tuple[tuple[str, str], ...],
+        detector_name: str,
+        detector_instance: str | None,
         outside: bool,
         now: float,
     ) -> float:
-        """Maintain the 0->1 transition timestamp and return current duration."""
-        key = (group, query_id, series_key)
+        """Maintain the 0->1 transition timestamp and return current duration.
+
+        Per-detector keying matters: with multiple detectors per series
+        (e.g. MAD + Hampel + IQR), a non-firing detector must not pop
+        the start timestamp a firing sibling just set. Each
+        ``(detector_name, detector_instance)`` pair holds its own
+        timer.
+        """
+        key = (group, query_id, series_key, detector_name, detector_instance)
         with self._lock:
             start = self._anomaly_start.get(key)
             if outside:
@@ -215,6 +248,46 @@ class SnapshotStore:
             count = self._expect_misses.get(key, 0) + 1
             self._expect_misses[key] = count
             return count
+
+    # ------------------------------------------------------------------
+    # Calibration cache (auto-select + confidence-score support)
+    # ------------------------------------------------------------------
+    def record_calibration(
+        self,
+        group: str,
+        query_id: str,
+        series_key: tuple[tuple[str, str], ...],
+        detector_name: str,
+        detector_instance: str | None,
+        calibration: DetectorCalibration,
+    ) -> None:
+        key = (group, query_id, series_key, detector_name, detector_instance)
+        with self._lock:
+            self._calibrations[key] = calibration
+
+    def get_calibration(
+        self,
+        group: str,
+        query_id: str,
+        series_key: tuple[tuple[str, str], ...],
+        detector_name: str,
+        detector_instance: str | None,
+    ) -> DetectorCalibration | None:
+        key = (group, query_id, series_key, detector_name, detector_instance)
+        with self._lock:
+            return self._calibrations.get(key)
+
+    def clear_calibrations(self) -> None:
+        """Drop the entire calibration cache.
+
+        Called on config reload because the cache key does not include
+        detector ``params``: a reload that flips ``Hampel.t0`` from 3
+        to 7 would otherwise reuse the t0=3 calibration for up to
+        ``auto_select_interval``. Wiping forces the next run to
+        re-calibrate against the new params.
+        """
+        with self._lock:
+            self._calibrations.clear()
 
 
 __all__ = [

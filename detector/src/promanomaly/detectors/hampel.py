@@ -12,6 +12,8 @@ from typing import Any, ClassVar
 import numpy as np
 import pandas as pd
 
+from .base import ParamSpec
+
 
 class Hampel:
     """Hampel filter detector.
@@ -33,6 +35,14 @@ class Hampel:
         "comparison. Better when the baseline drifts within the window."
     )
     defaults: ClassVar[dict[str, Any]] = {"t0": 3}
+    param_spec: ClassVar[tuple[ParamSpec, ...]] = (
+        ParamSpec(
+            name="t0",
+            type_="int",
+            default=3,
+            doc="Half-width of the local sub-window; sub-window spans 2*t0 + 1 points.",
+        ),
+    )
 
     def fit_score(
         self,

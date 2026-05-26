@@ -20,12 +20,30 @@ safety:
   on_source_failure: fail_ready
   fail_ready_after: 5
 
+defaults:
+  # Practical-significance floors: both must be exceeded for the alert
+  # bit to fire on top of the statistical threshold. Exercised here so
+  # the matrix render covers the YAML surface even when the floors are
+  # zero in production.
+  min_abs_delta: 0.0
+  min_relative_delta: 0.05
+
 groups:
   - name: ci_full
     priority: 5
+    auto_select: explicit_plus_best
+    auto_select_interval: 24h
+    # Composite gauge fires when at least two detectors agree —
+    # high-precision, low-flap signal for the most critical pages.
+    ensemble:
+      method: voting
+      min_detectors: 2
     queries:
       - id: latency
         promql: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
+        # Per-query override: tighten the relative floor on a signal
+        # whose normal baseline is very small.
+        min_relative_delta: 0.1
         detectors:
           - name: MAD
           - name: Hampel
@@ -33,9 +51,22 @@ groups:
             params:
               window: 1h
               t0: 5
+          - name: IQR
+            params:
+              k: 1.5
+          - name: ZScoreEWMA
+            params:
+              alpha: 0.05
       - id: heartbeat
         promql: up{job="critical"}
         expect: true
         expect_grace_runs: 2
         detectors:
           - name: MAD
+      - id: diurnal_requests
+        promql: sum by (instance) (rate(http_requests_total[1m]))
+        detectors:
+          - name: HourOfDayMAD
+            params:
+              lookback: 7d
+              bucket_width: 1h

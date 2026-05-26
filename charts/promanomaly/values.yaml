@@ -47,6 +47,14 @@ safety:
   # Only honoured when on_source_failure: fail_ready. A single
   # transient TSDB blip must not take the pod out of the service.
   fail_ready_after: 3
+  # In-process LRU+TTL cache for overlapping PromQL responses. The
+  # Redis-backed HA variant ships in a later milestone; this knob will
+  # continue to govern the single-replica path. See docs/operations.md
+  # for the worked example.
+  query_cache:
+    enabled: true
+    max_entries: 1024
+    ttl: 30s
 
 defaults:
   window: 1h
@@ -59,6 +67,15 @@ defaults:
   emit_duration: true
   alert_thresholds:
     score: 3.0
+  # Practical-significance floors. Both default off (0 = no opinion).
+  # Setting either gates anomaly_outside_threshold so the alerting bit
+  # only fires when the move is statistically AND practically
+  # meaningful — useful on sparse counters where MAD's 3-MAD threshold
+  # picks up 0.01 -> 0.012 moves that are operational noise.
+  # ``anomaly_score`` is unaffected; dashboards still see the raw
+  # signal. See docs/operations.md for the worked example.
+  min_abs_delta: 0.0      # original-units floor (e.g. 0.05 errors/s)
+  min_relative_delta: 0.0 # fraction-of-baseline floor (e.g. 0.05 = 5%)
 
 # Inline detector groups. Mutually exclusive with ``existingConfigMap``.
 #
@@ -162,6 +179,15 @@ prometheusRule:
       enabled: true
       for: 10m
       severity: critical
+    # Calibration-confidence gate. Fires only when a detector is
+    # actively firing AND the per-detector confidence has dropped
+    # below the configured threshold. See docs/confidence.md for the
+    # formula behind anomaly_confidence_score.
+    anomalyConfidenceLow:
+      enabled: true
+      threshold: 0.5
+      for: 10m
+      severity: warning
     anomalyStale:
       enabled: true
       maxStaleSeconds: 600

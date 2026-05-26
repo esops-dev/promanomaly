@@ -14,6 +14,8 @@ from typing import Any, ClassVar
 import numpy as np
 import pandas as pd
 
+from .base import ParamSpec
+
 # Scale factor that makes MAD a consistent estimator of standard deviation
 # for Gaussian data. We expose the *raw* number-of-MADs distance and do
 # NOT apply this factor; the conventional 3-MAD anomaly threshold follows.
@@ -52,6 +54,9 @@ class MAD:
         "alert_thresholds.score."
     )
     defaults: ClassVar[dict[str, Any]] = {}
+    # No detector-specific tuning knobs. Sensitivity is the universal
+    # alert_thresholds.score.
+    param_spec: ClassVar[tuple[ParamSpec, ...]] = ()
 
     def fit_score(
         self,

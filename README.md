@@ -52,7 +52,9 @@ watches the mounted ConfigMap, validates the new config in-place, and
 rolls back on validation failure (`kubectl apply` to the ConfigMap is
 enough). `POST /-/reload` and `SIGHUP` trigger the same path. Run
 `promanomaly validate --config path/to/config.yaml` in CI to catch
-schema errors before merging — see [`docs/operations.md`](docs/operations.md)
+schema errors before merging; add `--probe --strict` to additionally
+execute every query against the live datasource and fail the build
+on empty or erroring queries. See [`docs/operations.md`](docs/operations.md)
 for the full CLI surface and operational guidance.
 
 See [`docs/`](docs/) for configuration, detector selection, and
