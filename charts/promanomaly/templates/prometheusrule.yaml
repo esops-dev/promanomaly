@@ -98,6 +98,25 @@ spec:
               series for at least the configured grace runs.
         {{- end }}
         {{- end }}
+        {{- with $rules.anomalyConfidenceLow }}
+        {{- if .enabled }}
+        - alert: AnomalyConfidenceLow
+          expr: |
+            anomaly_confidence_score < {{ .threshold }}
+              and on (id, group, detector) anomaly_outside_threshold == 1
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "Low-confidence anomaly on {{ "{{" }} $labels.id {{ "}}" }} ({{ "{{" }} $labels.group {{ "}}" }})"
+            description: |
+              Detector {{ "{{" }} $labels.detector {{ "}}" }} is firing
+              but the calibration-driven confidence score has been
+              below {{ .threshold }} for at least {{ .for }}.
+              Inspect with /debug/inspect before paging — the verdict
+              may be unreliable.
+        {{- end }}
+        {{- end }}
     - name: promanomaly.operational
       interval: 30s
       rules:

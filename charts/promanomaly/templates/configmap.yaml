@@ -37,6 +37,12 @@ data:
       {{- with .Values.safety.fail_ready_after }}
       fail_ready_after: {{ . }}
       {{- end }}
+      {{- with .Values.safety.query_cache }}
+      query_cache:
+        enabled: {{ .enabled }}
+        max_entries: {{ .max_entries }}
+        ttl: {{ .ttl | quote }}
+      {{- end }}
     defaults:
       window: {{ .Values.defaults.window | quote }}
       step: {{ .Values.defaults.step | quote }}
@@ -46,6 +52,12 @@ data:
       emit_change_points: {{ .Values.defaults.emit_change_points }}
       emit_baseline_stability: {{ .Values.defaults.emit_baseline_stability }}
       emit_duration: {{ .Values.defaults.emit_duration }}
+      {{- with .Values.defaults.min_abs_delta }}
+      min_abs_delta: {{ . }}
+      {{- end }}
+      {{- with .Values.defaults.min_relative_delta }}
+      min_relative_delta: {{ . }}
+      {{- end }}
       alert_thresholds:
         score: {{ .Values.defaults.alert_thresholds.score }}
     groups:

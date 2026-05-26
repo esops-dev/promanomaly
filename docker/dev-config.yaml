@@ -39,6 +39,17 @@ defaults:
 groups:
   - name: node_dev
     priority: 1
+    # explicit_plus_best keeps every detector's score visible in /metrics
+    # for local inspection; the winner is just additionally marked.
+    auto_select: explicit_plus_best
+    auto_select_interval: 5m   # dev-only; production default is 24h
+    # Exercise the v0.2 ensemble fuser on the local stack: voting
+    # requires two detectors to agree before lighting up the composite
+    # gauge. Useful for eyeballing how max vs. voting differ in
+    # /metrics while iterating on a new signal.
+    ensemble:
+      method: voting
+      min_detectors: 2
     queries:
       - id: node_cpu_busy_pct
         promql: '100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[1m])))'
@@ -50,3 +61,9 @@ groups:
             params:
               window: 15m
               t0: 3
+          - name: IQR
+            params:
+              k: 1.5
+          - name: ZScoreEWMA
+            params:
+              alpha: 0.1

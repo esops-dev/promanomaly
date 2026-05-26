@@ -35,11 +35,13 @@ from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from .cache import TTLCache
 from .config import Config, ReloadAuthConfig, load_config
+from .detectors import list_meta
 from .exporter import Exporter, OperationalMetrics
 from .logging import configure_logging, get_logger
 from .runner import Runner
-from .source import PromQLSource
+from .source import PromQLSource, QueryResult
 from .state import SnapshotStore
 
 logger = get_logger(__name__)
@@ -61,6 +63,7 @@ class Application:
             base_url=config.datasource.url,
             timeout=config.datasource.timeout_seconds,
             auth=config.datasource.auth,
+            cache=_build_query_cache(config),
         )
         self._runner = Runner(
             config=config,
@@ -68,7 +71,7 @@ class Application:
             store=self._store,
             operational=self._ops,
         )
-        self._exporter = Exporter(self._store, self._ops)
+        self._exporter = Exporter(self._store, self._ops, self._source)
         self._scheduler: AsyncIOScheduler | None = None
         # Anchor background tasks so the GC can't drop them mid-run.
         self._background: set[asyncio.Task[Any]] = set()
@@ -145,6 +148,16 @@ class Application:
             # Bounded, read-only view of the active config (no secrets).
             return JSONResponse(self._safe_config_view())
 
+        @app.get("/debug/detectors")
+        async def debug_detectors() -> JSONResponse:
+            # Snapshot of the detector entry-point registry. Stable shape
+            # so the CLI ``detectors list --target`` can render it
+            # without negotiation; described in docs/detectors.md.
+            # ``defaults`` is a simple {name: default} dict kept for
+            # backwards compatibility; ``params`` is the canonical richer
+            # form with per-parameter type and doc.
+            return JSONResponse([m.as_dict() for m in list_meta()])
+
         return app
 
     # ------------------------------------------------------------------
@@ -163,6 +176,7 @@ class Application:
             return False, f"validation failed: {exc}"
 
         self._runner.replace_config(new_config)
+        self._source.replace_cache(_build_query_cache(new_config))
         self._config = new_config
         self._stamp_config_hash(new_config)
         if self._scheduler is not None:
@@ -290,6 +304,16 @@ class Application:
 # ----------------------------------------------------------------------
 # Module-level entrypoints
 # ----------------------------------------------------------------------
+
+
+def _build_query_cache(
+    config: Config,
+) -> TTLCache[tuple[str, float, float, int, int], QueryResult] | None:
+    """Return a query cache instance honoured by the source layer, or ``None``."""
+    cfg = config.safety.query_cache
+    if not cfg.enabled:
+        return None
+    return TTLCache(max_entries=cfg.max_entries, ttl_seconds=cfg.ttl_seconds)
 
 
 def _parse_listen(addr: str) -> tuple[str, int]:

@@ -101,6 +101,31 @@ spec:
               A query configured with expect:true has returned no
               series for at least the configured grace runs.
 
+        - alert: AnomalyConfidenceLow
+          # Calibration confidence has dropped on a detector that is
+          # currently firing. Useful as a gating signal — operators who
+          # only want high-confidence pages should compose this with
+          # AnomalyOutsideThreshold rather than firing on it alone.
+          # The explicit ``and on (id, group, detector)`` matcher ignores
+          # per-source labels (instance, job, ...) so the join holds even
+          # when those differ between the confidence gauge and the
+          # threshold bit. Without it, Prometheus's default exact-set
+          # match silently produces no results whenever the two metrics
+          # carry slightly different labels.
+          expr: |
+            anomaly_confidence_score < 0.5
+              and on (id, group, detector) anomaly_outside_threshold == 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Low-confidence anomaly on {{ $labels.id }} ({{ $labels.group }})"
+            description: |
+              Detector {{ $labels.detector }} is firing but the
+              calibration-driven confidence score has been below 0.5
+              for at least 10m. Inspect with /debug/inspect before
+              paging — the verdict may be unreliable.
+
     - name: promanomaly.operational
       interval: 30s
       rules:

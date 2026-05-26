@@ -125,6 +125,26 @@ class ServerConfig(_ModelBase):
         return parse_duration(self.refresh_interval)
 
 
+class QueryCacheConfig(_ModelBase):
+    """In-process LRU cache for overlapping PromQL responses.
+
+    Enabled by default with a conservative TTL — same PromQL inside one
+    run (multiple queries, ensemble fan-out) is collapsed into one TSDB
+    request without changing semantics. The Redis-backed HA variant
+    ships in v0.4 and slots into the same call site.
+    """
+
+    enabled: bool = True
+    max_entries: int = Field(default=1024, ge=1)
+    # 30s default mirrors the typical scrape cadence — two queries inside
+    # the same tick share a result, but the second tick still refetches.
+    ttl: Duration = "30s"
+
+    @property
+    def ttl_seconds(self) -> float:
+        return parse_duration(self.ttl)
+
+
 class SafetyConfig(_ModelBase):
     max_series_per_query: int = Field(default=1000, ge=1)
     max_total_series: int = Field(default=20000, ge=1)
@@ -138,6 +158,7 @@ class SafetyConfig(_ModelBase):
     # A single transient failure must not take the pod out of the
     # service, so the default mirrors expect_grace_runs.
     fail_ready_after: int = Field(default=3, ge=1)
+    query_cache: QueryCacheConfig = Field(default_factory=QueryCacheConfig)
 
     @property
     def detect_timeout_seconds(self) -> float:
@@ -193,6 +214,18 @@ class DetectorEntry(_ModelBase):
     def _validate_name(cls, value: str) -> str:
         return _validate_prom_name(value, field="detector.name")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_string_shorthand(cls, value: Any) -> Any:
+        # ``- MAD`` is the convenient form when no overrides are needed;
+        # pydantic gets a plain string here and we promote it into the
+        # canonical ``{name: ..., params: {}}`` dict. Lists / non-string
+        # scalars fall through and pydantic produces a normal type error
+        # against ``name``.
+        if isinstance(value, str):
+            return {"name": value}
+        return value
+
 
 class QueryConfig(_ModelBase):
     id: PromName
@@ -236,11 +269,25 @@ class EnsembleConfig(_ModelBase):
     min_detectors: int = Field(default=2, ge=1)
 
 
+# ``auto_select`` accepts ``true`` (winner-only output), ``false`` (off,
+# the default), or ``"explicit_plus_best"`` (emit every configured
+# detector plus a marker label on the winner). The string form lets
+# operators opt in to keeping all detector outputs visible for
+# comparison while still benefiting from the winner labelling.
+AutoSelect = bool | Literal["explicit_plus_best"]
+
+
 class GroupConfig(_ModelBase):
     name: PromName
     priority: int = 1
     queries: list[QueryConfig]
     ensemble: EnsembleConfig | None = None
+    auto_select: AutoSelect = False
+    auto_select_interval: Duration = "24h"
+
+    @property
+    def auto_select_interval_seconds(self) -> float:
+        return parse_duration(self.auto_select_interval)
 
     @field_validator("name")
     @classmethod
@@ -256,6 +303,26 @@ class GroupConfig(_ModelBase):
         if len(ids) != len(set(ids)):
             raise ValueError(f"duplicate query id within group: {ids}")
         return queries
+
+    @model_validator(mode="after")
+    def _validate_ensemble_reachable(self) -> GroupConfig:
+        # ``voting`` with min_detectors larger than every query's
+        # detector count is a silent never-fire footgun: the composite
+        # gauge stays at 0 forever, so the user thinks the alert simply
+        # never trips. Reject when NO query in the group can ever reach
+        # the threshold; allow the mixed case (some queries fire, some
+        # are deliberately degenerate) since that may be intentional.
+        ens = self.ensemble
+        if ens is None or ens.method != "voting":
+            return self
+        max_detectors = max((len(q.detectors) for q in self.queries), default=0)
+        if ens.min_detectors > max_detectors:
+            raise ValueError(
+                f"group {self.name!r}: ensemble.min_detectors={ens.min_detectors} "
+                f"exceeds the largest configured detector list "
+                f"({max_detectors}); composite metric would never fire"
+            )
+        return self
 
 
 class Config(_ModelBase):
@@ -324,6 +391,7 @@ __all__ = [
     "ExporterConfig",
     "ExporterLabelsConfig",
     "GroupConfig",
+    "QueryCacheConfig",
     "QueryConfig",
     "ReloadAuthConfig",
     "ReloadConfig",

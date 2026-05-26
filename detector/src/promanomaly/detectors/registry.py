@@ -75,6 +75,7 @@ def meta(name: str) -> DetectorMeta:
         name=cls.name,
         description=getattr(cls, "description", ""),
         defaults=dict(getattr(cls, "defaults", {}) or {}),
+        params=tuple(getattr(cls, "param_spec", ()) or ()),
     )
 
 

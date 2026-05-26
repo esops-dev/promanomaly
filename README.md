@@ -6,7 +6,7 @@ Anomaly detection for Prometheus-compatible metrics, exposed as Prometheus metri
 [![Release](https://img.shields.io/github/v/release/esops-dev/promanomaly?include_prereleases&sort=semver)](https://github.com/esops-dev/promanomaly/releases)
 [![License](https://img.shields.io/github/license/esops-dev/promanomaly)](LICENSE)
 
-promanomaly reads a YAML config, queries a Prometheus-compatible TSDB
+`promanomaly` reads a YAML config, queries a Prometheus-compatible TSDB
 (VictoriaMetrics by default), runs robust statistical detectors over a
 rolling window of recent data, and exposes anomaly scores on `/metrics`.
 Anomalies become first-class metrics — graphable in Grafana, alertable
@@ -52,7 +52,9 @@ watches the mounted ConfigMap, validates the new config in-place, and
 rolls back on validation failure (`kubectl apply` to the ConfigMap is
 enough). `POST /-/reload` and `SIGHUP` trigger the same path. Run
 `promanomaly validate --config path/to/config.yaml` in CI to catch
-schema errors before merging — see [`docs/operations.md`](docs/operations.md)
+schema errors before merging; add `--probe --strict` to additionally
+execute every query against the live datasource and fail the build
+on empty or erroring queries. See [`docs/operations.md`](docs/operations.md)
 for the full CLI surface and operational guidance.
 
 See [`docs/`](docs/) for configuration, detector selection, and

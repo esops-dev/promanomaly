@@ -36,19 +36,25 @@ Noisy, heavy-tailed, or non-Gaussian (p99 latency, error rates, queue depth, thr
 └── No
 
 Roughly Gaussian with slowly drifting mean (cache hit rate, sustained throughput)?
-└── Yes → ZScoreEWMA (planned)
+└── Yes → ZScoreEWMA
 
 Counter with mostly-zero gaps (sparse errors, rare events)?
-└── Yes → MAD + longer window (pair with `min_abs_delta` floor when available)
+└── Yes → MAD + longer window (pair with `min_abs_delta` floor)
+
+Want a non-parametric detector with different sensitivity from MAD?
+└── Yes → IQR (pairs well with MAD inside an `ensemble:`)
 
 Strong daily/hourly pattern (request rate, batch counters)?
-└── Yes → HourOfDayMAD (planned)
+└── Yes → HourOfDayMAD
 
 Breaks on deploys or rolling restarts?
 └── Yes → BOCPD / CUSUM (planned change-point detectors). Until then use short-window MAD.
 
 Comparing identical instances (nodes, pods, replicas)?
 └── Yes → Cohort detector (planned)
+
+Cannot decide between MAD / Hampel / IQR for a given series?
+└── Yes → set `auto_select: true` on the group and let the calibration cycle choose per series (see `docs/auto-select.md`).
 ```
 
 ### Quick Cross-Checks Before Shipping

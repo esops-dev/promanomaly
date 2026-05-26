@@ -2,16 +2,21 @@
 
 Thin wrapper around ``httpx`` that returns one ``QuerySeries`` per series
 in the response, parsed into a pandas DataFrame ready for the detectors.
+
+An optional :class:`TTLCache` collapses overlapping PromQL queries inside
+a short TTL window — see ``cache.py`` for the rationale.
 """
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 import pandas as pd
 
+from .cache import TTLCache
 from .config import AuthConfig
 
 
@@ -60,11 +65,24 @@ class PromQLSource:
         base_url: str,
         timeout: float,
         auth: AuthConfig | None = None,
+        cache: TTLCache[tuple[str, float, float, int, int], QueryResult] | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._auth = auth or AuthConfig()
         self._client: httpx.AsyncClient | None = None
+        self._cache = cache
+
+    @property
+    def cache(self) -> TTLCache[tuple[str, float, float, int, int], QueryResult] | None:
+        return self._cache
+
+    def replace_cache(
+        self,
+        cache: TTLCache[tuple[str, float, float, int, int], QueryResult] | None,
+    ) -> None:
+        """Swap the cache out (used by config reload to honour new sizing)."""
+        self._cache = cache
 
     async def __aenter__(self) -> PromQLSource:
         await self.start()
@@ -111,7 +129,36 @@ class PromQLSource:
         Raises :class:`SourceQueryError` on any TSDB-side failure.
         Truncation to ``max_series`` is reported via ``QueryResult.truncated``
         rather than failing the call.
+
+        When a :class:`TTLCache` is wired in, the response is served from
+        cache when an identical ``(promql, window, step, max_series,
+        end_bucketed)`` request has been seen inside the TTL. ``end`` is
+        quantised to ``step_seconds`` so overlapping rolling windows
+        coalesce — the seconds-of-skew between two callers within the
+        same scrape bucket never causes a redundant TSDB hit.
         """
+        cache_key: tuple[str, float, float, int, int] | None = None
+        if self._cache is not None:
+            # Quantise to step seconds so two callers requesting the same
+            # promql/window within one step boundary share a cache slot
+            # — the TSDB would return the same samples anyway. Use the
+            # raw step so sub-second cadences (e.g. step=250ms) still get
+            # one-bucket-per-step granularity; the small epsilon only
+            # exists to keep an accidentally-zero step from raising
+            # ZeroDivisionError.
+            step = float(step_seconds) if step_seconds > 0 else 1e-6
+            bucket = int(end // step)
+            cache_key = (
+                promql,
+                float(window_seconds),
+                float(step_seconds),
+                int(max_series or 0),
+                bucket,
+            )
+            cached = self._cache.get(cache_key, time.monotonic())
+            if cached is not None:
+                return cached
+
         if self._client is None:
             await self.start()
         assert self._client is not None
@@ -166,7 +213,10 @@ class PromQLSource:
             )
             series_list.append(QuerySeries(labels=labels, samples=df))
 
-        return QueryResult(series=series_list, truncated=truncated)
+        query_result = QueryResult(series=series_list, truncated=truncated)
+        if self._cache is not None and cache_key is not None:
+            self._cache.put(cache_key, query_result, time.monotonic())
+        return query_result
 
 
 __all__ = [

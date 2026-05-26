@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import inspect
 import os
 import time
 from dataclasses import dataclass, field
@@ -27,7 +28,15 @@ from typing import Any
 import pandas as pd
 import structlog
 
-from .config import Config, DefaultsConfig, DetectorEntry, GroupConfig, QueryConfig
+from .calibration import DetectorCalibration, calibrate_detector
+from .config import (
+    Config,
+    DefaultsConfig,
+    DetectorEntry,
+    EnsembleConfig,
+    GroupConfig,
+    QueryConfig,
+)
 from .detectors import Detector, UnknownDetectorError, get
 from .exporter import OperationalMetrics
 from .source import PromQLSource, QueryResult, QuerySeries, SourceQueryError
@@ -55,6 +64,21 @@ class _DetectorPlan:
     instance: str | None
     cls: type[Detector]
     params: dict[str, Any]
+
+
+@dataclass
+class _DetectorOutcome:
+    """Per-detector score + alerting bit for one series.
+
+    Captured per series so the ensemble fuser (when configured) can
+    fold the individual detector verdicts into a single composite
+    score without re-running detectors. The runner only retains these
+    long enough to compute composites and discards them.
+    """
+
+    plan: _DetectorPlan
+    score: float
+    outside: bool
 
 
 @dataclass
@@ -134,6 +158,11 @@ class Runner:
 
         Called from the reload path. Drops state for groups that were
         removed; new groups simply appear on the next scheduled run.
+        The calibration cache is dropped wholesale because its key
+        does not include detector ``params`` — a reload that tweaks a
+        detector parameter would otherwise reuse stale per-detector F1
+        / confidence / stability numbers for up to one
+        ``auto_select_interval``.
         """
         old_names = {g.name for g in self._config.groups}
         new_names = {g.name for g in new_config.groups}
@@ -142,6 +171,7 @@ class Runner:
             self._group_locks.pop(removed, None)
         for added in new_names - old_names:
             self._group_locks[added] = asyncio.Lock()
+        self._store.clear_calibrations()
         self._config = new_config
 
     async def run_group(self, group_name: str) -> GroupRunResult:
@@ -397,11 +427,23 @@ class Runner:
                 _DetectorPlan(name=entry.name, instance=entry.instance, cls=cls, params=params)
             )
 
+        # Stratified detectors (HourOfDayMAD) need a longer query window
+        # than the group default. We take the max across all detectors
+        # in the query so MAD + Hampel + HourOfDayMAD can coexist
+        # without forcing the group's defaults.window upward.
+        window_seconds = defaults.window_seconds
+        for plan in plans:
+            override = getattr(plan.cls, "query_window_seconds", None)
+            if callable(override):
+                value = override(plan.params)
+                if value is not None and value > window_seconds:
+                    window_seconds = float(value)
+
         end = time.time()
         result = await self._source.range_query(
             promql=query.promql,
             end=end,
-            window_seconds=defaults.window_seconds,
+            window_seconds=window_seconds,
             step_seconds=defaults.step_seconds,
             max_series=self._config.safety.max_series_per_query,
         )
@@ -437,6 +479,42 @@ class Runner:
         merged.setdefault("step", defaults.step)
         return merged
 
+    def _detector_input_window_seconds(
+        self, plan: _DetectorPlan, defaults: DefaultsConfig
+    ) -> float:
+        """Return how many seconds of data this detector wants to see.
+
+        Stratified detectors expose ``query_window_seconds`` to expand
+        the fetch; that same value is also the detector's intended
+        input window. Plain rolling detectors fall back to the group
+        default — so when MAD shares a query with HourOfDayMAD, MAD
+        still scores on the last ``defaults.window`` of data instead
+        of the 7d the fetch pulled.
+        """
+        override = getattr(plan.cls, "query_window_seconds", None)
+        if callable(override):
+            value = override(plan.params)
+            if value is not None:
+                return float(value)
+        return defaults.window_seconds
+
+    def _slice_for_detector(
+        self, plan: _DetectorPlan, samples: pd.DataFrame, defaults: DefaultsConfig
+    ) -> pd.DataFrame:
+        """Trim ``samples`` to the trailing window the detector wants."""
+        if samples.empty:
+            return samples
+        desired = self._detector_input_window_seconds(plan, defaults)
+        latest_ts = float(samples["timestamp"].iloc[-1])
+        cutoff = latest_ts - desired
+        sliced = samples[samples["timestamp"] >= cutoff]
+        # Always keep at least the most recent sample so the detector
+        # has a "latest point" to score even when the slice would be
+        # empty (e.g. clock skew, weirdly-spaced data).
+        if sliced.empty:
+            return samples.tail(1).reset_index(drop=True)
+        return sliced.reset_index(drop=True)
+
     async def _score_series(
         self,
         *,
@@ -468,8 +546,34 @@ class Runner:
                 observed_runs=observed_runs,
             )
 
+        # Calibration cycle: refresh per-detector confidence / stability
+        # / F1 when stale. Cheap because the TTL (24h default) means we
+        # only pay the synthetic-injection cost a small handful of times
+        # per series per day. Errors are swallowed — calibration is a
+        # secondary signal and must never take a normal detection run
+        # down.
+        if self._calibration_due(group, query, series, plans, defaults):
+            self._refresh_calibrations(group, query, series, plans, defaults, threshold_score)
+
+        winner = self._select_winner(group, query, series, plans) if group.auto_select else None
+        # When ensemble: is configured we must execute every detector
+        # (even auto_select losers) so the fuser sees every vote.
+        # Without ensemble, the historical optimization stands —
+        # ``auto_select: true`` skips losers entirely to save compute.
+        # ``explicit_plus_best`` always runs every detector because
+        # every detector's score gets emitted by design.
+        run_losers = group.ensemble is not None or group.auto_select == "explicit_plus_best"
+
         produced: list[Sample] = []
+        outcomes: list[_DetectorOutcome] = []
         for plan in plans:
+            is_winner = winner is not None and (plan.name, plan.instance) == winner
+            is_suppressed = group.auto_select is True and winner is not None and not is_winner
+            if is_suppressed and not run_losers:
+                # Skip the detector entirely — same compute profile as
+                # the v0.2 baseline before ensemble fusion landed.
+                continue
+            emit_samples = not is_suppressed
             try:
                 score_row = await self._run_detector(plan, series)
             except concurrent.futures.TimeoutError:
@@ -499,17 +603,30 @@ class Runner:
                 ).inc()
                 continue
 
+            score, outside, samples = self._format_detector_samples(
+                group=group,
+                query=query,
+                series=series,
+                plan=plan,
+                score_row=score_row,
+                threshold_score=threshold_score,
+                min_abs=min_abs,
+                min_rel=min_rel,
+                defaults=defaults,
+                mark_as_winner=is_winner,
+            )
+            outcomes.append(_DetectorOutcome(plan=plan, score=score, outside=outside))
+            if emit_samples:
+                produced.extend(samples)
+
+        if group.ensemble is not None and outcomes:
             produced.extend(
-                self._format_detector_samples(
+                self._format_ensemble_samples(
                     group=group,
                     query=query,
                     series=series,
-                    plan=plan,
-                    score_row=score_row,
-                    threshold_score=threshold_score,
-                    min_abs=min_abs,
-                    min_rel=min_rel,
-                    defaults=defaults,
+                    outcomes=outcomes,
+                    ensemble=group.ensemble,
                 )
             )
         return produced
@@ -517,12 +634,13 @@ class Runner:
     async def _run_detector(self, plan: _DetectorPlan, series: QuerySeries) -> pd.Series:
         timeout = self._config.safety.detect_timeout_seconds
         loop = asyncio.get_running_loop()
-        detector = plan.cls()
+        detector = _build_detector(plan.cls, plan.params)
+        sliced = self._slice_for_detector(plan, series.samples, self._config.defaults)
         future = loop.run_in_executor(
             self._executor,
             _invoke_detector,
             detector,
-            series.samples,
+            sliced,
             plan.params,
         )
         started = time.monotonic()
@@ -599,30 +717,39 @@ class Runner:
         min_abs: float,
         min_rel: float,
         defaults: DefaultsConfig,
-    ) -> list[Sample]:
-        labels = self._series_labels(group, query, series, plan)
+        mark_as_winner: bool = False,
+    ) -> tuple[float, bool, list[Sample]]:
+        """Return ``(score, outside, samples)`` for one detector run.
+
+        Splitting the verdict out separately from the rendered samples
+        lets the caller feed ensemble fusion without re-parsing the
+        emitted Sample list.
+        """
+        extras: dict[str, str] = {}
+        if mark_as_winner:
+            # Opt-in label: only emitted when this detector is the
+            # auto-select winner for this series. Opt-in labels are
+            # non-breaking per the project's API contract.
+            extras["best_detector"] = plan.name
+        labels = self._series_labels(group, query, series, plan, extras=extras)
         score = float(score_row.get("score", 0.0))
         baseline = float(score_row.get("baseline", 0.0))
         latest_y = float(series.samples["y"].iloc[-1])
 
-        statistical_outside = score >= threshold_score
-        # Practical-significance floor: both the abs and rel floors must
-        # be satisfied for the alerting bit to fire. The raw score is
-        # unaffected so dashboards still surface the statistical signal.
-        delta = abs(latest_y - baseline)
-        baseline_for_rel = abs(baseline) if baseline != 0 else 1.0
-        rel_delta = delta / baseline_for_rel if min_rel > 0 else 0.0
-        practical_outside = True
-        if min_abs > 0:
-            practical_outside = practical_outside and delta >= min_abs
-        if min_rel > 0:
-            practical_outside = practical_outside and rel_delta >= min_rel
-
-        outside = bool(statistical_outside and practical_outside)
+        outside = self._apply_threshold(
+            score=score,
+            baseline=baseline,
+            latest_y=latest_y,
+            threshold_score=threshold_score,
+            min_abs=min_abs,
+            min_rel=min_rel,
+        )
         duration_seconds = self._store.update_duration(
             group=group.name,
             query_id=query.id,
             series_key=series.label_key,
+            detector_name=plan.name,
+            detector_instance=plan.instance,
             outside=outside,
             now=time.time(),
         )
@@ -645,7 +772,115 @@ class Runner:
                     value=duration_seconds,
                 )
             )
-        return samples
+
+        # Confidence / baseline-stability come from the latest
+        # calibration cycle, refreshed at most every
+        # ``auto_select_interval``. Emitted only when a calibration
+        # exists so we never publish made-up numbers — the gauge
+        # appearing in /metrics is itself a signal that calibration
+        # has run for this series.
+        calibration = self._store.get_calibration(
+            group.name, query.id, series.label_key, plan.name, plan.instance
+        )
+        if calibration is not None:
+            samples.append(
+                Sample(
+                    metric="anomaly_confidence_score",
+                    labels=labels,
+                    value=calibration.confidence_score,
+                )
+            )
+            if defaults.emit_baseline_stability:
+                samples.append(
+                    Sample(
+                        metric="anomaly_baseline_stability",
+                        labels=labels,
+                        value=calibration.baseline_stability,
+                    )
+                )
+        return score, outside, samples
+
+    @staticmethod
+    def _apply_threshold(
+        *,
+        score: float,
+        baseline: float,
+        latest_y: float,
+        threshold_score: float,
+        min_abs: float,
+        min_rel: float,
+    ) -> bool:
+        """Combine the statistical threshold with the practical floors.
+
+        The raw score is unaffected — only the alerting bit is gated, so
+        dashboards still see the statistical signal even when the floor
+        suppresses the firing. Both floors must be satisfied when set:
+        either floor at zero is treated as "no opinion".
+        """
+        statistical_outside = score >= threshold_score
+        delta = abs(latest_y - baseline)
+        # Zero baseline (sparse counters that haven't fired yet,
+        # zero-clamped gauges) makes "fraction of baseline" undefined.
+        # We substitute 1.0 so min_relative_delta degenerates into an
+        # absolute-units floor in that case — the most operator-friendly
+        # behaviour and the one documented in operations.md.
+        baseline_for_rel = abs(baseline) if baseline != 0 else 1.0
+        rel_delta = delta / baseline_for_rel if min_rel > 0 else 0.0
+        practical_outside = True
+        if min_abs > 0:
+            practical_outside = practical_outside and delta >= min_abs
+        if min_rel > 0:
+            practical_outside = practical_outside and rel_delta >= min_rel
+        return bool(statistical_outside and practical_outside)
+
+    def _format_ensemble_samples(
+        self,
+        *,
+        group: GroupConfig,
+        query: QueryConfig,
+        series: QuerySeries,
+        outcomes: list[_DetectorOutcome],
+        ensemble: EnsembleConfig,
+    ) -> list[Sample]:
+        """Fuse per-detector outcomes into composite metrics.
+
+        Two fusion methods are supported and only two; the project guide
+        is deliberate about not growing this list. ``max`` is a logical
+        OR; ``voting`` fires only when ``min_detectors`` agree. The
+        composite score is the max raw score across detectors in both
+        modes, so the gauge is useful as a "how loud is the loudest
+        detector" indicator independent of the firing rule.
+        """
+        # ``id`` and ``group`` are the only labels on composite metrics —
+        # we intentionally drop ``detector`` because the composite spans
+        # multiple detectors, and source-side labels would balloon the
+        # cardinality at fan-in. This matches the documented label
+        # surface in CLAUDE.md.
+        src = self._filter_source_labels(series.labels)
+        result: dict[str, str] = dict(src)
+        result["id"] = query.id
+        result["group"] = group.name
+        labels = tuple(sorted(result.items()))
+
+        composite_score = max((o.score for o in outcomes), default=0.0)
+        if ensemble.method == "max":
+            fires = any(o.outside for o in outcomes)
+        elif ensemble.method == "voting":
+            agree = sum(1 for o in outcomes if o.outside)
+            fires = agree >= ensemble.min_detectors
+        else:
+            # Defensive: schema already restricts to {max, voting} so
+            # this branch only trips on a future enum addition. Treat
+            # as "do not emit" rather than crashing the whole group.
+            return []
+        return [
+            Sample(metric="anomaly_composite_score", labels=labels, value=composite_score),
+            Sample(
+                metric="anomaly_composite_outside_threshold",
+                labels=labels,
+                value=1.0 if fires else 0.0,
+            ),
+        ]
 
     def _series_labels(
         self,
@@ -653,10 +888,14 @@ class Runner:
         query: QueryConfig,
         series: QuerySeries,
         plan: _DetectorPlan,
+        extras: dict[str, str] | None = None,
     ) -> tuple[tuple[str, str], ...]:
         # Output-label filtering: explicit drop wins, then allow restricts
         # to an explicit set. The canonical labels (id, group, detector,
-        # detector_instance) are always emitted regardless.
+        # detector_instance) are always emitted regardless. ``extras``
+        # carries opt-in labels (e.g. ``best_detector`` for auto-select)
+        # that bypass the allow/drop filter because they are tool-private
+        # and feature-gated.
         src = self._filter_source_labels(series.labels)
         result: dict[str, str] = dict(src)
         result["id"] = query.id
@@ -664,7 +903,123 @@ class Runner:
         result["detector"] = plan.name
         if plan.instance is not None:
             result["detector_instance"] = plan.instance
+        if extras:
+            result.update(extras)
         return tuple(sorted(result.items()))
+
+    def _calibration_due(
+        self,
+        group: GroupConfig,
+        query: QueryConfig,
+        series: QuerySeries,
+        plans: list[_DetectorPlan],
+        defaults: DefaultsConfig,
+    ) -> bool:
+        # Calibration runs whenever auto-select is enabled OR the user
+        # asked for the confidence / stability metrics. We honour the
+        # latter by checking ``defaults.emit_baseline_stability``;
+        # if the gauge is disabled and auto-select is off, we never
+        # pay the calibration cost.
+        if not group.auto_select and not defaults.emit_baseline_stability:
+            return False
+        if len(series.samples) < defaults.min_points:
+            return False
+        ttl = group.auto_select_interval_seconds
+        now = time.time()
+        for plan in plans:
+            cal = self._store.get_calibration(
+                group.name, query.id, series.label_key, plan.name, plan.instance
+            )
+            if cal is None or (now - cal.last_calibrated) >= ttl:
+                return True
+        return False
+
+    def _refresh_calibrations(
+        self,
+        group: GroupConfig,
+        query: QueryConfig,
+        series: QuerySeries,
+        plans: list[_DetectorPlan],
+        defaults: DefaultsConfig,
+        threshold_score: float,
+    ) -> None:
+        now = time.time()
+        # Coverage target: window / step samples. With the dev defaults
+        # (window=15m, step=15s) this is 60 — exactly the min_points
+        # floor — but operators commonly run window=1h / step=15s,
+        # giving a 240-sample expected coverage.
+        expected = max(
+            defaults.min_points,
+            int(defaults.window_seconds / max(1.0, defaults.step_seconds)),
+        )
+        for plan in plans:
+            cal = self._store.get_calibration(
+                group.name, query.id, series.label_key, plan.name, plan.instance
+            )
+            ttl = group.auto_select_interval_seconds
+            if cal is not None and (now - cal.last_calibrated) < ttl:
+                continue
+            # Use the same slice the detector will see during scoring,
+            # so calibration is comparing like with like — especially
+            # important when a stratified detector widened the fetch
+            # for the rest of the group.
+            sliced = self._slice_for_detector(plan, series.samples, defaults)
+            try:
+                # Match the kwarg-forwarding instantiation path used by
+                # ``_run_detector`` — without this, detectors that consume
+                # their tuning knobs in ``__init__`` would silently fail
+                # calibration (caught and swallowed below) and never get
+                # a confidence / baseline-stability gauge.
+                factory = _detector_factory_for(plan)
+                new_cal = calibrate_detector(
+                    samples=sliced,
+                    detector_factory=factory,
+                    params=plan.params,
+                    threshold=threshold_score,
+                    expected_samples=expected,
+                    now=now,
+                )
+            except Exception:
+                logger.exception(
+                    "calibration_failed",
+                    group=group.name,
+                    query=query.id,
+                    detector=plan.name,
+                )
+                continue
+            self._store.record_calibration(
+                group.name,
+                query.id,
+                series.label_key,
+                plan.name,
+                plan.instance,
+                new_cal,
+            )
+
+    def _select_winner(
+        self,
+        group: GroupConfig,
+        query: QueryConfig,
+        series: QuerySeries,
+        plans: list[_DetectorPlan],
+    ) -> tuple[str, str | None] | None:
+        # Winner = detector with highest F1; ties broken by precision,
+        # then by config order so the result is deterministic.
+        best: tuple[str, str | None] | None = None
+        best_score: tuple[float, float, int] | None = None
+        for idx, plan in enumerate(plans):
+            cal: DetectorCalibration | None = self._store.get_calibration(
+                group.name, query.id, series.label_key, plan.name, plan.instance
+            )
+            if cal is None:
+                continue
+            # Higher idx loses on ties because we want config order to
+            # win; negate so the tuple comparison ranks idx ascending.
+            score_key = (cal.f1, cal.precision, -idx)
+            if best_score is None or score_key > best_score:
+                best_score = score_key
+                best = (plan.name, plan.instance)
+        return best
 
     def _filter_source_labels(self, labels: dict[str, str]) -> dict[str, str]:
         cfg = self._config.exporter.output_labels
@@ -705,6 +1060,43 @@ def _invoke_detector(
     helper keeps the asyncio event loop free.
     """
     return detector.fit_score(samples, "", params)
+
+
+def _detector_factory_for(plan: _DetectorPlan) -> Any:
+    """Return a zero-arg factory the calibration cycle can call.
+
+    Calibration treats its ``detector_factory`` as a callable returning
+    a fresh detector instance; we close over ``plan.cls`` and
+    ``plan.params`` so the calibration path uses the same constructor
+    semantics as the live detection path.
+    """
+
+    def factory() -> Detector:
+        return _build_detector(plan.cls, plan.params)
+
+    return factory
+
+
+def _build_detector(cls: type[Detector], params: dict[str, Any]) -> Detector:
+    """Instantiate ``cls`` and forward any ``params`` the constructor accepts.
+
+    Detectors that take no constructor arguments (the historical
+    contract: read params off the ``params`` dict in ``fit_score``)
+    continue to work because we only filter for names ``__init__``
+    actually accepts. Detectors that declare matching keyword args
+    receive them as kwargs — the v0.2 "params forwarded as kwargs to
+    the detector's constructor" surface. The full params dict is also
+    handed to ``fit_score`` so both styles compose freely.
+    """
+    try:
+        sig = inspect.signature(cls)
+    except (TypeError, ValueError):
+        return cls()
+    accepts_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    if accepts_kwargs:
+        return cls(**params)
+    matched = {k: v for k, v in params.items() if k in sig.parameters}
+    return cls(**matched) if matched else cls()
 
 
 __all__ = [
