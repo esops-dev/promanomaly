@@ -6,7 +6,7 @@ Anomaly detection for Prometheus-compatible metrics, exposed as Prometheus metri
 [![Release](https://img.shields.io/github/v/release/esops-dev/promanomaly?include_prereleases&sort=semver)](https://github.com/esops-dev/promanomaly/releases)
 [![License](https://img.shields.io/github/license/esops-dev/promanomaly)](LICENSE)
 
-promanomaly reads a YAML config, queries a Prometheus-compatible TSDB
+`promanomaly` reads a YAML config, queries a Prometheus-compatible TSDB
 (VictoriaMetrics by default), runs robust statistical detectors over a
 rolling window of recent data, and exposes anomaly scores on `/metrics`.
 Anomalies become first-class metrics — graphable in Grafana, alertable
