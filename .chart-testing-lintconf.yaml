@@ -1,0 +1,15 @@
+# yamllint rules consumed by `chart-testing` (`ct lint`) and mirrored
+# by the local `make chart-lint` target. These match the chart-testing
+# defaults so what passes locally also passes in CI:
+#   * document-start and line-length are disabled — Kubernetes manifests
+#     and chart values commonly omit `---` and run wide.
+#   * truthy is disabled — Helm template output frequently includes
+#     truthy-looking strings in unrelated contexts.
+# Everything else stays at the yamllint default, including the
+# two-space-before-inline-comment rule that `ct lint` enforces on
+# every chart values file.
+---
+rules:
+  document-start: disable
+  line-length: disable
+  truthy: disable

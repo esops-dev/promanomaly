@@ -21,8 +21,8 @@ datasource:
   url: http://victoria-metrics-single-server:8428/
   timeout: 10s
   auth:
-    type: none         # none | bearer | basic | mtls
-    existingSecret: "" # secret name carrying the configured credential
+    type: none          # none | bearer | basic | mtls
+    existingSecret: ""  # secret name carrying the configured credential
 
 # Reload endpoint protection. The shipped NetworkPolicy denies ingress
 # to /-/reload and the debug endpoints by default; auth is defence in

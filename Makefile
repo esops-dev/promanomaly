@@ -79,6 +79,17 @@ chart-lint: chart-deps ## helm lint + kubeconform on rendered manifests.
 	helm lint $(CHART_DIR)/promanomaly-stack
 	helm template $(CHART_DIR)/promanomaly       | kubeconform -strict -summary -ignore-missing-schemas
 	helm template $(CHART_DIR)/promanomaly-stack | kubeconform -strict -summary -ignore-missing-schemas
+	@if command -v yamllint >/dev/null; then \
+	  yamllint -c .chart-testing-lintconf.yaml \
+	    $(CHART_DIR)/promanomaly/Chart.yaml \
+	    $(CHART_DIR)/promanomaly/values.yaml \
+	    $(CHART_DIR)/promanomaly/ci \
+	    $(CHART_DIR)/promanomaly-stack/Chart.yaml \
+	    $(CHART_DIR)/promanomaly-stack/values.yaml \
+	    $(CHART_DIR)/promanomaly-stack/ci; \
+	else \
+	  echo "yamllint not installed — skipping (ct lint will run it in CI)"; \
+	fi
 	@for f in dashboards/grafana/*.json; do python3 -m json.tool "$$f" > /dev/null; done
 	@echo "dashboards JSON ok"
 
