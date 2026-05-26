@@ -1,0 +1,184 @@
+# Default values for the promanomaly detector chart.
+# Single-replica only — HA mode lands in a later release and adds
+# leader election. See README for the operational story.
+
+image:
+  repository: ghcr.io/esops-dev/promanomaly
+  tag: ""              # overrides Chart.appVersion when set
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1        # do not bump — single-replica is the supported topology
+
+strategy:
+  type: Recreate       # required while replicaCount: 1
+
+# Datasource: the PromQL-compatible TSDB the detector reads from.
+datasource:
+  url: http://victoria-metrics-single-server:8428/
+  timeout: 10s
+  auth:
+    type: none          # none | bearer | basic | mtls
+    existingSecret: ""  # secret name carrying the configured credential
+
+# Reload endpoint protection. The shipped NetworkPolicy denies ingress
+# to /-/reload and the debug endpoints by default; auth is defence in
+# depth for zero-trust environments.
+server:
+  listen: ":9092"
+  refresh_interval: 1m
+  reload:
+    enabled: true
+    watch_configmap: true
+    auth:
+      type: none       # none | bearer | mtls
+      existingSecret: ""
+
+safety:
+  max_series_per_query: 1000
+  max_total_series: 20000
+  series_overflow: drop_lowest_priority
+  detect_timeout: 5s
+  query_timeout: 10s
+  on_source_failure: serve_stale
+  # Only honoured when on_source_failure: fail_ready. A single
+  # transient TSDB blip must not take the pod out of the service.
+  fail_ready_after: 3
+
+defaults:
+  window: 1h
+  step: 15s
+  min_points: 60
+  warmup_policy: emit_warming_up
+  emit_baseline: true
+  emit_change_points: true
+  emit_baseline_stability: true
+  emit_duration: true
+  alert_thresholds:
+    score: 3.0
+
+# Inline detector groups. Mutually exclusive with ``existingConfigMap``.
+#
+# REQUIRED: the schema validator rejects a config without at least one
+# group, so leaving this empty means the detector pod will CrashLoopBackOff
+# at boot. Either fill in groups here or point ``existingConfigMap`` at a
+# ConfigMap you manage out-of-band.
+groups: []
+
+# Manage the detector config out-of-band (Argo CD / Flux / sealed-secrets).
+# When set, the chart skips its own ConfigMap rendering and points the
+# Deployment at this ConfigMap instead.
+existingConfigMap: ""
+
+service:
+  type: ClusterIP
+  port: 9092
+
+serviceAccount:
+  create: true
+  name: ""
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+podAnnotations: {}
+podLabels: {}
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Optional ServiceMonitor for Prometheus Operator setups.
+serviceMonitor:
+  enabled: false
+  namespace: ""
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+  honorLabels: true   # required so anomaly labels flow through unchanged
+
+# NetworkPolicy: deny ingress to /-/reload and (future) debug endpoints
+# by default. Toggle off if your cluster does not use NetworkPolicies.
+networkPolicy:
+  enabled: true
+  allowedScrapeNamespaces: []   # empty = same namespace only
+
+# Optional bundled PrometheusRule. Off by default — we don't ship
+# opinionated thresholds. The rendered manifest mirrors
+# ``examples/alerts/promanomaly-rules.yaml`` and is the reference
+# starting point operators should tune per their SLOs.
+prometheusRule:
+  enabled: false
+  namespace: ""
+  # Labels added to the PrometheusRule object so the kube-prometheus
+  # Prometheus picks it up. The default ``release: prometheus`` matches
+  # the kube-prometheus-stack default; override to match your release.
+  labels:
+    release: prometheus
+  # Per-group toggles for the bundled rules. Each entry maps to one of
+  # the alerts defined in ``examples/alerts/promanomaly-rules.yaml``.
+  rules:
+    anomalyOutsideThreshold:
+      enabled: true
+      for: 5m
+      severity: warning
+    anomalyLongRunning:
+      enabled: true
+      durationSeconds: 1800
+      for: 1m
+      severity: critical
+    anomalyEnsembleAgreement:
+      enabled: true
+      for: 5m
+      severity: warning
+    anomalyChangePoint:
+      enabled: true
+      window: 10m
+      severity: info
+    anomalySignalMissing:
+      enabled: true
+      for: 10m
+      severity: critical
+    anomalyStale:
+      enabled: true
+      maxStaleSeconds: 600
+      for: 5m
+      severity: warning
+    anomalyDetectorFailing:
+      enabled: true
+      rateThreshold: 0.5
+      window: 15m
+      for: 5m
+      severity: warning
+    anomalySourceFailing:
+      enabled: true
+      window: 15m
+      for: 10m
+      severity: warning
+    anomalyNotReady:
+      enabled: true
+      for: 5m
+      severity: critical

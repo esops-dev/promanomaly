@@ -1,0 +1,13 @@
+# Clusters without NetworkPolicy support need to be able to install the
+# chart cleanly without rendering the policy.
+
+networkPolicy:
+  enabled: false
+
+groups:
+  - name: ci_nopolicy
+    queries:
+      - id: ci_metric
+        promql: up
+        detectors:
+          - name: MAD

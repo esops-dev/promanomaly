@@ -1,0 +1,62 @@
+# Self-monitoring config: point the detector at its own operational
+# metrics. This is both a smoke test (any rolling failure is itself an
+# anomaly) and a real production safeguard against silent stalls.
+
+apiVersion: promanomaly.io/v1alpha1
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 10s
+
+server:
+  listen: ":9092"
+  refresh_interval: 1m
+  reload:
+    enabled: true
+    watch_configmap: true
+  ready_endpoint: true
+
+safety:
+  max_series_per_query: 200
+  max_total_series: 1000
+  series_overflow: drop_lowest_priority
+  detect_timeout: 5s
+  query_timeout: 10s
+  on_source_failure: serve_stale
+
+defaults:
+  window: 1h
+  step: 15s
+  min_points: 60
+  warmup_policy: emit_warming_up
+  emit_baseline: true
+  emit_duration: true
+  alert_thresholds:
+    score: 4.0   # tighter than default 3.0 — self-metrics are tame in steady state
+
+groups:
+  - name: promanomaly_self
+    priority: 10
+    queries:
+      - id: pa_run_duration
+        promql: anomaly_run_duration_seconds{job="promanomaly"}
+        detectors:
+          - name: MAD
+          - name: Hampel
+            params:
+              t0: 5
+
+      - id: pa_failures_rate
+        promql: rate(anomaly_failures_total{job="promanomaly"}[5m])
+        detectors:
+          - name: MAD
+
+      - id: pa_source_failures_rate
+        promql: rate(anomaly_source_failure_total{job="promanomaly"}[5m])
+        detectors:
+          - name: MAD
+
+      - id: pa_dropped_rate
+        promql: rate(anomaly_series_dropped_total{job="promanomaly"}[5m])
+        detectors:
+          - name: MAD

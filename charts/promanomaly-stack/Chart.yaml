@@ -1,0 +1,33 @@
+apiVersion: v2
+name: promanomaly-stack
+description: |
+  Umbrella chart bundling promanomaly plus VictoriaMetrics for
+  greenfield installs. Production users are better off installing
+  ``promanomaly`` directly alongside their existing TSDB.
+type: application
+home: https://github.com/esops-dev/promanomaly
+sources:
+  - https://github.com/esops-dev/promanomaly
+maintainers:
+  - name: promanomaly maintainers
+    url: https://github.com/esops-dev/promanomaly
+keywords:
+  - prometheus
+  - victoriametrics
+  - anomaly-detection
+  - observability
+# Chart and app versions are placeholders intentionally — the release
+# pipeline rewrites both at tag time.
+version: 0.0.0
+appVersion: "0.0.0"
+
+dependencies:
+  - name: promanomaly
+    version: 0.0.0
+    repository: file://../promanomaly
+    condition: promanomaly.enabled
+  - name: victoria-metrics-single
+    version: "0.27.0"
+    repository: https://victoriametrics.github.io/helm-charts/
+    condition: victoria-metrics-single.enabled
+    alias: victoria-metrics-single

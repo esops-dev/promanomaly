@@ -1,0 +1,41 @@
+# Render every optional template at once — ServiceMonitor,
+# PrometheusRule, NetworkPolicy. Catches conditional-block regressions
+# in a single template render.
+
+serviceMonitor:
+  enabled: true
+  interval: 30s
+
+prometheusRule:
+  enabled: true
+  labels:
+    release: prometheus
+
+networkPolicy:
+  enabled: true
+  allowedScrapeNamespaces:
+    - monitoring
+
+safety:
+  on_source_failure: fail_ready
+  fail_ready_after: 5
+
+groups:
+  - name: ci_full
+    priority: 5
+    queries:
+      - id: latency
+        promql: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
+        detectors:
+          - name: MAD
+          - name: Hampel
+            instance: long
+            params:
+              window: 1h
+              t0: 5
+      - id: heartbeat
+        promql: up{job="critical"}
+        expect: true
+        expect_grace_runs: 2
+        detectors:
+          - name: MAD

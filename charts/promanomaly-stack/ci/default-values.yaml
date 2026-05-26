@@ -1,0 +1,12 @@
+# Greenfield install: VictoriaMetrics + promanomaly together. Default
+# subchart values plus a minimal detector group so the rendered config
+# passes promanomaly's schema validator at boot.
+
+promanomaly:
+  groups:
+    - name: ci_stack
+      queries:
+        - id: ci_metric
+          promql: up
+          detectors:
+            - name: MAD

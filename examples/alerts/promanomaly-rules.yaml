@@ -1,0 +1,153 @@
+# Reference PrometheusRule for promanomaly.
+#
+# These alerts are intentionally generic: severities, thresholds, and
+# `for:` clauses are starting points, not opinions. Tune per SLO before
+# wiring them into a real Alertmanager route.
+#
+# Two delivery modes are supported:
+#   1. Copy this file into your cluster as-is (Prometheus Operator picks
+#      it up via the standard `release` label selector — adjust the
+#      `release: prometheus` label to match your kube-prometheus-stack
+#      release name).
+#   2. Render the equivalent rules from the bundled Helm chart by
+#      setting `prometheusRule.enabled=true` on `charts/promanomaly/`.
+#
+# Alert names match those documented in CLAUDE.md and `docs/patterns.md`.
+#
+# DRIFT GUARD: this file is the canonical source for the *alert name set*
+# and *expr shape*. The Helm template at
+# `charts/promanomaly/templates/prometheusrule.yaml` renders the same
+# alerts with the same expressions but parameterised thresholds. The
+# `tests/test_prometheus_rules_parity.py` test fails when either file
+# drops or renames an alert that the other still has, so adding or
+# removing an alert is a coordinated change against both files.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: promanomaly
+  labels:
+    app.kubernetes.io/name: promanomaly
+    app.kubernetes.io/part-of: promanomaly
+    # Selector used by the kube-prometheus-stack default Prometheus.
+    release: prometheus
+spec:
+  groups:
+    - name: promanomaly.anomalies
+      interval: 30s
+      rules:
+        - alert: AnomalyOutsideThreshold
+          expr: anomaly_outside_threshold == 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Anomaly score above threshold for {{ $labels.id }} ({{ $labels.group }})"
+            description: |
+              Detector {{ $labels.detector }} has reported
+              anomaly_outside_threshold=1 for at least 5m on series
+              id={{ $labels.id }} group={{ $labels.group }}.
+              Inspect the underlying signal before silencing.
+
+        - alert: AnomalyLongRunning
+          # Score has been over threshold continuously for 30 minutes;
+          # escalate beyond the standard AnomalyOutsideThreshold rule.
+          expr: anomaly_duration_seconds > 1800
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Anomaly sustained >30m for {{ $labels.id }} ({{ $labels.group }})"
+            description: |
+              anomaly_duration_seconds has been over 1800 for at least
+              1m, meaning the underlying anomaly_outside_threshold has
+              been continuously 1 for more than 30 minutes. Escalate.
+
+        - alert: AnomalyEnsembleAgreement
+          # Composite metric is only emitted when an ensemble: block is
+          # configured. The rule is harmless when absent (the expression
+          # evaluates to "no data").
+          expr: anomaly_composite_outside_threshold == 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Ensemble agreement on anomaly for {{ $labels.id }} ({{ $labels.group }})"
+            description: |
+              Multiple detectors agree the signal is anomalous. High
+              precision; investigate even with a short `for:` clause.
+
+        - alert: AnomalyChangePoint
+          expr: increase(anomaly_change_point_total[10m]) > 0
+          for: 0m
+          labels:
+            severity: info
+          annotations:
+            summary: "Change-point detected on {{ $labels.id }} ({{ $labels.group }})"
+            description: |
+              A change-point detector reported a regime shift in the
+              last 10 minutes. Useful as context, not necessarily a
+              page.
+
+        - alert: AnomalySignalMissing
+          # Companion to expect:true / discover-based absence detection.
+          expr: anomaly_signal_missing == 1
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Expected signal {{ $labels.id }} ({{ $labels.group }}) missing"
+            description: |
+              A query configured with expect:true has returned no
+              series for at least the configured grace runs.
+
+    - name: promanomaly.operational
+      interval: 30s
+      rules:
+        - alert: AnomalyStale
+          expr: time() - anomaly_last_run_timestamp_seconds > 600
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "promanomaly group {{ $labels.group }} stale"
+            description: |
+              No successful detection run for group {{ $labels.group }}
+              in over 10 minutes. Check scheduler health and source
+              connectivity.
+
+        - alert: AnomalyDetectorFailing
+          expr: rate(anomaly_failures_total[15m]) > 0.5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "promanomaly detector {{ $labels.detector }} failing"
+            description: |
+              Detector failures are exceeding 0.5/s for group
+              {{ $labels.group }} / detector {{ $labels.detector }}
+              with reason {{ $labels.reason }}.
+
+        - alert: AnomalySourceFailing
+          expr: rate(anomaly_source_failure_total[15m]) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "promanomaly TSDB queries failing for {{ $labels.group }}"
+            description: |
+              Source-query failures are non-zero over 15m. With the
+              default serve_stale policy /metrics is still serving the
+              last good snapshot — scores are stale, not fresh.
+
+        - alert: AnomalyNotReady
+          expr: max(anomaly_group_ready) == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "promanomaly has no ready groups"
+            description: |
+              No promanomaly group has completed a successful run in
+              the last 5 minutes. The pod will fail readiness if the
+              fail_ready policy is configured.

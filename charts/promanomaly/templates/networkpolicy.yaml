@@ -1,0 +1,29 @@
+{{- if .Values.networkPolicy.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "promanomaly.fullname" . }}
+  labels: {{- include "promanomaly.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "promanomaly.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow /metrics scraping. The detector serves /-/reload and the
+    # debug endpoints from the same pod & port, so this rule
+    # deliberately allows the *namespace*, not the world.
+    - from:
+        - podSelector: {}
+        {{- range .Values.networkPolicy.allowedScrapeNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      ports:
+        - port: 9092
+          protocol: TCP
+  egress:
+    - {} # allow all egress; the datasource URL is user-configurable
+{{- end }}

@@ -1,0 +1,52 @@
+# Local-dev config: short rolling window, fast refresh, low min_points so
+# scores are produced minutes after the stack starts (instead of after
+# an hour of warm-up). Not intended for any non-dev use.
+
+apiVersion: promanomaly.io/v1alpha1
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 30s
+
+server:
+  listen: ":9092"
+  refresh_interval: 30s
+  reload:
+    enabled: true
+    watch_configmap: false
+  ready_endpoint: true
+
+safety:
+  max_series_per_query: 200
+  max_total_series: 2000
+  series_overflow: drop_lowest_priority
+  detect_timeout: 5s
+  query_timeout: 10s
+  on_source_failure: serve_stale
+
+defaults:
+  window: 15m
+  step: 15s
+  min_points: 30
+  warmup_policy: emit_warming_up
+  emit_baseline: true
+  emit_change_points: true
+  emit_baseline_stability: true
+  emit_duration: true
+  alert_thresholds:
+    score: 3.0
+
+groups:
+  - name: node_dev
+    priority: 1
+    queries:
+      - id: node_cpu_busy_pct
+        promql: '100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[1m])))'
+        detectors:
+          - name: MAD
+            params:
+              window: 15m
+          - name: Hampel
+            params:
+              window: 15m
+              t0: 3

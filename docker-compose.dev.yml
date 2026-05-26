@@ -1,0 +1,106 @@
+# Endpoints on localhost:
+#   VictoriaMetrics  :8428
+#   Prometheus       :9090
+#   node-exporter    :9100
+#   detector         :9092  (/metrics, /healthz, /-/reload, /ready, /debug/*)
+#   Redis            :6379  (query-cache backend; HA isn't wired in compose
+#                            since leader election needs a kube API server)
+
+name: promanomaly-dev
+
+services:
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.142.0
+    container_name: pa-victoriametrics
+    command:
+      - "--storageDataPath=/storage"
+      - "--httpListenAddr=:8428"
+      - "--retentionPeriod=30d"
+    ports:
+      - "8428:8428"
+    volumes:
+      - vm-data:/storage
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8428/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:v1.11.1
+    container_name: pa-node-exporter
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    ports:
+      - "9100:9100"
+    restart: unless-stopped
+
+  redis:
+    # Lets the dev detector exercise the Redis-backed query cache path
+    # against a real backend instead of in-memory only. HA mode (leader
+    # election) needs a Kubernetes API server, which docker-compose does
+    # not provide — so the snapshot cache stays unused here. The query
+    # cache validates fine in single-replica mode.
+    image: redis:7-alpine
+    container_name: pa-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.11.3
+    container_name: pa-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=2h"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+    restart: unless-stopped
+
+  detector:
+    build:
+      context: ./detector
+    image: promanomaly:dev
+    container_name: pa-detector
+    command: ["--config", "/etc/promanomaly/config.yaml"]
+    ports:
+      - "9092:9092"
+    volumes:
+      # Dev-tuned config: short window, fast refresh, low min_points so the
+      # first scores are produced minutes after `make dev-up` instead of
+      # waiting an hour for the rolling window to fill.
+      # examples/configs/* are production-grade and require a long-running TSDB.
+      - ./docker/dev-config.yaml:/etc/promanomaly/config.yaml:ro
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  vm-data:
+  prom-data:

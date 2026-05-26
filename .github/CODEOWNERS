@@ -1,0 +1,28 @@
+# Code owners for promanomaly.
+#
+# Last matching pattern wins. The catch-all assigns review on every PR;
+# specific patterns scope review for sensitive areas.
+#
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+*                                  @dj-wasabi
+
+# Build, release, and supply-chain plumbing — review every change.
+/.github/                          @dj-wasabi
+/Makefile                          @dj-wasabi
+/detector/Dockerfile               @dj-wasabi
+/detector/pyproject.toml           @dj-wasabi
+
+# Output metric names are part of the public API.
+/detector/src/promanomaly/exporter.py   @dj-wasabi
+
+# Security-sensitive surfaces.
+/detector/src/promanomaly/leader.py     @dj-wasabi
+/detector/src/promanomaly/source.py     @dj-wasabi
+/SECURITY.md                            @dj-wasabi
+
+# Cross-tool label contract is committed identically in both repos.
+/LABELS_CONTRACT.md                @dj-wasabi
+
+# Helm charts ship to end users — schema changes are breaking.
+/charts/                           @dj-wasabi

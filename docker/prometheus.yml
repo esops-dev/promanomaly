@@ -1,0 +1,39 @@
+# Prometheus config for the local dev stack (docker-compose.dev.yml).
+#
+# Scrapes node-exporter and the detector, then remote_writes everything
+# into VictoriaMetrics so the detector has a long-term TSDB to query.
+# Production Prometheus is never the detector's read source — all
+# detector reads go through the long-term TSDB instead.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: dev
+    replica: prometheus-0
+
+remote_write:
+  - url: http://victoriametrics:8428/api/v1/write
+    queue_config:
+      max_samples_per_send: 5000
+      capacity: 20000
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  - job_name: promanomaly
+    # honor_labels: anomaly metrics carry the source ``instance`` label
+    # (e.g. ``dev-host-a:9100``) from the underlying time-series. Without
+    # honor_labels Prometheus would rename it to ``exported_instance`` and
+    # add its own ``instance="detector:9092"``, which makes joining
+    # ``anomaly_score`` to the source metric on ``instance`` impossible
+    # from a dashboard.
+    honor_labels: true
+    static_configs:
+      - targets: ["detector:9092"]
