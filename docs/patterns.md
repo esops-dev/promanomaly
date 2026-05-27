@@ -120,6 +120,37 @@ topk(10, max by (id, group, instance) (anomaly_score))
 
 Add `anomaly_duration_seconds` as a second column to distinguish brief spikes from sustained problems.
 
+## Change-Points Composed With Outlier Alerts
+
+Layer change-point detection on top of an ordinary outlier detector so the alert text can distinguish "still anomalous" from "regime just shifted":
+
+```yaml
+queries:
+  - id: error_rate
+    promql: sum by (service) (rate(http_requests_total{status=~"5.."}[5m]))
+    detectors:
+      - name: MAD                 # ordinary outlier alerts
+      - name: BOCPD               # regime-shift detection
+      - name: CUSUM               # classical change-point counter
+```
+
+Alert recipes:
+
+```promql
+# Regime shift happened recently AND the latest sample is still off-baseline.
+increase(anomaly_change_point_total{detector="BOCPD"}[10m]) > 0
+  and on (id, group) anomaly_outside_threshold{detector="BOCPD"} == 1
+```
+
+```promql
+# Either change-point detector says "fresh fire in the last minute".
+sum by (id, group) (
+  rate(anomaly_change_point_total{detector=~"BOCPD|CUSUM"}[1m])
+) > 0
+```
+
+Do NOT silence change-point alerts during deploys inside the detector — fire on the change-point in Prometheus, silence in Alertmanager during the deploy window via webhooks. Damping scores during deploys hides the failure modes operators most need to see.
+
 ## Cross-Tool: promforecast + promanomaly
 
 ```promql

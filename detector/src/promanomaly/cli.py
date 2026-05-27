@@ -6,6 +6,8 @@ Subcommands
   additionally executes every query against the live datasource.
 - ``dry-run`` — validate + execute every group once in-process, then exit.
 - ``detect-once`` — run one detector against an ad-hoc PromQL query.
+- ``analyze`` — offline change-point analysis over a historical PromQL
+  range (uses ``ruptures`` Pelt/Binseg/Window algorithms).
 - ``detectors list`` — dump the entry-point registry.
 
 Running without a subcommand boots the server (used by the container's
@@ -15,6 +17,7 @@ ENTRYPOINT). Flag names parallel promforecast where the semantics match.
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import json
 import sys
 import time
@@ -28,7 +31,7 @@ from .detectors import list_meta
 from .exporter import OperationalMetrics
 from .logging import configure_logging
 from .runner import Runner, _build_detector
-from .source import PromQLSource, SourceQueryError
+from .source import PromQLSource, QuerySeries, SourceQueryError
 from .state import SnapshotStore
 
 
@@ -356,6 +359,277 @@ def detect_once(
         return 0
 
     sys.exit(asyncio.run(_run()))
+
+
+@cli.command(name="analyze")
+@click.option("--query", "promql", required=True, help="PromQL query to fetch and analyse.")
+@click.option(
+    "--from",
+    "from_",
+    required=True,
+    help=(
+        "Range start. RFC3339 (e.g. 2024-01-15T00:00:00Z), unix seconds, "
+        "or a relative '-7d' / '-3h' offset from --to."
+    ),
+)
+@click.option(
+    "--to",
+    "to_",
+    default="now",
+    show_default=True,
+    help="Range end. RFC3339, unix seconds, or 'now' (default).",
+)
+@click.option(
+    "--datasource-url",
+    default="http://localhost:8428/",
+    show_default=True,
+    help="PromQL-compatible datasource URL.",
+)
+@click.option(
+    "--step",
+    default="30s",
+    show_default=True,
+    help="Sample step for the range query.",
+)
+@click.option(
+    "--detector",
+    "detector_name",
+    type=click.Choice(["ruptures", "pelt", "binseg", "window"]),
+    default="ruptures",
+    show_default=True,
+    help=(
+        "Offline algorithm: 'ruptures' / 'pelt' is the default Pelt search; "
+        "'binseg' uses binary segmentation; 'window' uses a sliding-window "
+        "scan. All three are from the ruptures library."
+    ),
+)
+@click.option(
+    "--model",
+    default="l2",
+    show_default=True,
+    help="Cost model passed to ruptures (l1, l2, rbf, ar, normal).",
+)
+@click.option(
+    "--penalty",
+    default=10.0,
+    show_default=True,
+    type=float,
+    help="Penalty parameter (used by Pelt/Binseg); higher = fewer change-points.",
+)
+@click.option(
+    "--top",
+    default=10,
+    show_default=True,
+    type=int,
+    help="Print at most this many change-points (ranked by score).",
+)
+@click.option(
+    "--output",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    show_default=True,
+    help="Output format. 'json' is suitable for machine consumption.",
+)
+@click.option(
+    "--timeout",
+    default="30s",
+    show_default=True,
+    help="Datasource HTTP timeout.",
+)
+def analyze(
+    promql: str,
+    from_: str,
+    to_: str,
+    datasource_url: str,
+    step: str,
+    detector_name: str,
+    model: str,
+    penalty: float,
+    top: int,
+    output: str,
+    timeout: str,
+) -> None:
+    """Offline change-point analysis over a historical PromQL range.
+
+    Pulls the full ``[from, to]`` range in one query, runs the chosen
+    offline algorithm, and prints a ranked list of detected breaks with
+    timestamps and per-break scores. Different algorithm class from
+    BOCPD / CUSUM — those run online per scrape; this one knows the
+    whole series at once and finds segmentation that minimises a cost
+    function (Pelt / Binseg) or peak detection (Window).
+    """
+    try:
+        to_seconds = _parse_analyze_timestamp(to_, now=time.time())
+        from_seconds = _parse_analyze_timestamp(from_, now=to_seconds)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    if from_seconds >= to_seconds:
+        raise click.UsageError("--from must be before --to")
+
+    step_seconds = parse_duration(step)
+    window_seconds = to_seconds - from_seconds
+
+    async def _fetch() -> list[QuerySeries]:
+        source = PromQLSource(datasource_url, parse_duration(timeout))
+        try:
+            await source.start()
+            result = await source.range_query(
+                promql=promql,
+                end=to_seconds,
+                window_seconds=window_seconds,
+                step_seconds=step_seconds,
+            )
+        finally:
+            await source.close()
+        return list(result.series)
+
+    try:
+        series_list = asyncio.run(_fetch())
+    except SourceQueryError as exc:
+        click.echo(f"query failed: {exc}", err=True)
+        sys.exit(2)
+
+    if not series_list:
+        click.echo("no series returned", err=True)
+        sys.exit(1)
+
+    findings = _run_offline_change_points(
+        series_list=series_list,
+        detector_name=detector_name,
+        model=model,
+        penalty=penalty,
+        top=top,
+    )
+
+    if output == "json":
+        click.echo(json.dumps(findings, indent=2, sort_keys=True))
+    else:
+        _print_analyze_text(findings)
+
+
+def _parse_analyze_timestamp(value: str, *, now: float) -> float:
+    """Parse RFC3339 / unix-seconds / 'now' / relative '-7d' to unix seconds."""
+    value = value.strip()
+    if value == "now":
+        return float(now)
+    if value.startswith("-"):
+        # Relative offset from ``now`` (which the caller passes as the
+        # already-parsed --to value when resolving --from).
+        return float(now) - parse_duration(value[1:])
+    # Try unix seconds first (integer or float).
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    # RFC3339; accept the common 'Z' suffix that fromisoformat() handles
+    # natively as of Python 3.11.
+    try:
+        dt = _dt.datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid timestamp {value!r}; expected RFC3339, unix seconds, 'now', or '-7d'"
+        ) from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.UTC)
+    return dt.timestamp()
+
+
+def _run_offline_change_points(
+    *,
+    series_list: list[QuerySeries],
+    detector_name: str,
+    model: str,
+    penalty: float,
+    top: int,
+) -> list[dict[str, Any]]:
+    """Run the chosen ruptures algorithm and return ranked findings.
+
+    Imported lazily so users invoking unrelated CLI subcommands don't pay
+    the scipy/ruptures import cost on every invocation. ``ruptures`` is
+    an optional dependency surfaced via the ``[analyze]`` extra so the
+    runtime container can omit it; install with
+    ``pip install promanomaly[analyze]`` to enable the CLI.
+    """
+    import numpy as np
+
+    try:
+        import ruptures as rpt
+    except ImportError as exc:
+        raise click.ClickException(
+            "promanomaly analyze requires the 'ruptures' library — "
+            "install with: pip install 'promanomaly[analyze]'"
+        ) from exc
+
+    findings: list[dict[str, Any]] = []
+    for series in series_list:
+        timestamps = series.samples["timestamp"].to_numpy(dtype=float, copy=False)
+        values = series.samples["y"].to_numpy(dtype=float, copy=False)
+        if values.size < 4:
+            # Skip silently — too short to find anything useful and
+            # ruptures will raise on tiny inputs.
+            continue
+        signal = values.reshape(-1, 1)
+        breakpoints: list[int]
+        if detector_name in ("ruptures", "pelt"):
+            algo = rpt.Pelt(model=model).fit(signal)
+            breakpoints = algo.predict(pen=penalty)
+        elif detector_name == "binseg":
+            algo = rpt.Binseg(model=model).fit(signal)
+            # Binseg.predict takes n_bkps OR pen — use pen for parity
+            # with Pelt so the same --penalty knob behaves consistently.
+            breakpoints = algo.predict(pen=penalty)
+        elif detector_name == "window":
+            # Window-based change-point detection; uses a fixed window
+            # width sized as a fraction of the signal length.
+            width = max(10, values.size // 20)
+            algo = rpt.Window(width=width, model=model).fit(signal)
+            breakpoints = algo.predict(pen=penalty)
+        else:
+            raise click.UsageError(f"unknown detector {detector_name!r}")
+
+        # ruptures appends the end of the signal as the final breakpoint
+        # — drop it so the output only carries genuine change-points.
+        breakpoints = [b for b in breakpoints if b < values.size]
+        for bp in breakpoints:
+            # Score: absolute mean shift across the break, normalised by
+            # the in-segment standard deviation. Approximate but
+            # interpretable; lets the caller rank breaks by magnitude.
+            left = values[max(0, bp - 30) : bp]
+            right = values[bp : min(values.size, bp + 30)]
+            if left.size == 0 or right.size == 0:
+                score = 0.0
+            else:
+                pooled_std = float(np.std(np.concatenate([left, right])))
+                pooled_std = max(pooled_std, 1e-12)
+                score = abs(float(np.mean(right)) - float(np.mean(left))) / pooled_std
+            findings.append(
+                {
+                    "labels": series.labels,
+                    "timestamp": float(timestamps[bp]),
+                    "iso8601": _format_iso(float(timestamps[bp])),
+                    "score": float(score),
+                    "index": int(bp),
+                    "left_mean": float(left.mean()) if left.size else None,
+                    "right_mean": float(right.mean()) if right.size else None,
+                }
+            )
+
+    findings.sort(key=lambda r: r["score"], reverse=True)
+    return findings[:top]
+
+
+def _format_iso(ts: float) -> str:
+    return _dt.datetime.fromtimestamp(ts, tz=_dt.UTC).isoformat()
+
+
+def _print_analyze_text(findings: list[dict[str, Any]]) -> None:
+    if not findings:
+        click.echo("no change-points detected")
+        return
+    click.echo(f"{'when':30}  {'score':>8}  labels")
+    for row in findings:
+        labels = ",".join(f"{k}={v}" for k, v in sorted(row["labels"].items())) or "-"
+        click.echo(f"{row['iso8601']:30}  {row['score']:8.2f}  {labels}")
 
 
 @cli.group()

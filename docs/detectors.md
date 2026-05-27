@@ -133,6 +133,66 @@ Bucket every sample in the lookback window by its UTC hour-of-day (24 buckets by
 **Resource note**
 A long lookback against a large query can pull a lot of data; respect `safety.max_series_per_query` and `safety.max_total_series`. The full day-of-week / multi-week version (with bounded sliding-window query strategy) lands in a later milestone.
 
+## BOCPD — Bayesian Online Change-Point Detection
+
+```yaml
+detectors:
+  - name: BOCPD
+    params:
+      hazard: 250        # default
+      threshold: 0.5     # default
+      lag: 15            # default
+```
+
+**Best for**
+Detecting regime shifts on signals where you want a probabilistic change-point score — deploys, rolling restarts, autoscaler steps, anything that breaks the baseline rather than spiking through it.
+
+**How it works**
+Models the observation stream with a Normal-Gamma conjugate prior and maintains a posterior distribution over the *run length* (samples since the last change-point). The score is the posterior mass at recent run lengths (`r_t <= lag`) — high when a change-point happened in the last `lag` samples. Fires when score ≥ `threshold`; `threshold` is a per-detector override of `alert_thresholds.score` because the score is a probability, not a sigma multiplier.
+
+**Parameters**
+- `hazard` (default `250`) — expected interval between change-points in samples.
+- `threshold` (default `0.5`) — posterior probability above which the detector fires.
+- `lag` (default `15`) — inclusive run-length window counted as "recent".
+
+**Trade-offs**
+Probabilistic and confidence-gateable; more expensive than CUSUM (`O(window²)` per fit, still cheap in absolute terms); assumes Gaussian-ish observations.
+
+## CUSUM — Cumulative Sum
+
+```yaml
+detectors:
+  - name: CUSUM
+    params:
+      k: 0.5      # default
+      h: 5.0      # default
+```
+
+**Best for**
+A fast, interpretable change-point detector. Workhorse of industrial process control; pairs well with BOCPD when you want both probabilistic and classical signals on the same metric.
+
+**How it works**
+Tracks running upper/lower cumulative sums of `(x - median - k*sigma)` against a MAD-derived sigma estimate. A change-point fires on a *fresh* crossing of `h*sigma` at the latest sample (no double-counting on overlapping rolling-window calls). The score is `max(|S+|, |S-|) / sigma`, in sigma units — same scale as MAD/Hampel.
+
+**Parameters**
+- `k` (default `0.5`) — reference value (in sigma units); slack subtracted before accumulation.
+- `h` (default `5.0`) — decision threshold (in sigma units).
+
+**Trade-offs**
+Single-pass, `O(window)`; intuitive sigma-multiplier units; less natural for non-Gaussian likelihoods but the MAD-derived sigma helps on heavy-tailed signals.
+
+### When to choose BOCPD vs CUSUM
+
+| Aspect                       | BOCPD                                | CUSUM                               |
+|------------------------------|--------------------------------------|-------------------------------------|
+| Output units                 | Probability `[0, 1]`                 | Sigma multiplier                    |
+| Tuning surface               | `hazard` + `threshold` + `lag`       | `k` + `h`                           |
+| Per-fit cost                 | `O(window²)`                         | `O(window)`                         |
+| Probabilistic interpretation | Yes                                  | No                                  |
+| Best when                    | You want a confidence-gated alert    | You want simple, fast, time-tested  |
+
+If unsure: start with CUSUM, layer BOCPD when you want posterior-confidence gating. See [`change-points.md`](change-points.md) for worked examples (synthetic step change, deploy-induced regression).
+
 ## Auto-select Best Detector Per Series
 
 ```yaml

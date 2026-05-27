@@ -48,7 +48,7 @@ Strong daily/hourly pattern (request rate, batch counters)?
 └── Yes → HourOfDayMAD
 
 Breaks on deploys or rolling restarts?
-└── Yes → BOCPD / CUSUM (planned change-point detectors). Until then use short-window MAD.
+└── Yes → BOCPD (probabilistic) or CUSUM (sigma-multiplier). See `change-points.md`.
 
 Comparing identical instances (nodes, pods, replicas)?
 └── Yes → Cohort detector (planned)

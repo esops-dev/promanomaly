@@ -122,6 +122,15 @@ _HELP: dict[str, tuple[str, str]] = {
             "else 0. Emitted only when an ensemble: block is configured."
         ),
     ),
+    "anomaly_change_point_total": (
+        "counter",
+        (
+            "Cumulative change-points observed by a change-point detector "
+            "(BOCPD, CUSUM) for one (id, group, detector) series. Resets "
+            "to zero on process restart — Prometheus's counter-reset "
+            "handling absorbs that."
+        ),
+    ),
 }
 
 
