@@ -15,7 +15,7 @@ from tests.fixtures import (
 def test_hampel_metadata() -> None:
     detector = Hampel()
     assert detector.name == "Hampel"
-    assert detector.defaults == {"t0": 3}
+    assert detector.defaults == {"t0": 3, "recursive_trim": False, "trim_threshold": 3.0}
 
 
 def test_clean_baseline_scores_low() -> None:

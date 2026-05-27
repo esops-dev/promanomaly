@@ -40,9 +40,32 @@ data:
       {{- with .Values.safety.query_cache }}
       query_cache:
         enabled: {{ .enabled }}
+        {{- with .backend }}
+        backend: {{ . | quote }}
+        {{- end }}
         max_entries: {{ .max_entries }}
         ttl: {{ .ttl | quote }}
       {{- end }}
+      {{- with .Values.safety.redis }}
+      redis:
+        url: {{ .url | quote }}
+        key_prefix: {{ .key_prefix | quote }}
+        timeout: {{ .timeout | quote }}
+      {{- end }}
+      {{- with .Values.safety.discovery }}
+      discovery:
+        forget_after_runs: {{ .forget_after_runs }}
+      {{- end }}
+    {{- if .Values.highAvailability.enabled }}
+    highAvailability:
+      enabled: true
+      lease_name: {{ .Values.highAvailability.lease_name | quote }}
+      lease_namespace: {{ default .Release.Namespace .Values.highAvailability.lease_namespace | quote }}
+      lease_duration: {{ .Values.highAvailability.lease_duration | quote }}
+      renew_deadline: {{ .Values.highAvailability.renew_deadline | quote }}
+      retry_period: {{ .Values.highAvailability.retry_period | quote }}
+      snapshot_ttl: {{ .Values.highAvailability.snapshot_ttl | quote }}
+    {{- end }}
     defaults:
       window: {{ .Values.defaults.window | quote }}
       step: {{ .Values.defaults.step | quote }}
@@ -60,6 +83,18 @@ data:
       {{- end }}
       alert_thresholds:
         score: {{ .Values.defaults.alert_thresholds.score }}
+    {{- if or .Values.exporter.output_labels.allow .Values.exporter.output_labels.drop }}
+    exporter:
+      output_labels:
+        {{- with .Values.exporter.output_labels.allow }}
+        allow:
+{{ toYaml . | indent 10 }}
+        {{- end }}
+        {{- with .Values.exporter.output_labels.drop }}
+        drop:
+{{ toYaml . | indent 10 }}
+        {{- end }}
+    {{- end }}
     groups:
 {{ toYaml .Values.groups | indent 6 }}
 {{- end }}

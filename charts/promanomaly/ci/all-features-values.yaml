@@ -28,6 +28,20 @@ defaults:
   min_abs_delta: 0.0
   min_relative_delta: 0.05
 
+# Output-label filtering: covers the v0.4 exporter.output_labels
+# surface so the configmap.yaml conditional block renders under the
+# CI matrix. ``allow`` keeps an explicit set of instance/region labels
+# on the wire; ``drop`` strips a privacy-sensitive customer id even
+# when it would otherwise be in the allow list.
+exporter:
+  output_labels:
+    allow:
+      - instance
+      - region
+      - job
+    drop:
+      - customer_id
+
 groups:
   - name: ci_full
     priority: 5

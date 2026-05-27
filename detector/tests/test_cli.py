@@ -65,17 +65,23 @@ def test_detectors_list_local_returns_built_ins() -> None:
     hampel = next(r for r in rows if r["name"] == "Hampel")
     # ``defaults`` stays around for compatibility with scripts that
     # parsed the v0.2.0 output…
-    assert hampel["defaults"] == {"t0": 3}
+    assert hampel["defaults"] == {"t0": 3, "recursive_trim": False, "trim_threshold": 3.0}
     # …and ``params`` is the canonical richer shape: name + type + doc
     # for each tunable parameter.
     params_by_name = {p["name"]: p for p in hampel["params"]}
-    assert set(params_by_name) == {"t0"}
+    assert set(params_by_name) == {"t0", "recursive_trim", "trim_threshold"}
     assert params_by_name["t0"]["type"] == "int"
     assert params_by_name["t0"]["default"] == 3
     assert params_by_name["t0"]["doc"]
-    # MAD has no tunable knobs — params is just empty, not absent.
+    assert params_by_name["recursive_trim"]["type"] == "bool"
+    assert params_by_name["recursive_trim"]["default"] is False
+    assert params_by_name["trim_threshold"]["type"] == "float"
+    assert params_by_name["trim_threshold"]["default"] == 3.0
+    # MAD picked up the same recursive_trim + trim_threshold knobs in
+    # v0.4 — same opt-in baseline-contamination mitigation as Hampel.
     mad = next(r for r in rows if r["name"] == "MAD")
-    assert mad["params"] == []
+    mad_params = {p["name"] for p in mad["params"]}
+    assert {"recursive_trim", "trim_threshold"}.issubset(mad_params)
 
 
 def test_detectors_list_target_proxies_remote_endpoint(
@@ -284,3 +290,157 @@ def test_unused_query_result_import_kept() -> None:
     # explicit so a refactor that moves the type doesn't silently break
     # CLI imports we exercise via _stub_source_with.
     assert QueryResult is not None
+
+
+# ---------------------------------------------------------------------------
+# validate --probe with discover: blocks (v0.4)
+# ---------------------------------------------------------------------------
+
+
+def _write_discovery_config(tmp_path: Path) -> Path:
+    cfg = {
+        "apiVersion": CURRENT_API_VERSION,
+        "datasource": {"url": "http://stub"},
+        "groups": [
+            {
+                "name": "g",
+                "queries": [
+                    {
+                        "id": "cpu_{{ instance }}",
+                        "promql": 'rate(node_cpu_seconds_total{instance="{{ instance }}"}[1m])',
+                        "discover": [{"variable": "instance", "probe": "up", "label": "instance"}],
+                        "detectors": [{"name": "MAD"}],
+                    }
+                ],
+            }
+        ],
+    }
+    path = tmp_path / "discovery.yaml"
+    path.write_text(yaml.safe_dump(cfg))
+    return path
+
+
+def test_validate_probe_simulates_discovery_expansion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``validate --probe`` against a discover: query reports which
+    variable values were resolved, how many variants the Cartesian
+    expansion yielded, and (per variant) how many series the rendered
+    PromQL would pull from the TSDB. This is the v0.4 "catch the wildcard
+    foot-gun at PR time" gate."""
+    path = _write_discovery_config(tmp_path)
+
+    probe_text = "up"
+
+    def responder(promql: str) -> StubResponse:
+        if promql == probe_text:
+            return StubResponse(
+                series=[
+                    QuerySeries(labels={"instance": "node_a"}, samples=clean_baseline(5)),
+                    QuerySeries(labels={"instance": "node_b"}, samples=clean_baseline(5)),
+                ]
+            )
+        return StubResponse(
+            series=[QuerySeries(labels={"instance": "x"}, samples=clean_baseline(5))]
+        )
+
+    _stub_source_with(monkeypatch, responder)
+
+    result = CliRunner().invoke(cli, ["validate", "--config", str(path), "--probe"])
+    assert result.exit_code == 0, result.output
+    lines = [line for line in result.output.strip().splitlines() if line.strip()]
+    payloads = [json.loads(line) for line in lines]
+    # One ``discovered`` line listing the variable's values.
+    discovered = next(p for p in payloads if p.get("status") == "discovered")
+    assert sorted(discovered["values"]) == ["node_a", "node_b"]
+    assert discovered["count"] == 2
+    # One ``expansion`` line announcing the fan-out size.
+    expansion = next(p for p in payloads if p.get("status") == "expansion")
+    assert expansion["variants"] == 2
+    # Two ``ok`` rows (one per rendered variant).
+    ok_rows = [p for p in payloads if p.get("status") == "ok"]
+    assert len(ok_rows) == 2
+    summary = payloads[-1]["summary"]
+    assert summary["discovery_expansions"] == 2
+    assert summary["total_series"] == 2
+
+
+def test_validate_probe_surfaces_unsafe_discovered_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``validate --probe`` should surface dropped unsafe values so an
+    operator inspecting the JSON output can fix the discovery axis
+    rather than wonder why their probe returned three values but only
+    two variants got rendered."""
+    path = _write_discovery_config(tmp_path)
+
+    def responder(promql: str) -> StubResponse:
+        if promql == "up":
+            return StubResponse(
+                series=[
+                    QuerySeries(labels={"instance": "node_a"}, samples=clean_baseline(5)),
+                    QuerySeries(labels={"instance": 'evil"label'}, samples=clean_baseline(5)),
+                ]
+            )
+        return StubResponse(
+            series=[QuerySeries(labels={"instance": "x"}, samples=clean_baseline(5))]
+        )
+
+    _stub_source_with(monkeypatch, responder)
+
+    result = CliRunner().invoke(cli, ["validate", "--config", str(path), "--probe"])
+    assert result.exit_code == 0, result.output
+    payloads = [json.loads(line) for line in result.output.strip().splitlines() if line.strip()]
+    discovered = next(p for p in payloads if p.get("status") == "discovered")
+    assert discovered["values"] == ["node_a"]
+    assert discovered["dropped_unsafe"] == ['evil"label']
+
+
+def test_validate_probe_strict_fails_when_expansion_exceeds_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wildcard probe that fans out beyond ``safety.max_total_series``
+    must abort under ``--strict`` so the most common discovery foot-gun
+    is caught at PR time rather than at runtime."""
+    cfg = {
+        "apiVersion": CURRENT_API_VERSION,
+        "datasource": {"url": "http://stub"},
+        "safety": {"max_total_series": 1},
+        "groups": [
+            {
+                "name": "g",
+                "queries": [
+                    {
+                        "id": "cpu_{{ instance }}",
+                        "promql": 'up{instance="{{ instance }}"}',
+                        "discover": [{"variable": "instance", "probe": "up", "label": "instance"}],
+                        "detectors": [{"name": "MAD"}],
+                    }
+                ],
+            }
+        ],
+    }
+    path = tmp_path / "discovery_cap.yaml"
+    path.write_text(yaml.safe_dump(cfg))
+
+    def responder(promql: str) -> StubResponse:
+        if promql == "up":
+            return StubResponse(
+                series=[
+                    QuerySeries(labels={"instance": "node_a"}, samples=clean_baseline(5)),
+                    QuerySeries(labels={"instance": "node_b"}, samples=clean_baseline(5)),
+                ]
+            )
+        return StubResponse(
+            series=[QuerySeries(labels={"instance": "x"}, samples=clean_baseline(5))]
+        )
+
+    _stub_source_with(monkeypatch, responder)
+    result = CliRunner().invoke(cli, ["validate", "--config", str(path), "--probe", "--strict"])
+    assert result.exit_code != 0
+    # The summary still surfaces — strict failure exposes the
+    # diagnostic alongside the non-zero exit.
+    assert "cardinality_exceeded" in result.output

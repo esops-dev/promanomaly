@@ -92,6 +92,25 @@ This emits `anomaly_signal_missing` when the series disappears.
 
 For unwatched metrics use `absent_over_time()` directly in alerts.
 
+### Discovery-tracked absence
+
+For dynamic workloads (pods, instances, jobs that come and go) you usually don't know which series should exist ahead of time — write the query once with `discover:` and the detector tracks the set automatically. When a previously-seen series stops reporting for `expect_grace_runs` consecutive runs, `anomaly_signal_missing{id, group, <discovered_labels>}=1` is emitted with the missing series' labels.
+
+```yaml
+queries:
+  - id: cpu_busy_{{ instance }}
+    promql: 'avg by (instance) (rate(node_cpu_seconds_total{instance="{{ instance }}"}[1m]))'
+    expect_grace_runs: 3
+    discover:
+      - variable: instance
+        probe: 'up{job="node"}'
+        label: instance
+    detectors:
+      - name: MAD
+```
+
+The same `AnomalySignalMissing` reference alert covers both `expect:` (static) and `discover:` (dynamic). See [`operations.md`](operations.md#dynamic-series-discovery) for the full discovery model — Cartesian expansion, probe failure handling, and the `validate --probe` discovery-expansion simulation.
+
 ## Per-Group Thresholds
 
 Override the default only where needed:

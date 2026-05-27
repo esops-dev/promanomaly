@@ -12,6 +12,7 @@ promanomaly ships with a small, focused set of CLI commands for validation, test
 | `detect-once`     | Run one detector on an ad-hoc PromQL query |
 | `analyze`         | Offline change-point analysis over historical data |
 | `detectors list`  | List registered detectors |
+| `inspect`         | Inspect one running detector's state for an (id, label) series |
 
 All commands accept `--log-level`. `--config` is required only for server, `validate`, and `dry-run`.
 
@@ -92,3 +93,27 @@ Lists all installed detectors with name, description, and parameters.
 promanomaly detectors list
 promanomaly detectors list --target http://localhost:9092   # query a running instance
 ```
+
+## `inspect`
+
+The highest-leverage answer to "why did this series score 4.7?" — queries a running detector's `/debug/inspect` endpoint, which re-fetches the rolling window from the TSDB right now, re-runs every configured detector against it, and returns the per-detector score, baseline, threshold, and (when calibrated) confidence + stability.
+
+```bash
+promanomaly inspect --target http://localhost:9092 --id error_rate
+promanomaly inspect --target http://localhost:9092 --id error_rate --labels 'instance=host-a'
+promanomaly inspect --target http://localhost:9092 --id error_rate --output json
+```
+
+**Flags**
+
+| Flag                | Default     | Description |
+|---------------------|-------------|-------------|
+| `--target <url>`    | required    | Running detector base URL (e.g. `http://localhost:9092`) |
+| `--id <id>`         | required    | Metric id (matches a configured `query.id`) |
+| `--labels <sel>`    | none        | Label selector (`k1=v1,k2=v2`); empty matches every series for the id |
+| `--output`          | text        | `text` or `json` |
+| `--timeout <s>`     | 10          | HTTP timeout |
+
+The `/debug/inspect` endpoint is part of the same `/debug/*` family covered by the bundled NetworkPolicy — by default only same-namespace pods can reach it.
+
+**Note on dynamic discovery.** `inspect` matches against the configured `query.id`. For queries with a `discover:` block, the templated form (`cpu_busy_{{ instance }}`) is the configured id, so the endpoint can't currently resolve a rendered id like `cpu_busy_node_17`. Use `detect-once` for ad-hoc inspection of discovery-expanded series.

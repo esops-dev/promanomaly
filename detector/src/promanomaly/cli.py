@@ -21,13 +21,16 @@ import datetime as _dt
 import json
 import sys
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import click
 
+from .backtest import backtest_cmd
 from .config import Config, load_config, parse_duration
 from .detectors import get as get_detector
 from .detectors import list_meta
+from .discovery import DiscoveryError, expand_query, probe_variable
 from .exporter import OperationalMetrics
 from .logging import configure_logging
 from .runner import Runner, _build_detector
@@ -172,8 +175,43 @@ async def _run_probe(
         end = time.time()
         window = cfg.defaults.window_seconds
         step = cfg.defaults.step_seconds
+
+        async def _probe(promql: str) -> Any:
+            return await source.range_query(
+                promql=promql,
+                end=end,
+                window_seconds=window,
+                step_seconds=step,
+                max_series=cfg.safety.max_series_per_query,
+            )
+
+        discovered_total = 0
         for group in cfg.groups:
             for query in group.queries:
+                if query.discover:
+                    # Discovery-expansion simulation: probe each
+                    # variable, run the Cartesian expansion, then
+                    # execute each rendered variant. Reports the
+                    # projected total series so operators see at
+                    # PR-time what would land in production.
+                    discovered_count = await _probe_discover_query(
+                        source=source,
+                        group_name=group.name,
+                        query=query,
+                        probe_fn=_probe,
+                        end=end,
+                        window=window,
+                        step=step,
+                        max_series=cfg.safety.max_series_per_query,
+                        counters=lambda kind: None,
+                    )
+                    if discovered_count.errored:
+                        errored += discovered_count.errored
+                    if discovered_count.empty_unexpected:
+                        empty += discovered_count.empty_unexpected
+                    total_series += discovered_count.total_series
+                    discovered_total += discovered_count.variant_count
+                    continue
                 entry: dict[str, Any] = {
                     "group": group.name,
                     "query": query.id,
@@ -208,16 +246,155 @@ async def _run_probe(
                 click.echo(json.dumps(entry, sort_keys=True))
     finally:
         await source.close()
-    summary = {
+    summary: dict[str, Any] = {
         "total_series": total_series,
         "max_total_series": cfg.safety.max_total_series,
         "empty_unexpected": empty,
         "errored": errored,
     }
+    if discovered_total:
+        summary["discovery_expansions"] = discovered_total
     click.echo(json.dumps({"summary": summary}, sort_keys=True))
     if strict and (empty > 0 or errored > 0):
         return 1
+    # Discovery expansion vs the global cardinality cap — the most
+    # common operator footgun documented in the v0.4 story.
+    if strict and total_series > cfg.safety.max_total_series:
+        click.echo(
+            json.dumps(
+                {
+                    "status": "cardinality_exceeded",
+                    "total_series": total_series,
+                    "max_total_series": cfg.safety.max_total_series,
+                },
+                sort_keys=True,
+            ),
+            err=True,
+        )
+        return 1
     return 0
+
+
+@dataclass
+class _DiscoverProbeResult:
+    """Accumulator returned by ``_probe_discover_query``."""
+
+    variant_count: int = 0
+    total_series: int = 0
+    empty_unexpected: int = 0
+    errored: int = 0
+
+
+async def _probe_discover_query(
+    *,
+    source: PromQLSource,
+    group_name: str,
+    query: Any,
+    probe_fn: Any,
+    end: float,
+    window: float,
+    step: float,
+    max_series: int,
+    counters: Any,
+) -> _DiscoverProbeResult:
+    """Resolve discovery probes, expand, execute, and emit JSON lines."""
+    del counters
+    result = _DiscoverProbeResult()
+    value_sets: dict[str, list[str]] = {}
+    for var in query.discover:
+        try:
+            values, dropped = await probe_variable(var, probe_fn=probe_fn)
+        except DiscoveryError as exc:
+            click.echo(
+                json.dumps(
+                    {
+                        "group": group_name,
+                        "query": query.id,
+                        "variable": var.variable,
+                        "status": "discovery_error",
+                        "reason": exc.reason,
+                        "detail": exc.message,
+                    },
+                    sort_keys=True,
+                )
+            )
+            result.errored += 1
+            return result
+        value_sets[var.variable] = values
+        entry: dict[str, Any] = {
+            "group": group_name,
+            "query": query.id,
+            "variable": var.variable,
+            "status": "discovered",
+            "values": values,
+            "count": len(values),
+        }
+        if dropped:
+            # Surface unsafe values so the operator can spot a label
+            # that contains characters PromQL won't accept un-escaped.
+            entry["dropped_unsafe"] = dropped
+        click.echo(json.dumps(entry, sort_keys=True))
+    try:
+        variants = expand_query(query, value_sets)
+    except DiscoveryError as exc:
+        click.echo(
+            json.dumps(
+                {
+                    "group": group_name,
+                    "query": query.id,
+                    "status": "expansion_error",
+                    "reason": exc.reason,
+                    "detail": exc.message,
+                },
+                sort_keys=True,
+            )
+        )
+        result.errored += 1
+        return result
+    result.variant_count = len(variants)
+    click.echo(
+        json.dumps(
+            {
+                "group": group_name,
+                "query": query.id,
+                "status": "expansion",
+                "variants": len(variants),
+            },
+            sort_keys=True,
+        )
+    )
+    for variant in variants:
+        entry = {
+            "group": group_name,
+            "query": variant.rendered_id,
+            "promql": variant.rendered_promql,
+            "discovered_labels": variant.labels,
+        }
+        try:
+            qresult = await source.range_query(
+                promql=variant.rendered_promql,
+                end=end,
+                window_seconds=window,
+                step_seconds=step,
+                max_series=max_series,
+            )
+        except SourceQueryError as exc:
+            entry["status"] = "error"
+            entry["reason"] = exc.reason
+            entry["detail"] = exc.message
+            result.errored += 1
+        else:
+            series_count = len(qresult.series)
+            result.total_series += series_count
+            entry["status"] = "ok"
+            entry["series"] = series_count
+            entry["truncated"] = qresult.truncated
+            if series_count == 0:
+                entry["empty"] = True
+                if not query.expect:
+                    result.empty_unexpected += 1
+        click.echo(json.dumps(entry, sort_keys=True))
+    return result
 
 
 @cli.command(name="dry-run")
@@ -630,6 +807,125 @@ def _print_analyze_text(findings: list[dict[str, Any]]) -> None:
     for row in findings:
         labels = ",".join(f"{k}={v}" for k, v in sorted(row["labels"].items())) or "-"
         click.echo(f"{row['iso8601']:30}  {row['score']:8.2f}  {labels}")
+
+
+@cli.command(name="inspect")
+@click.option(
+    "--target",
+    "target_url",
+    required=True,
+    help="Running detector base URL (e.g. http://localhost:9092).",
+)
+@click.option(
+    "--id",
+    "metric_id",
+    required=True,
+    help="Metric id to inspect (matches a configured query.id).",
+)
+@click.option(
+    "--labels",
+    "labels",
+    default=None,
+    help="Label selector as 'k1=v1,k2=v2'. Empty matches every series for the id.",
+)
+@click.option(
+    "--output",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    show_default=True,
+    help="Output format. 'json' is the raw /debug/inspect response.",
+)
+@click.option(
+    "--timeout",
+    default=10.0,
+    show_default=True,
+    type=float,
+    help="HTTP timeout in seconds.",
+)
+def inspect_cmd(
+    target_url: str,
+    metric_id: str,
+    labels: str | None,
+    output: str,
+    timeout: float,
+) -> None:
+    """Query a running detector's /debug/inspect for one (id, label) series.
+
+    The highest-leverage answer to "why did this series score 4.7?" —
+    pulls the live rolling window the detector would see right now, runs
+    every configured detector against it, and prints the per-detector
+    score / baseline / threshold along with calibration data and
+    warm-up status.
+    """
+    import httpx
+
+    params: dict[str, str] = {"id": metric_id}
+    if labels:
+        params["labels"] = labels
+    url = target_url.rstrip("/") + "/debug/inspect"
+    try:
+        resp = httpx.get(url, params=params, timeout=timeout)
+    except httpx.HTTPError as exc:
+        click.echo(f"could not reach {target_url}: {exc}", err=True)
+        sys.exit(2)
+    try:
+        payload = resp.json()
+    except ValueError:
+        click.echo(f"non-JSON response from {url}: {resp.text[:200]}", err=True)
+        sys.exit(2)
+    if resp.status_code >= 400:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True), err=True)
+        sys.exit(1)
+    if output == "json":
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    _print_inspect_text(payload)
+
+
+def _print_inspect_text(payload: dict[str, Any]) -> None:
+    if payload.get("status") == "error":
+        click.echo(f"ERROR: {payload.get('reason')} — {payload.get('detail')}")
+        return
+    click.echo(f"id     : {payload['id']}")
+    click.echo(f"group  : {payload['group']}")
+    click.echo(f"query  : {payload['query']}")
+    sel = payload.get("label_selector") or {}
+    sel_repr = ",".join(f"{k}={v}" for k, v in sorted(sel.items())) if sel else "(none)"
+    click.echo(f"labels : {sel_repr}")
+    click.echo(f"matched: {payload['matched_series']} / {payload['total_series']} series")
+    for series in payload.get("series", []):
+        labels_repr = ",".join(f"{k}={v}" for k, v in sorted(series["labels"].items())) or "-"
+        click.echo("")
+        click.echo(f"  series       : {labels_repr}")
+        click.echo(f"  samples      : {series['sample_count']}")
+        click.echo(f"  latest_y     : {series['latest_y']}")
+        click.echo(
+            f"  warming_up   : {series['warming_up']} ({series['warmup_observed_runs']} runs)"
+        )
+        for det in series.get("detectors", []):
+            inst = f"[{det['instance']}]" if det.get("instance") else ""
+            click.echo(f"  detector     : {det['name']}{inst} ({det['status']})")
+            if det["status"] == "ok":
+                click.echo(
+                    f"    score      : {det['score']:.4f}  "
+                    f"baseline={det['baseline']:.4f}  "
+                    f"threshold={det['threshold']}  "
+                    f"outside={det['is_outside'] or det.get('statistical_outside', False)}"
+                )
+            if det.get("calibration"):
+                cal = det["calibration"]
+                click.echo(
+                    f"    confidence : {cal['confidence_score']:.3f}  "
+                    f"stability={cal['baseline_stability']:.3f}  "
+                    f"f1={cal['f1']:.3f}"
+                )
+
+
+# Register the backtest command imported from promanomaly.backtest so
+# operators can invoke it as ``promanomaly backtest`` rather than the
+# longer ``python -m promanomaly.backtest`` (which still works because
+# the module retains its own entry point for Makefile use).
+cli.add_command(backtest_cmd, name="backtest")
 
 
 @cli.group()

@@ -1,4 +1,4 @@
-"""In-process LRU + TTL cache for PromQL range-query responses.
+"""LRU + TTL cache for PromQL range-query responses.
 
 Two unrelated detection paths frequently issue the same PromQL against the
 TSDB within a few seconds: an operator who configures the same expression
@@ -9,16 +9,24 @@ than the rolling ``step``. Without coordination the source layer fires
 the same query at the TSDB once per caller; with the cache enabled the
 second-and-later callers see the previous result instead.
 
-This is the single-replica caching layer described in the v0.2 roadmap
-story. The Redis-backed variant for HA mode lives in v0.4 and will plug
-into the same call site.
+Two backends share the same interface so the source layer doesn't care
+which is in use:
+
+- :class:`TTLCache` is the in-process LRU used in single-replica mode.
+- :class:`RedisQueryCache` is the v0.4 HA variant — leader and followers
+  share a Redis so each (promql, window) bucket only hits the TSDB once
+  across the whole cluster. Uses JSON serialisation via :mod:`serde` so
+  a write-capable but untrusted Redis can't deserialise to RCE.
 """
 
 from __future__ import annotations
 
+import contextlib
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass
@@ -97,4 +105,141 @@ class TTLCache[K, V]:
                 self.stats.evictions += 1
 
 
-__all__ = ["CacheStats", "TTLCache"]
+class RedisQueryCache[K, V]:
+    """Redis-backed query cache for HA-mode deployments.
+
+    Mirrors the :class:`TTLCache` surface (``get`` / ``put`` / ``stats`` /
+    ``len``) so the source layer can hold a single :class:`Any` reference
+    that may resolve to either backend. Values are encoded as JSON via
+    :mod:`promanomaly.serde` so deserialisation cannot execute code —
+    Redis no longer needs to be on the same trust boundary as the
+    detector process.
+
+    The eviction counter is left at 0: Redis handles eviction with its
+    own ``maxmemory-policy`` rather than a process-local LRU. Operators
+    who want a hard bound configure Redis itself; the cache only owns
+    the TTL.
+    """
+
+    # Size lookup is throttled to once per this many seconds. Without
+    # the throttle, ``__len__`` issues a SCAN over every cache key on
+    # every ``/metrics`` render; with a default 15s scrape interval,
+    # that's one SCAN per scrape per replica. Operators get
+    # near-real-time data without the cost.
+    _SIZE_REFRESH_SECONDS = 30.0
+
+    def __init__(
+        self,
+        *,
+        client: Any,
+        ttl_seconds: float,
+        key_prefix: str = "promanomaly:query",
+    ) -> None:
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be > 0")
+        self._client = client
+        self._ttl = int(max(1, ttl_seconds))
+        self._prefix = key_prefix
+        self._lock = threading.RLock()
+        self.stats = CacheStats()
+        # Cached size + the wall-clock the cache was last refreshed.
+        # Read under ``_lock`` since /metrics renders concurrently with
+        # detector runs in HA mode.
+        self._cached_size: int = 0
+        self._cached_size_at: float = 0.0
+
+    @property
+    def ttl_seconds(self) -> float:
+        return float(self._ttl)
+
+    @property
+    def max_entries(self) -> int:
+        # Redis-managed; the cache itself imposes no upper bound.
+        return 0
+
+    def __len__(self) -> int:
+        # Throttled SCAN: at most one full-prefix walk every
+        # ``_SIZE_REFRESH_SECONDS``. Returns the most recent value in
+        # between, so the gauge can lag a scrape but never blocks the
+        # /metrics render on a Redis round-trip when entries are dense.
+        now = time.monotonic()
+        with self._lock:
+            if now - self._cached_size_at < self._SIZE_REFRESH_SECONDS:
+                return self._cached_size
+        try:
+            count = sum(1 for _ in self._iter_keys())
+        except Exception:
+            count = self._cached_size
+        with self._lock:
+            self._cached_size = count
+            self._cached_size_at = now
+        return count
+
+    def clear(self) -> None:
+        try:
+            for key in list(self._iter_keys()):
+                self._client.delete(key)
+        except Exception:
+            # Best-effort. A Redis outage during clear is non-fatal —
+            # entries TTL out anyway.
+            return
+
+    def get(self, key: K, now: float) -> V | None:
+        del now  # TTL is enforced by Redis itself
+        redis_key = self._encode_key(key)
+        try:
+            raw = self._client.get(redis_key)
+        except Exception:
+            with self._lock:
+                self.stats.misses += 1
+            return None
+        with self._lock:
+            if raw is None:
+                self.stats.misses += 1
+                return None
+            self.stats.hits += 1
+        from .serde import decode_query_result
+
+        value = decode_query_result(raw)
+        if value is None:
+            # Corrupted / wrong-version / non-JSON entry. Drop it so
+            # the cache stays consistent and treat it as a miss.
+            with self._lock:
+                self.stats.expirations += 1
+            with contextlib.suppress(Exception):
+                self._client.delete(redis_key)
+            return None
+        # ``decode_query_result`` returns a concrete QueryResult; the
+        # generic ``QueryResult`` in this class signature is the
+        # caller-visible payload type.
+        return value  # type: ignore[return-value]
+
+    def put(self, key: K, value: V, now: float) -> None:
+        del now
+        redis_key = self._encode_key(key)
+        from .serde import encode_query_result
+
+        try:
+            payload = encode_query_result(value)  # type: ignore[arg-type]
+        except Exception:
+            # Refusing to cache an un-encodable value is preferable to
+            # poisoning Redis with garbage that every reader has to
+            # discover and drop.
+            return
+        try:
+            self._client.set(redis_key, payload, ex=self._ttl)
+        except Exception:
+            return
+
+    def _encode_key(self, key: K) -> str:
+        # repr is good enough for the cache-key tuples we pass in — they
+        # are flat and contain only primitives. Avoids pulling json into
+        # the hot path.
+        return f"{self._prefix}:{key!r}"
+
+    def _iter_keys(self) -> Any:
+        # SCAN with a small COUNT so we don't block Redis with KEYS.
+        return self._client.scan_iter(match=f"{self._prefix}:*", count=200)
+
+
+__all__ = ["CacheStats", "RedisQueryCache", "TTLCache"]

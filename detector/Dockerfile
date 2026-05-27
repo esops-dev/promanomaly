@@ -12,7 +12,7 @@ COPY src ./src
 
 RUN pip install --upgrade pip build && \
     pip wheel --no-deps -w /wheels . && \
-    pip wheel -w /wheels .
+    pip wheel -w /wheels '.[ha]'
 
 FROM python:3.14-slim AS runtime
 
@@ -28,7 +28,7 @@ RUN groupadd --system --gid 1000 promanomaly && \
 WORKDIR /app
 
 COPY --from=builder /wheels /wheels
-RUN pip install --no-cache-dir --no-index --find-links=/wheels promanomaly && \
+RUN pip install --no-cache-dir --no-index --find-links=/wheels 'promanomaly[ha]' && \
     rm -rf /wheels
 
 USER promanomaly:promanomaly

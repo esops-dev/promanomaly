@@ -18,8 +18,19 @@
     "replicaCount": {
       "type": "integer",
       "minimum": 1,
-      "maximum": 1,
-      "description": "Single-replica only — HA mode is not yet supported."
+      "description": "Replica count. Single-replica mode requires 1; bump only when highAvailability.enabled=true."
+    },
+    "highAvailability": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "lease_name": {"type": "string"},
+        "lease_namespace": {"type": "string"},
+        "lease_duration": {"type": "string"},
+        "renew_deadline": {"type": "string"},
+        "retry_period": {"type": "string"},
+        "snapshot_ttl": {"type": "string"}
+      }
     },
     "datasource": {
       "type": "object",
@@ -55,8 +66,23 @@
           "type": "object",
           "properties": {
             "enabled": {"type": "boolean"},
+            "backend": {"type": "string", "enum": ["memory", "redis"]},
             "max_entries": {"type": "integer", "minimum": 1},
             "ttl": {"type": "string"}
+          }
+        },
+        "redis": {
+          "type": "object",
+          "properties": {
+            "url": {"type": "string"},
+            "key_prefix": {"type": "string"},
+            "timeout": {"type": "string"}
+          }
+        },
+        "discovery": {
+          "type": "object",
+          "properties": {
+            "forget_after_runs": {"type": "integer", "minimum": 1}
           }
         }
       }
@@ -67,6 +93,24 @@
         "warmup_policy": {
           "type": "string",
           "enum": ["emit_warming_up", "suppress", "emit_with_flag"]
+        }
+      }
+    },
+    "exporter": {
+      "type": "object",
+      "properties": {
+        "output_labels": {
+          "type": "object",
+          "properties": {
+            "allow": {
+              "type": "array",
+              "items": {"type": "string"}
+            },
+            "drop": {
+              "type": "array",
+              "items": {"type": "string"}
+            }
+          }
         }
       }
     },

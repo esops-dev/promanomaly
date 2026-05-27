@@ -210,7 +210,106 @@ safety:
 
 Hit/miss counters surface as `anomaly_query_cache_hits_total`, `anomaly_query_cache_misses_total`, `anomaly_query_cache_evictions_total`, `anomaly_query_cache_expirations_total`, and the current size as `anomaly_query_cache_entries`. Use the hit ratio to tune `max_entries` for your workload.
 
-Single-replica only. The Redis-backed HA variant ships in v0.4 and plugs into the same call site without changing dashboards.
+**Backends**
+
+```yaml
+safety:
+  query_cache:
+    backend: memory     # default: in-process LRU+TTL
+    # backend: redis    # shared cache across the leader + followers
+  redis:
+    url: redis://promanomaly-redis-master:6379/0
+    key_prefix: promanomaly
+    timeout: 2s
+```
+
+- `memory` (default) — process-local LRU, one cache per replica. Works for single-replica deployments.
+- `redis` — shared via the configured Redis. In HA mode this means leader and followers see the same cached PromQL responses, so a TSDB hit is paid at most once across the cluster per (promql, window, step, end-bucket) tuple. Same `anomaly_query_cache_*` metrics; the wire format doesn't change.
+
+The Redis client is shared with the HA snapshot cache (see below) so there's only one connection pool per pod.
+
+## High Availability
+
+Single-replica is the default and supported topology. For multi-pod deployments, enable HA mode:
+
+```yaml
+highAvailability:
+  enabled: true
+  lease_name: promanomaly-leader
+  lease_namespace: ""        # defaults to the release namespace
+  lease_duration: 15s
+  renew_deadline: 10s
+  retry_period: 2s
+  snapshot_ttl: 5m
+safety:
+  redis:
+    url: redis://promanomaly-redis-master:6379/0
+```
+
+What changes when HA is on:
+
+- **Leader election** uses the standard `coordination.k8s.io/v1` Lease API. Only the elected leader runs the detector pipeline; followers serve `/metrics` from the shared snapshot cache. The Helm chart auto-renders the matching Role + RoleBinding scoped to the configured `lease_name` — no cluster-wide RBAC.
+- **Strategy** flips from `Recreate` to `RollingUpdate`. Failover is the documented path, so rolling pod restarts are safe.
+- **Shared snapshot cache** lives in Redis under `{key_prefix}:snapshot:<group>`. Followers poll the cache at `refresh_interval / 2` and feed snapshots into their local store; followers serving `/metrics` see the same wire output as the leader (within one poll interval).
+- **Per-replica identity** comes from the Downward API (`POD_NAME` env). The chart wires this automatically; override with `highAvailability.identity` only if you need a stable identity independent of the pod name.
+
+Two new operational metrics:
+
+- `anomaly_leader_elected{instance="<pod>"}` — `1` on the current leader, `0` everywhere else.
+- `anomaly_leader_transitions_total{instance="<pod>"}` — bumps each time *this* replica acquires the Lease.
+
+**Failover behaviour**
+
+- A new leader fires an *immediate* full detection run for every group on acquisition. Followers see fresh snapshots within one poll interval (≤ `refresh_interval / 2`) rather than waiting a full scheduler tick.
+- The previous leader observes Lease loss in its renewal loop and stops scheduling within `refresh_interval / 2`. In-flight detector runs are abandoned rather than allowed to complete — the new leader's immediate run reproduces them.
+- `snapshot_ttl` (default `5m`) bounds how long a stale snapshot can survive a leader that died without losing the Lease. Set it well above `refresh_interval` so transient leader changes don't blank `/metrics`.
+
+**Sizing.** Three replicas is the typical HA setup. Anything past that is leader-election overhead without benefit — only one replica runs detectors at any moment.
+
+## Dynamic Series Discovery
+
+Hand-writing one query per cohort member doesn't scale past a handful of services. `discover:` lets one templated query fan out across the distinct values of a label at runtime:
+
+```yaml
+groups:
+  - name: per_instance_cpu
+    queries:
+      - id: cpu_busy_{{ instance }}
+        promql: 'avg by (instance) (rate(node_cpu_seconds_total{instance="{{ instance }}"}[1m]))'
+        expect_grace_runs: 3
+        discover:
+          - variable: instance
+            probe: 'up{job="node"}'
+            label: instance
+        detectors:
+          - name: MAD
+```
+
+How it works:
+
+1. On every detector run, each `discover:` entry executes its `probe` PromQL.
+2. The distinct values of `label` across the probe result become the variable's value set.
+3. The query's `id` and `promql` are rendered once per Cartesian combination across all declared variables; each rendered variant flows through the standard per-query pipeline.
+4. `anomaly_discovery_expansions{group, query}` tracks the per-run fan-out so dashboards can spot drift in the discovered set over time.
+5. Probe failures bump `anomaly_discovery_failures_total{group, query, variable, reason}` and skip the query for that run. `reason` is bounded (`probe_query_failed`, `empty_probe`, `undeclared_variable`, `invalid_rendered_id`).
+
+**Catch foot-guns at PR time.** `validate --probe` simulates discovery: it runs every probe, expands, and reports the projected total series count alongside `safety.max_total_series`. Under `--strict` the CLI exits non-zero when the simulated total exceeds the cap — drop it into a CI job to catch wildcard mistakes before they hit production.
+
+```bash
+promanomaly validate --config promanomaly.yaml --probe --strict
+```
+
+**Signal-absence for discovered series.** Once the detector has seen a discovery key (e.g. `instance=node-17`) the absence of that key in a later run is itself an anomaly — the dynamic counterpart of the v0.1 `expect:` flag. After `expect_grace_runs` consecutive runs without the key, `anomaly_signal_missing{id, group, <discovered_labels>}=1` is emitted (with the **rendered** id, so the label value matches the one the series carried when present) and `anomaly_signal_missing_total{group, reason="missing_grace_exhausted"}` bumps once on the transition. The metric clears the next time the series reappears.
+
+The same `AnomalySignalMissing` reference alert covers both the v0.1 static `expect:` and the v0.4 dynamic-discovery case.
+
+**Bounding the tracker.** Workloads that churn through ephemeral identities (transient pod names, replica IDs that never recycle) would otherwise grow the discovery tracker without end. `safety.discovery.forget_after_runs` (default `1000`) drops a series from the tracker after that many consecutive missing runs; the next time it reappears it counts as a fresh discovery. The schema validates `forget_after_runs >= max(query.expect_grace_runs)` at boot — setting it lower would silently hide `anomaly_signal_missing` from operators.
+
+**Unsafe discovered values.** Values containing `"`, `\`, or whitespace control characters would break naive substitution into the PromQL template, so they are filtered before expansion. The runner bumps `anomaly_discovery_failures_total{reason="unsafe_value"}` and logs the offenders; `validate --probe` surfaces them in the per-variable JSON entry under `dropped_unsafe` so operators can fix the discovery axis (or relabel upstream) at PR time.
+
+**Probe failure under serve_stale.** A probe that hits a TSDB error (timeout, server_error, …) honours `safety.on_source_failure` the same way a regular query failure does — under the default `serve_stale` the previous snapshot is preserved instead of being overwritten with empty data. The original TSDB reason flows into `anomaly_source_failure_total{reason}` so it shares a bucket with regular-query failures; the discovery-specific `anomaly_discovery_failures_total{reason="probe_query_failed"}` counter is bumped separately for the discovery dashboard.
+
+**HA-mode caveat.** The discovery tracker is in-memory on the leader; on Lease failover, the new leader rebuilds it from zero. Series that disappeared right before the handover only get an `anomaly_signal_missing` from the new leader once they have missed `expect_grace_runs` more runs after takeover. For most workloads this is invisible; for workloads with a high churn rate close to failover, treat the first `(grace_runs × refresh_interval)` after a leader transition as a soft window.
 
 ## Validating Configs Before Deploy
 
@@ -237,3 +336,53 @@ promanomaly detectors list --target http://promanomaly.observability:9092
 ```
 
 The shipped NetworkPolicy denies ingress to `/debug/*` by default — same-namespace pods can hit it; everything else has to opt in.
+
+## Inspecting One Series Live
+
+`/debug/inspect?id=<metric_id>&labels=<sel>` re-fetches the rolling window from the TSDB right now, re-runs every configured detector for the matching `(id, label-set)` series, and returns the per-detector score, baseline, threshold, and (when calibrated) confidence + stability — the canonical answer to "why did this series score 4.7?". The CLI wraps the same endpoint:
+
+```bash
+promanomaly inspect --target http://promanomaly.observability:9092 \
+  --id error_rate --labels 'instance=host-a'
+
+# Raw response for piping into jq:
+promanomaly inspect --target http://promanomaly.observability:9092 \
+  --id error_rate --output json | jq '.series[0].detectors'
+```
+
+Because each call refetches, two consecutive calls can return slightly different scores if the TSDB picked up a new sample between them. That is the correct semantics — operators want "right now", not the cached snapshot from the last scheduled run. It also means `inspect` adds a small TSDB query per call; the NetworkPolicy keeps the endpoint inside the cluster, which is the intended trust boundary.
+
+## Output-Label Filtering
+
+Source-label allow / drop filtering runs at the exporter boundary. Use it when the source query naturally carries identifiers you don't want on the monitoring plane — customer ids, SKUs, user-supplied tags, anything caught by GDPR / SOC 2 / HIPAA.
+
+```yaml
+exporter:
+  output_labels:
+    # Optional: when non-empty, only these source labels are emitted.
+    allow:
+      - instance
+      - region
+    # Always stripped (takes precedence over allow).
+    drop:
+      - customer_id
+      - sku
+```
+
+Semantics:
+
+- The canonical detector labels — `id`, `group`, `detector`, `detector_instance` — are added **after** the filter and cannot be stripped. Listing one of them in `drop` is rejected at config-load time so a configuration mistake fails at validate-time rather than silently leaving the label in production.
+- `allow` and `drop` operate on **source** labels (everything copied from the PromQL response). The canonical labels and any opt-in feature labels (`best_detector`, `warming_up`) bypass the filter.
+- `drop` takes precedence over `allow` — if a label appears in both, it is stripped. Useful when the allow-list is an inherited template and a downstream config layer needs to subtract.
+- The filter applies uniformly to `anomaly_score`, `anomaly_baseline`, `anomaly_duration_seconds`, `anomaly_change_point_total`, `anomaly_confidence_score`, `anomaly_baseline_stability`, and the composite `anomaly_composite_*` metrics — anywhere source labels could otherwise reach the wire.
+
+**GDPR worked example.** A PromQL query like `rate(api_requests_total{customer_id=~".+"}[5m])` carries `customer_id` on each emitted series. Without filtering, every `anomaly_score` line includes the customer id; for a regulated workload that is itself a compliance event. Add:
+
+```yaml
+exporter:
+  output_labels:
+    drop:
+      - customer_id
+```
+
+and the output collapses to `anomaly_score{id="api_request_rate", group="...", instance="...", region="..."}` — Prometheus and Grafana still see useful labels, but the customer id never leaves the detector pod.

@@ -17,6 +17,9 @@ For “which detector should I use?”, see [`decision-tree.md`](decision-tree.m
 ```yaml
 detectors:
   - name: MAD
+    params:
+      recursive_trim: false   # default
+      trim_threshold: 3.0     # default
 ```
 
 **Best for**  
@@ -28,9 +31,17 @@ Extremely robust to outliers by construction — one bad point cannot pull the b
 **Limitations**  
 - Slowly drifting baselines inside the window → use **Hampel**  
 - Step changes that have already filled most of the window
+- Clustered multi-point anomalies inside the rolling window pollute the median + MAD → enable `recursive_trim`
 
 **Parameters**  
-None (window size is set globally via `defaults.window`).
+- `recursive_trim` (default `false`) — when true, run the baseline once, drop in-window points above `trim_threshold`, and recompute the median + MAD once more before scoring the latest sample. Bounded to a single trim pass for predictability. Mitigates the clustered-anomaly limitation: a burst of 4–5 anomalous points in the rolling window normally poisons the very median MAD is computed against, and the latest sample looks normal. With `recursive_trim` on, the burst is excluded from the recomputed baseline and the latest sample scores as the operator would expect.
+- `trim_threshold` (default `3.0`) — MAD-units cutoff for the trim pass. Matches the conventional 3-MAD anomaly threshold and the default `alert_thresholds.score`. **Deliberately separate from `alert_thresholds.score`** — alerting policy can change without silently re-shaping the baseline. Raise it when the rolling window legitimately contains points beyond 3 MADs that you don't want stripped; lower it for very clean signals where 3 MADs is already noise.
+
+  Worked example — `clustered_spikes(cluster=6, spike=10.0)`:
+  - Without trim: baseline pulled toward the spike value, score ≈ 0.
+  - With trim: baseline snaps back to the pre-burst mean, score well above 3.
+
+  Window size is set globally via `defaults.window`.
 
 ## Hampel — Local-window Robust Outlier Filter
 
@@ -38,7 +49,9 @@ None (window size is set globally via `defaults.window`).
 detectors:
   - name: Hampel
     params:
-      t0: 3        # default
+      t0: 3                  # default
+      recursive_trim: false  # default
+      trim_threshold: 3.0    # default
 ```
 
 **Best for**  
@@ -49,6 +62,8 @@ Computes median and MAD over a small local sub-window of `2*t0 + 1` points aroun
 
 **Parameters**  
 - `t0` (default `3`) — half-width of the local sub-window. Larger values behave more like classical MAD; smaller values track drift faster.
+- `recursive_trim` (default `false`) — when true, recompute the local median + MAD once after excluding sub-window points above `trim_threshold` from the first pass. Same single-iteration bound as MAD. Particularly useful for Hampel because the local sub-window is small: a 4-point cluster right at the tail of the window otherwise fills most of it and the latest sample looks normal.
+- `trim_threshold` (default `3.0`) — local-MAD-units cutoff for the trim pass; same default and decoupling rationale as MAD's `trim_threshold`.
 
 ### MAD vs Hampel
 
@@ -297,3 +312,21 @@ Built-ins consume params via `fit_score`. Community detectors that prefer to sta
 4. Document it here (description + defaults).
 
 CI keeps code, registration, and docs in sync.
+
+## Third-party Detectors via Entry Points
+
+The detector registry is purely entry-point driven: built-ins and out-of-tree wheels register identically through the `promanomaly.detectors` entry point group. Anything `pip install`-able into the runtime image — a private wheel, a community detector like `promanomaly-prophet`, an experimental fork — shows up automatically on `/debug/detectors` and `promanomaly detectors list` without forking the core repo.
+
+```toml
+# pyproject.toml of a hypothetical third-party detector package
+[project.entry-points."promanomaly.detectors"]
+ProphetResidual = "promanomaly_prophet.detector:ProphetResidual"
+```
+
+A few constraints the registry enforces:
+
+- **Unique names.** Two packages claiming the same detector `name:` raise `DetectorRegistrationError` at boot — silent overwrite of a built-in by a third-party wheel is not allowed.
+- **Required `description:`.** Surfaces in `/debug/detectors`; the registry rejects empty strings.
+- **Stable parameter contract.** `defaults` (dict) and `param_spec` (tuple of `ParamSpec`) must agree on names and defaults. Parameter defaults are part of the public API — changing one is a breaking change with a deprecation period.
+
+Unknown detector names raise `UnknownDetectorError` carrying the available list, so misspelled config references produce an actionable error in the runner log instead of a bare `KeyError`.
