@@ -1,0 +1,110 @@
+# High-availability deployment.
+#
+# Three replicas: one is elected leader via a Kubernetes Lease and
+# runs the detector pipeline; the other two serve ``/metrics`` from a
+# shared Redis snapshot cache. The query cache is also Redis-backed so
+# every (promql, window, step, end-bucket) tuple hits the TSDB at most
+# once across the whole cluster. Failover is documented in
+# docs/operations.md and pinned by integration tests.
+#
+# Deployment notes:
+# - The Helm chart auto-renders a Lease Role + RoleBinding + flips the
+#   Deployment strategy to RollingUpdate when ``highAvailability.enabled=true``.
+# - The container image bundles the ``[ha]`` extra so the kubernetes
+#   client is available out of the box; pip installs without the extra
+#   refuse to start with HA on.
+# - Bring your own Redis (Bitnami, AWS ElastiCache, in-cluster, …);
+#   the umbrella ``promanomaly-stack`` chart does not bundle one yet.
+
+apiVersion: promanomaly.io/v1alpha1
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 10s
+
+server:
+  listen: ":9092"
+  refresh_interval: 1m
+  reload:
+    enabled: true
+    watch_configmap: true
+  ready_endpoint: true
+
+safety:
+  max_series_per_query: 1000
+  max_total_series: 20000
+  on_source_failure: serve_stale
+  fail_ready_after: 3
+  # Shared Redis cache: leader and followers see the same cached
+  # PromQL responses, so the TSDB is hit at most once per cache
+  # bucket across the entire cluster. ``backend: redis`` is required
+  # whenever multiple replicas should share a cache.
+  query_cache:
+    enabled: true
+    backend: redis
+    max_entries: 4096       # Redis-managed eviction; advisory only
+    ttl: 30s
+  redis:
+    url: redis://promanomaly-redis-master.observability:6379/0
+    key_prefix: promanomaly
+    timeout: 2s
+
+highAvailability:
+  enabled: true
+  # Lease coordinates run from a fixed name + namespace. The chart
+  # leaves ``lease_namespace`` empty by default to pick up the
+  # release namespace at template time.
+  lease_name: promanomaly-leader
+  lease_namespace: observability
+  # Defaults mirror controller-runtime so operators familiar with
+  # other controllers don't need to remember a new set.
+  lease_duration: 15s
+  renew_deadline: 10s
+  retry_period: 2s
+  # How long a published snapshot survives in Redis before a follower
+  # would otherwise see no snapshot at all. Keep well above
+  # ``server.refresh_interval`` so a brief leader change doesn't
+  # blank ``/metrics`` for followers between snapshots.
+  snapshot_ttl: 5m
+
+defaults:
+  window: 1h
+  step: 15s
+  min_points: 60
+  warmup_policy: emit_warming_up
+  emit_baseline: true
+  emit_duration: true
+  alert_thresholds:
+    score: 3.0
+
+groups:
+  - name: critical_signals
+    priority: 10
+    ensemble:
+      method: voting
+      min_detectors: 2
+    queries:
+      - id: api_p95_latency
+        promql: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="api"}[5m]))
+        detectors:
+          - name: MAD
+          - name: Hampel
+            params:
+              t0: 5
+          - name: IQR
+            params:
+              k: 1.5
+        alert_thresholds:
+          score: 4.0
+
+      - id: api_error_rate
+        promql: |
+          sum(rate(http_requests_total{job="api", code=~"5.."}[5m]))
+            /
+          sum(rate(http_requests_total{job="api"}[5m]))
+        min_relative_delta: 0.05    # 5% bump over baseline before firing
+        detectors:
+          - name: MAD
+          - name: ZScoreEWMA
+            params:
+              alpha: 0.05

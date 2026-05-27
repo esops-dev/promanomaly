@@ -219,3 +219,54 @@ def test_debug_detectors_endpoint_lists_built_ins(
         assert params["k"]["type"] == "float"
         assert params["k"]["default"] == 1.5
         assert params["k"]["doc"]
+
+
+def test_debug_inspect_returns_per_detector_scores(
+    stub_app: tuple[Application, StubSource],
+) -> None:
+    # Live integration check: hit /debug/inspect through the FastAPI
+    # app stack (route → inspect_series → stub source) so the wiring
+    # — JSON shape, status code, label-selector parsing — is pinned
+    # end-to-end, not just at the function level.
+    app, _stub = stub_app
+    with TestClient(app.build_app()) as client:
+        resp = client.get(
+            "/debug/inspect",
+            params={"id": "m1", "labels": "instance=h"},
+        )
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["status"] == "ok"
+        assert payload["matched_series"] == 1
+        assert payload["series"][0]["labels"] == {"instance": "h"}
+        names = {d["name"] for d in payload["series"][0]["detectors"]}
+        assert "MAD" in names
+
+
+def test_debug_inspect_unknown_id_returns_400(
+    stub_app: tuple[Application, StubSource],
+) -> None:
+    app, _stub = stub_app
+    with TestClient(app.build_app()) as client:
+        resp = client.get("/debug/inspect", params={"id": "does_not_exist"})
+        # Unknown-id is an operator error, not a server error — the
+        # status-code mapping in main.py must keep this on 4xx so CI
+        # gates and dashboards don't trigger 5xx alerts on operator
+        # typos.
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["status"] == "error"
+        assert body["reason"] == "unknown_id"
+
+
+def test_debug_inspect_bad_selector_returns_400(
+    stub_app: tuple[Application, StubSource],
+) -> None:
+    app, _stub = stub_app
+    with TestClient(app.build_app()) as client:
+        resp = client.get(
+            "/debug/inspect",
+            params={"id": "m1", "labels": "missing_equals_sign"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["reason"] == "bad_selector"

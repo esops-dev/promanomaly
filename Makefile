@@ -41,13 +41,21 @@ format: ## Apply ruff formatting and import sorting.
 test: ## Run the Python test suite.
 	cd $(DETECTOR) && $(UV) run pytest
 
+# BACKTEST_CONFIG defaults to the docker-compose dev config because that's
+# what `make dev-up` already points at. Override with
+# `make backtest CONFIG=path/to/config.yaml GROUP=...` for any other config.
+BACKTEST_CONFIG ?= docker/dev-config.yaml
+
 .PHONY: backtest
-backtest: ## Replay historical data, count true/false positives. Usage: make backtest GROUP=error_rates
-	cd $(DETECTOR) && $(UV) run python -m promanomaly.backtest --group $(GROUP)
+backtest: ## Replay historical data, count true/false positives. Usage: make backtest GROUP=error_rates [CONFIG=...] [OUTPUT=markdown]
+	cd $(DETECTOR) && $(UV) run python -m promanomaly.backtest \
+	  --config ../$(BACKTEST_CONFIG) --group $(GROUP) --output $(or $(OUTPUT),json)
 
 .PHONY: backtest-inject
-backtest-inject: ## Inject synthetic anomalies into real history. Usage: make backtest-inject GROUP=error_rates
-	cd $(DETECTOR) && $(UV) run python -m promanomaly.backtest --group $(GROUP) --inject
+backtest-inject: ## Inject synthetic anomalies into real history. Usage: make backtest-inject GROUP=error_rates [CONFIG=...] [OUTPUT=markdown]
+	cd $(DETECTOR) && $(UV) run python -m promanomaly.backtest \
+	  --config ../$(BACKTEST_CONFIG) --group $(GROUP) --inject \
+	  --output $(or $(OUTPUT),markdown)
 
 .PHONY: detect-once
 detect-once: ## Ad-hoc CLI: run one detector against a PromQL query.

@@ -1,0 +1,108 @@
+# Dynamic series discovery (v0.4).
+#
+# A single templated query fans out across the distinct values of a
+# label at run time, so adding a new instance / pod / job to the
+# environment doesn't require a YAML PR — discovery picks it up on
+# the next refresh interval. When a previously-seen series stops
+# reporting for ``expect_grace_runs`` consecutive runs, the dynamic
+# absence detection emits ``anomaly_signal_missing`` with the
+# discovered labels (the v0.4 dynamic counterpart to the v0.1
+# ``expect:`` flag).
+#
+# See docs/operations.md (Dynamic Series Discovery) and
+# docs/patterns.md (Absence Detection) for the full model, and
+# ``promanomaly validate --config discovery.yaml --probe --strict``
+# for the pre-deploy CI gate that catches wildcard mistakes before
+# they hit production cardinality.
+
+apiVersion: promanomaly.io/v1alpha1
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 10s
+
+server:
+  listen: ":9092"
+  refresh_interval: 1m
+  reload:
+    enabled: true
+    watch_configmap: true
+  ready_endpoint: true
+
+safety:
+  max_series_per_query: 1000
+  max_total_series: 20000
+  on_source_failure: serve_stale
+  discovery:
+    # After this many consecutive missing runs a discovered series is
+    # forgotten and the tracker reclaims the entry. Workloads with
+    # ephemeral identities (transient pod names) should leave the
+    # default — it prevents the discovery dict from growing forever.
+    forget_after_runs: 1000
+
+defaults:
+  window: 1h
+  step: 15s
+  min_points: 60
+  warmup_policy: emit_warming_up
+  emit_baseline: true
+  emit_duration: true
+  alert_thresholds:
+    score: 3.0
+
+groups:
+  # Fleet-wide CPU monitoring driven by node-exporter targets. One
+  # YAML entry replaces what would otherwise be one entry per host.
+  - name: per_node_cpu
+    priority: 5
+    queries:
+      - id: node_cpu_busy_{{ instance }}
+        promql: '100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{instance="{{ instance }}", mode="idle"}[1m])))'
+        expect_grace_runs: 5      # node down for 5 minutes -> alert
+        discover:
+          - variable: instance
+            # Probe over a *labelable* identifier. The probe runs once
+            # per refresh interval, so a low-cost query like ``up`` is
+            # preferred over an expensive rate over a long window.
+            probe: 'up{job="node-exporter"}'
+            label: instance
+        detectors:
+          - name: MAD
+          - name: Hampel
+            params:
+              t0: 5
+        alert_thresholds:
+          score: 4.0              # CPU is busy by nature — tighten the bar
+
+  # Per-pod memory pressure for a specific workload, with two
+  # discovery variables fanning out as a Cartesian product. With
+  # discovery enabled, the templated id MUST resolve to a valid
+  # Prometheus name after substitution; values that would render
+  # ``{{ pod }}`` as ``my-pod-9k4vt`` (containing a hyphen) get
+  # rejected at expansion time — switch the discovery axis to the
+  # workload's ``deployment`` label, or label-relabel inside
+  # node-exporter / kube-state-metrics so the variable carries a
+  # safe identifier.
+  - name: per_workload_memory
+    priority: 4
+    queries:
+      - id: workload_memory_bytes_{{ deployment }}_{{ namespace }}
+        promql: |
+          sum by (deployment, namespace) (
+            container_memory_working_set_bytes{
+              deployment="{{ deployment }}",
+              namespace="{{ namespace }}"
+            }
+          )
+        expect_grace_runs: 3
+        discover:
+          - variable: deployment
+            probe: 'count by (deployment) (kube_deployment_status_replicas_available)'
+            label: deployment
+          - variable: namespace
+            probe: 'count by (namespace) (kube_deployment_status_replicas_available)'
+            label: namespace
+        detectors:
+          - name: ZScoreEWMA
+            params:
+              alpha: 0.05

@@ -12,7 +12,7 @@
 #   2. Render the equivalent rules from the bundled Helm chart by
 #      setting `prometheusRule.enabled=true` on `charts/promanomaly/`.
 #
-# Alert names match those documented in CLAUDE.md and `docs/patterns.md`.
+# Alert names match those documented in `docs/patterns.md`.
 #
 # DRIFT GUARD: this file is the canonical source for the *alert name set*
 # and *expr shape*. The Helm template at

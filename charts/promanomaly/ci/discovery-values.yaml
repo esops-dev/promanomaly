@@ -1,0 +1,17 @@
+# Dynamic series discovery (v0.4): a templated query that fans out
+# across instance labels at runtime. The chart linter only validates
+# the YAML shape; runtime probe behaviour is exercised in pytest.
+
+groups:
+  - name: discovered
+    queries:
+      - id: cpu_busy_{{ instance }}
+        promql: 'avg by (instance) (rate(node_cpu_seconds_total{instance="{{ instance }}"}[1m]))'
+        expect_grace_runs: 3
+        discover:
+          - variable: instance
+            probe: 'up{job="node"}'
+            label: instance
+        detectors:
+          - name: MAD
+          - name: Hampel

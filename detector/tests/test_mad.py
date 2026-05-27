@@ -15,7 +15,7 @@ def test_mad_metadata() -> None:
     detector = MAD()
     assert detector.name == "MAD"
     assert "rolling" in detector.description.lower()
-    assert detector.defaults == {}
+    assert detector.defaults == {"recursive_trim": False, "trim_threshold": 3.0}
 
 
 def test_clean_baseline_scores_low() -> None:

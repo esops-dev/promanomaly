@@ -292,6 +292,35 @@ class OperationalMetrics:
             "Number of entries currently held in the in-process query cache.",
             registry=self.registry,
         )
+        # Leader election (HA mode only). Cardinality is bounded — one
+        # per replica via ``instance`` label.
+        self.leader_elected = Gauge(
+            "anomaly_leader_elected",
+            "1 on the replica currently holding the leader Lease, 0 on followers.",
+            ["instance"],
+            registry=self.registry,
+        )
+        self.leader_transitions_total = Counter(
+            "anomaly_leader_transitions_total",
+            "Total times this replica has acquired the leader Lease.",
+            ["instance"],
+            registry=self.registry,
+        )
+        # Dynamic series discovery (v0.4). Per-run fan-out gauges and the
+        # per-variable failure counter; cardinality is bounded by the
+        # number of configured (group, query, variable) tuples.
+        self.discovery_expansions = Gauge(
+            "anomaly_discovery_expansions",
+            "Number of discovered series the last run fanned out to per query.",
+            ["group", "query"],
+            registry=self.registry,
+        )
+        self.discovery_failures_total = Counter(
+            "anomaly_discovery_failures_total",
+            "Discovery probe failures bucketed by variable and reason.",
+            ["group", "query", "variable", "reason"],
+            registry=self.registry,
+        )
 
     def render(self) -> bytes:
         return generate_latest(self.registry)

@@ -230,6 +230,56 @@ def test_ensemble_max_method_does_not_trip_reachability_check() -> None:
     assert cfg.groups[0].ensemble is not None
 
 
+def test_discovery_forget_after_runs_must_outlast_grace() -> None:
+    """Audit guard: an operator who sets forget_after_runs below a
+    query's expect_grace_runs would silently hide signal_missing —
+    the transition would fire and the entry would get dropped before
+    the next scrape. Reject the combination at config-load time."""
+    raw = {
+        **MIN_CONFIG,
+        "safety": {"discovery": {"forget_after_runs": 2}},
+        "groups": [
+            {
+                "name": "g1",
+                "queries": [
+                    {
+                        "id": "cpu_{{ instance }}",
+                        "promql": 'up{instance="{{ instance }}"}',
+                        "expect_grace_runs": 5,
+                        "discover": [{"variable": "instance", "probe": "up", "label": "instance"}],
+                        "detectors": [{"name": "MAD"}],
+                    }
+                ],
+            }
+        ],
+    }
+    with pytest.raises(Exception, match="forget_after_runs"):
+        Config.model_validate(raw)
+
+
+def test_discovery_forget_after_runs_above_grace_is_ok() -> None:
+    raw = {
+        **MIN_CONFIG,
+        "safety": {"discovery": {"forget_after_runs": 50}},
+        "groups": [
+            {
+                "name": "g1",
+                "queries": [
+                    {
+                        "id": "cpu_{{ instance }}",
+                        "promql": 'up{instance="{{ instance }}"}',
+                        "expect_grace_runs": 5,
+                        "discover": [{"variable": "instance", "probe": "up", "label": "instance"}],
+                        "detectors": [{"name": "MAD"}],
+                    }
+                ],
+            }
+        ],
+    }
+    cfg = Config.model_validate(raw)
+    assert cfg.safety.discovery.forget_after_runs == 50
+
+
 def test_load_config_reads_dev_yaml(tmp_path: Path) -> None:
     dev = Path(__file__).resolve().parents[2] / "docker" / "dev-config.yaml"
     cfg = load_config(dev)

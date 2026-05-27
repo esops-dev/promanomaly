@@ -6,7 +6,15 @@ metadata:
 spec:
   replicas: {{ .Values.replicaCount }}
   strategy:
+    {{- if .Values.highAvailability.enabled }}
+    # HA mode survives a pod restart via leader election + the shared
+    # snapshot in Redis, so RollingUpdate is the right strategy. The
+    # static value here lets operators still override via
+    # ``strategy.type`` without touching the helper template.
+    type: {{ default "RollingUpdate" .Values.strategy.type }}
+    {{- else }}
     type: {{ .Values.strategy.type }}
+    {{- end }}
   selector:
     matchLabels: {{- include "promanomaly.selectorLabels" . | nindent 6 }}
   template:
@@ -15,7 +23,13 @@ spec:
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-        checksum/config: {{ tpl (toYaml .Values) . | sha256sum }}
+        {{- /*
+          toYaml without `tpl`: rolling the pods on a values change
+          only needs a deterministic hash. Running the YAML back
+          through `tpl` would re-interpret discovery templates like
+          `{{ instance }}` and fail to render.
+        */}}
+        checksum/config: {{ toYaml .Values | sha256sum }}
       labels:
         {{- include "promanomaly.selectorLabels" . | nindent 8 }}
         {{- with .Values.podLabels }}
@@ -36,6 +50,19 @@ spec:
           args:
             - "--config"
             - "/etc/promanomaly/config.yaml"
+          env:
+            # Downward API: POD_NAME is read by the leader-election
+            # path in HA mode to assign a unique Lease identity per
+            # replica. Always set so single-replica deployments
+            # log the pod name consistently too.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: http
               containerPort: 9092

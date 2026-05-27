@@ -38,6 +38,13 @@ from .config import (
     QueryConfig,
 )
 from .detectors import Detector, UnknownDetectorError, get
+from .discovery import (
+    DiscoveryError,
+    ExpandedQuery,
+    expand_query,
+    probe_variable,
+    render_template,
+)
 from .exporter import OperationalMetrics
 from .source import PromQLSource, QueryResult, QuerySeries, SourceQueryError
 from .state import GroupSnapshot, Sample, SnapshotStore
@@ -300,114 +307,345 @@ class Runner:
         return None
 
     async def _run_group_inner(self, group: GroupConfig) -> _GroupInnerResult:
-        defaults = self._config.defaults
-        policy = self._config.safety.on_source_failure
         out = _GroupInnerResult()
 
         for query in group.queries:
-            try:
-                qresult, plans = await self._fetch_and_plan(
-                    group, query, inflight_series_count=out.series_count
-                )
-            except SourceQueryError as exc:
-                # Source failure semantics:
-                #   serve_stale (default) -> raise; the run aborts and
-                #     the last good snapshot for the whole group stays
-                #     put.
-                #   drop_scores -> bump the counter, log, and continue
-                #     to the next query. The failed query's series are
-                #     simply absent from the new snapshot, so Prometheus
-                #     staleness handling flags them within a few
-                #     scrapes.
-                #   fail_ready -> raise like serve_stale; the readiness
-                #     bookkeeping lives in run_group().
-                logger.warning(
-                    "source_query_failed",
-                    group=group.name,
-                    query=query.id,
-                    reason=exc.reason,
-                    detail=exc.message,
-                    policy=policy,
-                )
-                self._ops.source_failure_total.labels(group=group.name, reason=exc.reason).inc()
-                if policy == "drop_scores":
-                    out.source_failures += 1
-                    continue
-                raise
-            except UnknownDetectorError as exc:
-                logger.error(
-                    "unknown_detector",
-                    group=group.name,
-                    query=query.id,
-                    detector=exc.detector_name,
-                )
-                self._ops.failures_total.labels(
-                    group=group.name,
-                    detector=exc.detector_name,
-                    reason=REASON_UNKNOWN_DETECTOR,
-                ).inc()
-                continue
-            except Exception as exc:
-                logger.exception(
-                    "query_failed",
-                    group=group.name,
-                    query=query.id,
-                    error=str(exc),
-                )
-                self._ops.failures_total.labels(
-                    group=group.name,
-                    detector="",
-                    reason=REASON_QUERY_EXCEPTION,
-                ).inc()
-                continue
-
-            # A successful fetch counts as a queries_succeeded even when
-            # the result vector is empty: the run produced fresh
-            # information about this query (expect: handling needs it,
-            # and dashboards rely on "we tried and got nothing" being
-            # distinct from "we couldn't ask").
-            out.queries_succeeded += 1
-
-            if qresult.truncated:
-                out.dropped[REASON_CARDINALITY] = out.dropped.get(REASON_CARDINALITY, 0) + 1
-                self._ops.series_dropped_total.labels(
-                    group=group.name, reason=REASON_CARDINALITY
-                ).inc()
-
-            # expect: handling — a query that returns zero series for
-            # expect_grace_runs consecutive runs trips
-            # anomaly_signal_missing=1.
-            if query.expect:
-                misses = self._store.record_expect_observation(
-                    group.name, query.id, has_results=bool(qresult.series)
-                )
-                if misses == 0:
-                    pass  # series back; signal_missing implicitly clears
-                elif misses == query.expect_grace_runs:
-                    self._ops.signal_missing_total.labels(
-                        group=group.name, reason="missing_grace_exhausted"
-                    ).inc()
-                if misses >= query.expect_grace_runs:
-                    out.samples.append(
-                        Sample(
-                            metric="anomaly_signal_missing",
-                            labels=(("id", query.id), ("group", group.name)),
-                            value=1.0,
-                        )
-                    )
-
-            for series in qresult.series:
-                out.series_count += 1
-                produced = await self._score_series(
+            if query.discover:
+                await self._process_discovered_query(group, query, out)
+            else:
+                await self._process_query_variant(
                     group=group,
                     query=query,
-                    plans=plans,
-                    series=series,
-                    defaults=defaults,
+                    variant=ExpandedQuery(
+                        rendered_id=query.id,
+                        rendered_promql=query.promql,
+                        labels={},
+                    ),
+                    out=out,
                 )
-                out.samples.extend(produced)
 
         return out
+
+    async def _process_discovered_query(
+        self,
+        group: GroupConfig,
+        query: QueryConfig,
+        out: _GroupInnerResult,
+    ) -> None:
+        """Probe + expand + score one discover-templated query.
+
+        Probe TSDB failures honour ``safety.on_source_failure`` so a
+        transient TSDB blip doesn't silently wipe a group's previously-
+        published snapshot under ``serve_stale``. Config-level failures
+        (undeclared template variable, illegal rendered id) bump
+        ``anomaly_discovery_failures_total`` and skip the query without
+        invoking the source-failure policy — those are user errors, not
+        infrastructure failures.
+
+        Discovery-tracked series that go missing past ``expect_grace_runs``
+        trip ``anomaly_signal_missing`` with the discovered labels — the
+        v0.4 dynamic counterpart to the v0.1 ``expect:`` flag. The
+        rendered (non-template) id is emitted on the metric so the same
+        logical series carries the same ``id`` label value in both
+        present and missing states.
+        """
+        policy = self._config.safety.on_source_failure
+        try:
+            value_sets = await self._probe_discovery_variables(group, query)
+        except SourceQueryError as exc:
+            # Treat probe-side TSDB failure exactly like a regular
+            # source query failure: bump the counter, then either
+            # propagate (serve_stale / fail_ready preserve the previous
+            # snapshot) or swallow (drop_scores).
+            self._ops.source_failure_total.labels(group=group.name, reason=exc.reason).inc()
+            logger.warning(
+                "discovery_probe_source_failed",
+                group=group.name,
+                query=query.id,
+                reason=exc.reason,
+                detail=exc.message,
+                policy=policy,
+            )
+            if policy == "drop_scores":
+                out.source_failures += 1
+                return
+            raise
+        except DiscoveryError as exc:
+            # Config-level discovery failure (template references an
+            # undeclared variable, etc.) — not a transient infra issue,
+            # so it shouldn't invoke serve_stale. Just skip the query.
+            logger.error(
+                "discovery_aborted",
+                group=group.name,
+                query=query.id,
+                reason=exc.reason,
+                detail=exc.message,
+            )
+            return
+
+        try:
+            variants = expand_query(query, value_sets)
+        except DiscoveryError as exc:
+            self._ops.discovery_failures_total.labels(
+                group=group.name,
+                query=query.id,
+                variable="",
+                reason=exc.reason,
+            ).inc()
+            logger.error(
+                "discovery_expansion_failed",
+                group=group.name,
+                query=query.id,
+                reason=exc.reason,
+            )
+            return
+
+        self._ops.discovery_expansions.labels(group=group.name, query=query.id).set(len(variants))
+
+        seen_keys: list[tuple[tuple[str, str], ...]] = []
+        for variant in variants:
+            seen_keys.append(variant.label_key)
+            await self._process_query_variant(
+                group=group,
+                query=query,
+                variant=variant,
+                out=out,
+            )
+
+        # Discovery-based absence: anomaly_signal_missing for series
+        # we've seen before but is absent in this run for at least
+        # ``expect_grace_runs`` consecutive runs. ``forget_after_runs``
+        # bounds the tracker so churn through ephemeral identities
+        # (transient pods, replicas) can't grow the dict without end.
+        grace = query.expect_grace_runs
+        forget_after = self._config.safety.discovery.forget_after_runs
+        transitioned = self._store.record_discovery_observation(
+            group.name,
+            query.id,
+            seen_keys,
+            grace,
+            forget_after_runs=forget_after,
+        )
+        for _series_key in transitioned:
+            self._ops.signal_missing_total.labels(
+                group=group.name, reason="missing_grace_exhausted"
+            ).inc()
+        for series_key in self._store.discovery_known_missing(group.name, query.id, grace):
+            # Render the id using the discovered labels so a missing
+            # series carries the same ``id`` label value it carried
+            # when it was present. Without this, an operator alerting
+            # on anomaly_signal_missing{id="cpu_busy_node_a"} would
+            # never match because the missing-state metric would use
+            # the raw template "cpu_busy_{{ instance }}" instead.
+            bindings = dict(series_key)
+            rendered_id = render_template(query.id, bindings)
+            # Discovered labels travel as ordinary source labels on
+            # anomaly_signal_missing — so the operator's privacy filter
+            # (exporter.output_labels) applies to them too, even on the
+            # "series went missing" path. Without this, a customer_id
+            # carried via discover: would leak through the absence
+            # signal even when scored metrics correctly strip it.
+            filtered_disc = self._filter_source_labels(dict(series_key))
+            labels = (
+                ("id", rendered_id),
+                ("group", group.name),
+                *filtered_disc.items(),
+            )
+            out.samples.append(
+                Sample(
+                    metric="anomaly_signal_missing",
+                    labels=tuple(sorted(labels)),
+                    value=1.0,
+                )
+            )
+
+    async def _probe_discovery_variables(
+        self,
+        group: GroupConfig,
+        query: QueryConfig,
+    ) -> dict[str, list[str]]:
+        """Run every probe for a query; harvest discovered values.
+
+        Raises :class:`SourceQueryError` when a probe fails against the
+        TSDB so the caller can apply ``safety.on_source_failure``. Other
+        failure modes (no safe values, …) emit
+        ``anomaly_discovery_failures_total`` and either short-circuit
+        via :class:`DiscoveryError` (raised) or carry empty sets through
+        (the runner treats that like an ``expect:`` empty result).
+        """
+        defaults = self._config.defaults
+
+        async def _probe(promql: str) -> QueryResult:
+            return await self._source.range_query(
+                promql=promql,
+                end=time.time(),
+                window_seconds=defaults.window_seconds,
+                step_seconds=defaults.step_seconds,
+                max_series=self._config.safety.max_series_per_query,
+            )
+
+        value_sets: dict[str, list[str]] = {}
+        for var in query.discover:
+            try:
+                values, dropped = await probe_variable(var, probe_fn=_probe)
+            except DiscoveryError as exc:
+                # Probe-side source failures (timeout, server_error, …)
+                # arrive here with the original TSDB reason preserved.
+                # Re-raise as SourceQueryError so the caller can apply
+                # ``safety.on_source_failure`` instead of silently
+                # overwriting the snapshot with empty data on a TSDB
+                # blip. Tag the discovery-specific counter separately so
+                # operators can tell discovery failure from regular
+                # query failure on dashboards.
+                self._ops.discovery_failures_total.labels(
+                    group=group.name,
+                    query=query.id,
+                    variable=var.variable,
+                    reason="probe_query_failed",
+                ).inc()
+                raise SourceQueryError(exc.reason, exc.message) from exc
+            if dropped:
+                # Surface unsafe values so the operator can fix the
+                # query rather than have us silently filter their
+                # production labels. Counter is bounded — one bump per
+                # affected variable per run.
+                self._ops.discovery_failures_total.labels(
+                    group=group.name,
+                    query=query.id,
+                    variable=var.variable,
+                    reason="unsafe_value",
+                ).inc()
+                logger.warning(
+                    "discovery_unsafe_values_dropped",
+                    group=group.name,
+                    query=query.id,
+                    variable=var.variable,
+                    examples=dropped[:5],
+                    dropped_count=len(dropped),
+                )
+            if not values:
+                self._ops.discovery_failures_total.labels(
+                    group=group.name,
+                    query=query.id,
+                    variable=var.variable,
+                    reason="empty_probe",
+                ).inc()
+                logger.info(
+                    "discovery_probe_empty",
+                    group=group.name,
+                    query=query.id,
+                    variable=var.variable,
+                )
+            value_sets[var.variable] = values
+        return value_sets
+
+    async def _process_query_variant(
+        self,
+        *,
+        group: GroupConfig,
+        query: QueryConfig,
+        variant: ExpandedQuery,
+        out: _GroupInnerResult,
+    ) -> None:
+        """Fetch and score one (possibly rendered) query variant.
+
+        For non-discover queries the variant just mirrors the
+        ``QueryConfig`` fields verbatim. For discover queries each
+        Cartesian fan-out passes through here, so failure isolation /
+        ``expect:`` / cardinality safety apply identically to every
+        rendered variant.
+        """
+        defaults = self._config.defaults
+        policy = self._config.safety.on_source_failure
+        # ``effective_query`` carries the rendered id/promql and the
+        # variant's discovered labels. ``query`` keeps the original
+        # config (and its templates) for diagnostics + state-store keys
+        # the runner maintains per logical query rather than per
+        # expansion.
+        effective_query = (
+            query.model_copy(update={"id": variant.rendered_id, "promql": variant.rendered_promql})
+            if variant.labels
+            else query
+        )
+
+        try:
+            qresult, plans = await self._fetch_and_plan(
+                group, effective_query, inflight_series_count=out.series_count
+            )
+        except SourceQueryError as exc:
+            logger.warning(
+                "source_query_failed",
+                group=group.name,
+                query=effective_query.id,
+                reason=exc.reason,
+                detail=exc.message,
+                policy=policy,
+            )
+            self._ops.source_failure_total.labels(group=group.name, reason=exc.reason).inc()
+            if policy == "drop_scores":
+                out.source_failures += 1
+                return
+            raise
+        except UnknownDetectorError as exc:
+            logger.error(
+                "unknown_detector",
+                group=group.name,
+                query=effective_query.id,
+                detector=exc.detector_name,
+            )
+            self._ops.failures_total.labels(
+                group=group.name,
+                detector=exc.detector_name,
+                reason=REASON_UNKNOWN_DETECTOR,
+            ).inc()
+            return
+        except Exception as exc:
+            logger.exception(
+                "query_failed",
+                group=group.name,
+                query=effective_query.id,
+                error=str(exc),
+            )
+            self._ops.failures_total.labels(
+                group=group.name,
+                detector="",
+                reason=REASON_QUERY_EXCEPTION,
+            ).inc()
+            return
+
+        out.queries_succeeded += 1
+
+        if qresult.truncated:
+            out.dropped[REASON_CARDINALITY] = out.dropped.get(REASON_CARDINALITY, 0) + 1
+            self._ops.series_dropped_total.labels(group=group.name, reason=REASON_CARDINALITY).inc()
+
+        if effective_query.expect:
+            misses = self._store.record_expect_observation(
+                group.name, effective_query.id, has_results=bool(qresult.series)
+            )
+            if misses == effective_query.expect_grace_runs:
+                self._ops.signal_missing_total.labels(
+                    group=group.name, reason="missing_grace_exhausted"
+                ).inc()
+            if misses >= effective_query.expect_grace_runs:
+                out.samples.append(
+                    Sample(
+                        metric="anomaly_signal_missing",
+                        labels=(("group", group.name), ("id", effective_query.id)),
+                        value=1.0,
+                    )
+                )
+
+        for series in qresult.series:
+            out.series_count += 1
+            produced = await self._score_series(
+                group=group,
+                query=effective_query,
+                plans=plans,
+                series=series,
+                defaults=defaults,
+            )
+            out.samples.extend(produced)
 
     async def _fetch_and_plan(
         self,
@@ -895,8 +1133,7 @@ class Runner:
         # ``id`` and ``group`` are the only labels on composite metrics —
         # we intentionally drop ``detector`` because the composite spans
         # multiple detectors, and source-side labels would balloon the
-        # cardinality at fan-in. This matches the documented label
-        # surface in CLAUDE.md.
+        # cardinality at fan-in.
         src = self._filter_source_labels(series.labels)
         result: dict[str, str] = dict(src)
         result["id"] = query.id

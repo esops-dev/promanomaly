@@ -20,6 +20,11 @@ dependencies = [
     "PyYAML>=6.0.2",
     "numpy>=2.1.0",
     "pandas>=2.2.3",
+    # Redis-backed query + snapshot cache, used in HA mode and any
+    # time ``safety.query_cache.backend=redis``. Kept in the base
+    # install because the client itself is small (~50KB) and most HA
+    # users will also want the single-replica Redis-query-cache path.
+    "redis>=5.2.0",
 ]
 
 [project.optional-dependencies]
@@ -30,6 +35,14 @@ dependencies = [
 analyze = [
     "ruptures>=1.1.9",
 ]
+# Kubernetes Lease client for HA-mode leader election. Heavy (~10MB
+# of generated API stubs) and only consumed when
+# ``highAvailability.enabled=true``; install with
+# ``pip install promanomaly[ha]`` for multi-replica deployments.
+# Single-replica setups don't need the dependency.
+ha = [
+    "kubernetes>=31.0.0",
+]
 dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
@@ -39,6 +52,14 @@ dev = [
     "types-PyYAML",
     "pandas-stubs",
     "ruptures>=1.1.9",
+    # Used in unit tests of the Redis-backed query + snapshot caches so
+    # they exercise the real ``redis-py`` API surface without requiring
+    # an external Redis at test time.
+    "fakeredis>=2.26.0",
+    # HA-mode test suite needs the kubernetes client too; bundling it
+    # with the dev extras means ``uv sync --all-extras`` covers both
+    # single-replica and HA test paths.
+    "kubernetes>=31.0.0",
 ]
 
 [project.scripts]
@@ -88,6 +109,8 @@ module = [
     "prometheus_client.*",
     "uvicorn.*",
     "ruptures.*",
+    "kubernetes.*",
+    "fakeredis.*",
 ]
 ignore_missing_imports = true
 

@@ -125,16 +125,43 @@ class ServerConfig(_ModelBase):
         return parse_duration(self.refresh_interval)
 
 
+class RedisConfig(_ModelBase):
+    """Connection settings for the Redis-backed cache(s).
+
+    A single Redis instance backs both the query cache (when HA mode is
+    on) and the shared snapshot cache. Keys are prefixed so the two
+    coexist safely on the same database.
+    """
+
+    url: str = "redis://localhost:6379/0"
+    # All keys this process writes are prefixed with ``{key_prefix}:``
+    # so multiple deployments can share a Redis without colliding.
+    key_prefix: str = "promanomaly"
+    # Per-connection timeout. Kept tight so a slow Redis cannot block
+    # the detector pipeline for longer than the source-query budget.
+    timeout: Duration = "2s"
+
+    @property
+    def timeout_seconds(self) -> float:
+        return parse_duration(self.timeout)
+
+
 class QueryCacheConfig(_ModelBase):
-    """In-process LRU cache for overlapping PromQL responses.
+    """LRU cache for overlapping PromQL responses.
 
     Enabled by default with a conservative TTL — same PromQL inside one
     run (multiple queries, ensemble fan-out) is collapsed into one TSDB
-    request without changing semantics. The Redis-backed HA variant
-    ships in v0.4 and slots into the same call site.
+    request without changing semantics.
+
+    ``backend: memory`` (the default) keeps entries in a process-local
+    LRU. ``backend: redis`` plugs into the same call site but stores
+    entries in the configured Redis (set ``safety.redis.url``) so a
+    leader and its followers share a single TSDB hit per (promql,
+    window) bucket — the HA-mode variant from v0.4.
     """
 
     enabled: bool = True
+    backend: Literal["memory", "redis"] = "memory"
     max_entries: int = Field(default=1024, ge=1)
     # 30s default mirrors the typical scrape cadence — two queries inside
     # the same tick share a result, but the second tick still refetches.
@@ -143,6 +170,67 @@ class QueryCacheConfig(_ModelBase):
     @property
     def ttl_seconds(self) -> float:
         return parse_duration(self.ttl)
+
+
+class DiscoveryConfig(_ModelBase):
+    """Tuning knobs for dynamic series discovery.
+
+    The state-bounding default exists so a workload that churns through
+    ephemeral identities (transient pod names, replica IDs that never
+    recycle) doesn't grow the discovery-tracker dict without bound.
+    """
+
+    # After this many consecutive missing runs a discovered series is
+    # forgotten — ``anomaly_signal_missing`` stops being emitted and
+    # the next time the series reappears it counts as newly discovered.
+    # Default is large enough that operators get plenty of time to
+    # notice and act on the alert (~16 hours at a 1m refresh) while
+    # still bounding the worst-case state size.
+    forget_after_runs: int = Field(default=1000, ge=1)
+
+
+class HighAvailabilityConfig(_ModelBase):
+    """Lease-based leader election + Redis-backed snapshot sharing.
+
+    Off by default: the MVP topology is ``replicas: 1`` with
+    ``strategy: Recreate``. Operators opting into multi-replica
+    deployments flip ``enabled: true`` and the leader election + Redis
+    snapshot cache come online. Followers serve the leader's most
+    recent snapshot from Redis without issuing source queries.
+    """
+
+    enabled: bool = False
+    # Coordination Lease parameters. Defaults mirror controller-runtime
+    # so operators running other controllers on the same cluster don't
+    # need to remember a new set.
+    lease_name: str = "promanomaly-leader"
+    lease_namespace: str = "default"
+    lease_duration: Duration = "15s"
+    renew_deadline: Duration = "10s"
+    retry_period: Duration = "2s"
+    # Unique identity used inside the Lease. Defaults to the pod name
+    # via the ``POD_NAME`` env var when unset; the leader.py module
+    # resolves this at boot.
+    identity: str | None = None
+    # Where the shared snapshot lives. Mandatory whenever enabled=True;
+    # validated at load time.
+    snapshot_ttl: Duration = "5m"
+
+    @property
+    def lease_duration_seconds(self) -> float:
+        return parse_duration(self.lease_duration)
+
+    @property
+    def renew_deadline_seconds(self) -> float:
+        return parse_duration(self.renew_deadline)
+
+    @property
+    def retry_period_seconds(self) -> float:
+        return parse_duration(self.retry_period)
+
+    @property
+    def snapshot_ttl_seconds(self) -> float:
+        return parse_duration(self.snapshot_ttl)
 
 
 class SafetyConfig(_ModelBase):
@@ -159,6 +247,10 @@ class SafetyConfig(_ModelBase):
     # service, so the default mirrors expect_grace_runs.
     fail_ready_after: int = Field(default=3, ge=1)
     query_cache: QueryCacheConfig = Field(default_factory=QueryCacheConfig)
+    # Shared Redis settings; consumed by the query cache when
+    # ``query_cache.backend=redis`` and by the HA snapshot cache.
+    redis: RedisConfig = Field(default_factory=RedisConfig)
+    discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
 
     @property
     def detect_timeout_seconds(self) -> float:
@@ -195,13 +287,86 @@ class DefaultsConfig(_ModelBase):
         return parse_duration(self.step)
 
 
+_CANONICAL_OUTPUT_LABELS: frozenset[str] = frozenset(
+    {"id", "group", "detector", "detector_instance"}
+)
+
+
 class ExporterLabelsConfig(_ModelBase):
+    """Source-label allow / drop filtering applied at the exporter boundary.
+
+    The detector copies labels from the source query onto its output
+    metrics; for regulated or privacy-sensitive environments the operator
+    needs a way to prevent customer ids, internal SKUs, or other
+    sensitive labels reaching the monitoring plane via the anomaly
+    metrics.
+
+    Semantics:
+    - ``allow=[]`` (default) — every source label flows through.
+    - ``allow=[...]`` — only listed source labels are emitted; others
+      are stripped.
+    - ``drop=[...]`` — listed labels are always stripped. Applied after
+      ``allow`` so an explicit drop overrides an explicit allow.
+
+    The canonical labels emitted by the detector itself (``id``,
+    ``group``, ``detector``, ``detector_instance``) cannot be filtered;
+    they are added after the filter runs. Listing one of them in ``drop``
+    is rejected at config-load time so an operator who *thinks* they are
+    stripping ``id`` finds out at validate time, not when they wonder
+    why their PromQL joins still work.
+    """
+
     allow: list[str] = Field(default_factory=list)
     drop: list[str] = Field(default_factory=list)
+
+    @field_validator("drop")
+    @classmethod
+    def _reject_canonical_in_drop(cls, value: list[str]) -> list[str]:
+        offending = sorted(set(value) & _CANONICAL_OUTPUT_LABELS)
+        if offending:
+            raise ValueError(
+                f"exporter.output_labels.drop cannot strip canonical detector "
+                f"labels {offending}; they are added after the filter and "
+                "always emitted"
+            )
+        return value
 
 
 class ExporterConfig(_ModelBase):
     output_labels: ExporterLabelsConfig = Field(default_factory=ExporterLabelsConfig)
+
+
+_DISCOVER_VARIABLE_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+class DiscoverVariable(_ModelBase):
+    """One axis of dynamic series discovery.
+
+    The ``probe`` PromQL is executed at run time and the distinct values
+    of ``label`` across its result vector become the expansion set for
+    this variable. The variable is referenced in the query body and the
+    metric id template via ``{{ variable }}``.
+    """
+
+    variable: str
+    probe: str
+    label: str
+
+    @field_validator("variable")
+    @classmethod
+    def _validate_variable(cls, value: str) -> str:
+        if not _DISCOVER_VARIABLE_RE.match(value):
+            raise ValueError(
+                f"discover.variable={value!r}: must match {_DISCOVER_VARIABLE_RE.pattern}"
+            )
+        return value
+
+    @field_validator("label")
+    @classmethod
+    def _validate_label(cls, value: str) -> str:
+        if ":" in value:
+            raise ValueError(f"discover.label={value!r}: colons are reserved for recording rules")
+        return value
 
 
 class DetectorEntry(_ModelBase):
@@ -228,7 +393,11 @@ class DetectorEntry(_ModelBase):
 
 
 class QueryConfig(_ModelBase):
-    id: PromName
+    # Plain string allowed (and the historic norm); when a ``discover:``
+    # block is set the id is treated as a template — ``{{ variable }}``
+    # placeholders are substituted per expansion at runtime. The
+    # rendered ids still go through the Prometheus-name validator there.
+    id: str
     promql: str
     detectors: list[DetectorEntry]
     expect: bool = False
@@ -236,11 +405,34 @@ class QueryConfig(_ModelBase):
     min_abs_delta: float | None = None
     min_relative_delta: float | None = None
     alert_thresholds: AlertThresholds | None = None
+    # Dynamic series discovery (v0.4). Each entry probes the TSDB for
+    # the distinct values of one label; the query's ``promql`` and ``id``
+    # are expanded once per Cartesian combination across all variables.
+    discover: list[DiscoverVariable] = Field(default_factory=list)
 
     @field_validator("id")
     @classmethod
     def _validate_id(cls, value: str) -> str:
-        return _validate_prom_name(value, field="query.id")
+        # When the id contains no template placeholders we hold it to
+        # the Prometheus-name rules immediately. Templated ids are
+        # validated after substitution in the runner.
+        if "{{" not in value:
+            return _validate_prom_name(value, field="query.id")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_template_vs_discover(self) -> QueryConfig:
+        has_template = "{{" in self.id or "{{" in self.promql
+        if has_template and not self.discover:
+            raise ValueError(
+                f"query {self.id!r}: '{{{{ variable }}}}' placeholders require "
+                "a discover: block defining the variable(s)"
+            )
+        if self.discover:
+            names = [d.variable for d in self.discover]
+            if len(names) != len(set(names)):
+                raise ValueError(f"query {self.id!r}: duplicate discover.variable names: {names}")
+        return self
 
     @model_validator(mode="after")
     def _check_detector_instances(self) -> QueryConfig:
@@ -332,7 +524,43 @@ class Config(_ModelBase):
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
     defaults: DefaultsConfig = Field(default_factory=DefaultsConfig)
     exporter: ExporterConfig = Field(default_factory=ExporterConfig)
+    highAvailability: HighAvailabilityConfig = Field(default_factory=HighAvailabilityConfig)
     groups: list[GroupConfig]
+
+    @model_validator(mode="after")
+    def _validate_ha_requires_redis(self) -> Config:
+        # HA mode needs the Redis snapshot cache; without it followers
+        # would have no way to read the leader's output. Fail loud at
+        # boot rather than producing inconsistent /metrics across pods.
+        if self.highAvailability.enabled and not self.safety.redis.url:
+            raise ValueError("highAvailability.enabled=true requires safety.redis.url to be set")
+        if self.safety.query_cache.backend == "redis" and not self.safety.redis.url:
+            raise ValueError("safety.query_cache.backend=redis requires safety.redis.url to be set")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_discovery_forget_window(self) -> Config:
+        # ``forget_after_runs`` must outlast the longest configured
+        # ``expect_grace_runs`` of any discover-templated query —
+        # otherwise the missing-series transition fires for one run
+        # and the entry is dropped before the next scrape window
+        # rolls around, hiding the alert from operators. Surfacing
+        # this at boot is much friendlier than the silent failure
+        # mode in production.
+        forget = self.safety.discovery.forget_after_runs
+        for group in self.groups:
+            for query in group.queries:
+                if not query.discover:
+                    continue
+                if forget < query.expect_grace_runs:
+                    raise ValueError(
+                        f"safety.discovery.forget_after_runs={forget} is below "
+                        f"query {query.id!r}.expect_grace_runs={query.expect_grace_runs}; "
+                        "discovered series would be forgotten before signal_missing "
+                        "has a chance to alert. Raise forget_after_runs or lower "
+                        "expect_grace_runs."
+                    )
+        return self
 
     @field_validator("apiVersion")
     @classmethod
@@ -387,12 +615,16 @@ __all__ = [
     "DatasourceConfig",
     "DefaultsConfig",
     "DetectorEntry",
+    "DiscoverVariable",
+    "DiscoveryConfig",
     "EnsembleConfig",
     "ExporterConfig",
     "ExporterLabelsConfig",
     "GroupConfig",
+    "HighAvailabilityConfig",
     "QueryCacheConfig",
     "QueryConfig",
+    "RedisConfig",
     "ReloadAuthConfig",
     "ReloadConfig",
     "SafetyConfig",

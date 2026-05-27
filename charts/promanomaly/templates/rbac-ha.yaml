@@ -1,0 +1,39 @@
+{{- if .Values.highAvailability.enabled -}}
+# Lease-API permissions required by the HA leader-election loop.
+# Only the get/list/watch/create/update verbs on coordination.k8s.io
+# Leases are required — no cluster-scoped permissions, scoped to a
+# single Lease resource by name. Renders only when HA is enabled so
+# single-replica deployments don't grant rights they never use.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "promanomaly.fullname" . }}-leader-election
+  namespace: {{ default .Release.Namespace .Values.highAvailability.lease_namespace | quote }}
+  labels: {{- include "promanomaly.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: [{{ .Values.highAvailability.lease_name | quote }}]
+    verbs: ["get", "update", "patch"]
+  # Create + list are unscoped on apiGroups/resources because the
+  # client must be able to list before the Lease exists and create it
+  # on first acquisition. Same pattern controller-runtime uses.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "promanomaly.fullname" . }}-leader-election
+  namespace: {{ default .Release.Namespace .Values.highAvailability.lease_namespace | quote }}
+  labels: {{- include "promanomaly.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "promanomaly.fullname" . }}-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "promanomaly.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

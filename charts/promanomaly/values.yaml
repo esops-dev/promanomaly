@@ -11,10 +11,18 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
-replicaCount: 1        # do not bump — single-replica is the supported topology
+replicaCount: 1        # in single-replica mode this MUST stay at 1.
+                       # When highAvailability.enabled=true it's safe
+                       # to bump (typically to 2 or 3) and the chart
+                       # automatically flips to a RollingUpdate strategy
+                       # via the override below.
 
 strategy:
-  type: Recreate       # required while replicaCount: 1
+  # Recreate is correct for the single-replica MVP. The chart's helper
+  # template overrides this to RollingUpdate when
+  # highAvailability.enabled=true so HA deployments roll without a
+  # downtime window between pod kills and re-elections.
+  type: Recreate
 
 # Datasource: the PromQL-compatible TSDB the detector reads from.
 datasource:
@@ -48,13 +56,49 @@ safety:
   # transient TSDB blip must not take the pod out of the service.
   fail_ready_after: 3
   # In-process LRU+TTL cache for overlapping PromQL responses. The
-  # Redis-backed HA variant ships in a later milestone; this knob will
-  # continue to govern the single-replica path. See docs/operations.md
-  # for the worked example.
+  # Redis-backed HA variant is selected with ``backend: redis`` and
+  # requires the ``redis:`` block below. See docs/operations.md for
+  # the worked example.
   query_cache:
     enabled: true
+    backend: memory          # memory | redis
     max_entries: 1024
     ttl: 30s
+
+  # Shared Redis settings. Consumed by ``query_cache.backend=redis``
+  # and by ``highAvailability.enabled=true``.  Both share one Redis
+  # instance; the ``key_prefix`` keeps the snapshot cache and the
+  # query cache from colliding inside a database.
+  redis:
+    url: redis://promanomaly-redis-master:6379/0
+    key_prefix: promanomaly
+    timeout: 2s
+
+  # Dynamic series discovery (v0.4). Bounds the in-memory tracker so
+  # workloads with ephemeral identities (transient pod names, replica
+  # IDs that never recycle) don't grow the discovery dict without end.
+  # Default of 1000 runs is ~16 hours at the 1m refresh — plenty of
+  # time for operators to act on anomaly_signal_missing before the
+  # tracker forgets the series.
+  discovery:
+    forget_after_runs: 1000
+
+# High-availability mode: Lease-based leader election and a Redis-backed
+# shared snapshot cache. Off by default (single-replica is the MVP
+# topology). When flipped to ``true`` the Deployment switches to
+# RollingUpdate, the chart renders a Role + RoleBinding granting the
+# Lease verbs, and the Downward API exposes POD_NAME so each replica
+# announces its own identity in the Lease.
+highAvailability:
+  enabled: false
+  lease_name: promanomaly-leader
+  # Defaults to the release namespace via ``.Release.Namespace`` in the
+  # rendered ConfigMap when unset.
+  lease_namespace: ""
+  lease_duration: 15s
+  renew_deadline: 10s
+  retry_period: 2s
+  snapshot_ttl: 5m
 
 defaults:
   window: 1h
@@ -76,6 +120,22 @@ defaults:
   # signal. See docs/operations.md for the worked example.
   min_abs_delta: 0.0      # original-units floor (e.g. 0.05 errors/s)
   min_relative_delta: 0.0  # fraction-of-baseline floor (e.g. 0.05 = 5%)
+
+# Output-label filtering. Applied at the exporter boundary so labels
+# carried from the source query never reach Prometheus when they would
+# leak privacy/compliance-sensitive identifiers (customer ids, SKUs,
+# user-supplied tags). The canonical labels emitted by the detector
+# itself (id, group, detector, detector_instance) cannot be stripped.
+#
+# - ``allow`` (default []): when non-empty, only listed source labels
+#   pass through. The canonical labels are always emitted in addition.
+# - ``drop`` (default []): always stripped; takes precedence over allow.
+#
+# See docs/operations.md for a GDPR-style worked example.
+exporter:
+  output_labels:
+    allow: []
+    drop: []
 
 # Inline detector groups. Mutually exclusive with ``existingConfigMap``.
 #

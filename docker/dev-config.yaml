@@ -23,6 +23,18 @@ safety:
   detect_timeout: 5s
   query_timeout: 10s
   on_source_failure: serve_stale
+  # v0.4: drive the query cache through the dev Redis so the
+  # anomaly_query_cache_* metrics reflect the real backend rather than
+  # only the in-process LRU.
+  query_cache:
+    enabled: true
+    backend: redis
+    max_entries: 1024
+    ttl: 30s
+  redis:
+    url: redis://redis:6379/0
+    key_prefix: promanomaly
+    timeout: 2s
 
 defaults:
   window: 15m
@@ -79,3 +91,27 @@ groups:
         detectors:
           - name: BOCPD
           - name: CUSUM
+
+  - name: cluster_discovered
+    priority: 2
+    # v0.4: dynamic discovery against the local Prometheus's external
+    # ``cluster`` label. The probe harvests every distinct ``cluster``
+    # value from ``up{job="node-exporter"}`` and the templated query /
+    # id fan out across those values. With one cluster we'll only get
+    # one expansion (``cluster=dev``); the wiring still exercises the
+    # end-to-end discovery path (probe -> expansion -> fetch -> score)
+    # against real VictoriaMetrics, including the rendered metric id.
+    # ``instance`` is a tempting axis but its value
+    # (``node-exporter:9100``) contains characters Prometheus rejects
+    # in metric names, so the dev config picks a discovery label whose
+    # values render cleanly.
+    queries:
+      - id: cluster_cpu_busy_{{ cluster }}
+        promql: '100 * (1 - avg by (cluster) (rate(node_cpu_seconds_total{cluster="{{ cluster }}", mode="idle"}[1m])))'
+        expect_grace_runs: 3
+        discover:
+          - variable: cluster
+            probe: 'up{job="node-exporter"}'
+            label: cluster
+        detectors:
+          - name: MAD

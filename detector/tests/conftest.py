@@ -58,6 +58,14 @@ class StubSource(PromQLSource):
         return QueryResult(series=list(resp.series))
 
 
+def make_label_only_series(label: str, value: str) -> QuerySeries:
+    """Discovery probes only need a label set; the sample frame is unused."""
+    return QuerySeries(
+        labels={label: value},
+        samples=pd.DataFrame({"timestamp": [0.0], "y": [0.0]}),
+    )
+
+
 @pytest.fixture
 def stub_source() -> StubSource:
     return StubSource()

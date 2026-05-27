@@ -1,0 +1,33 @@
+# HA mode end-to-end render: leader election RBAC, RollingUpdate
+# strategy, Redis-backed query cache, snapshot cache TTL, and the
+# Downward API POD_NAME wiring all need to lint cleanly together.
+
+replicaCount: 2
+
+highAvailability:
+  enabled: true
+  lease_name: promanomaly-leader
+  lease_namespace: ""    # falls through to .Release.Namespace
+  lease_duration: 15s
+  renew_deadline: 10s
+  retry_period: 2s
+  snapshot_ttl: 5m
+
+safety:
+  query_cache:
+    enabled: true
+    backend: redis
+    max_entries: 4096
+    ttl: 30s
+  redis:
+    url: redis://promanomaly-redis-master:6379/0
+    key_prefix: promanomaly
+    timeout: 2s
+
+groups:
+  - name: ha_sanity
+    queries:
+      - id: cpu_busy_ratio
+        promql: rate(node_cpu_seconds_total[1m])
+        detectors:
+          - name: MAD
