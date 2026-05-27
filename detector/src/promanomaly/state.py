@@ -90,6 +90,14 @@ class SnapshotStore:
             tuple[str, str, tuple[tuple[str, str], ...], str, str | None],
             DetectorCalibration,
         ] = {}
+        # (group, query_id, series_key, detector_name, detector_instance)
+        # -> cumulative change-point count emitted as
+        # ``anomaly_change_point_total``. Rebuilt from zero on restart,
+        # which Prometheus's counter-reset detection handles correctly.
+        self._change_point_counts: dict[
+            tuple[str, str, tuple[tuple[str, str], ...], str, str | None],
+            int,
+        ] = {}
 
     # ------------------------------------------------------------------
     # Snapshots
@@ -129,6 +137,9 @@ class SnapshotStore:
             for cal_key in list(self._calibrations):
                 if cal_key[0] == group:
                     del self._calibrations[cal_key]
+            for cp_key in list(self._change_point_counts):
+                if cp_key[0] == group:
+                    del self._change_point_counts[cp_key]
 
     # ------------------------------------------------------------------
     # Readiness
@@ -276,6 +287,34 @@ class SnapshotStore:
         key = (group, query_id, series_key, detector_name, detector_instance)
         with self._lock:
             return self._calibrations.get(key)
+
+    # ------------------------------------------------------------------
+    # Change-point counter (anomaly_change_point_total)
+    # ------------------------------------------------------------------
+    def record_change_point(
+        self,
+        group: str,
+        query_id: str,
+        series_key: tuple[tuple[str, str], ...],
+        detector_name: str,
+        detector_instance: str | None,
+        fired: bool,
+    ) -> int:
+        """Update the cumulative change-point counter and return the new total.
+
+        Increments when ``fired`` is True; otherwise leaves the counter
+        unchanged. Either way returns the current cumulative count so the
+        caller can emit ``anomaly_change_point_total`` on every run (the
+        counter must be present every scrape, otherwise Prometheus treats
+        absence as a series staleness rather than a steady value).
+        """
+        key = (group, query_id, series_key, detector_name, detector_instance)
+        with self._lock:
+            count = self._change_point_counts.get(key, 0)
+            if fired:
+                count += 1
+                self._change_point_counts[key] = count
+            return count
 
     def clear_calibrations(self) -> None:
         """Drop the entire calibration cache.

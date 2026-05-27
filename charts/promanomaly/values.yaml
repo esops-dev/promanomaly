@@ -75,7 +75,7 @@ defaults:
   # ``anomaly_score`` is unaffected; dashboards still see the raw
   # signal. See docs/operations.md for the worked example.
   min_abs_delta: 0.0      # original-units floor (e.g. 0.05 errors/s)
-  min_relative_delta: 0.0 # fraction-of-baseline floor (e.g. 0.05 = 5%)
+  min_relative_delta: 0.0  # fraction-of-baseline floor (e.g. 0.05 = 5%)
 
 # Inline detector groups. Mutually exclusive with ``existingConfigMap``.
 #

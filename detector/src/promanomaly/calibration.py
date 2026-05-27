@@ -135,6 +135,13 @@ def _detector_fires(
         row = detector.fit_score(samples, "", params).iloc[-1]
     except Exception:
         return False
+    # Mirror the runner's verdict logic: a detector that knows its own
+    # threshold semantics flags ``is_outside=True`` directly; otherwise
+    # we compare the raw score against the alert threshold. Without the
+    # ``is_outside`` check here, calibration would disagree with live
+    # scoring for change-point detectors and report a misleading F1.
+    if bool(row.get("is_outside", False)):
+        return True
     return float(row.get("score", 0.0)) >= threshold
 
 

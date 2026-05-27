@@ -156,6 +156,44 @@ The composite metrics carry no `detector` label by design — they span multiple
 
 Weighted voting, Bayesian fusion, and ML-trained combiners are explicitly out of scope. Operators who want them compose recording rules; everything else drifts toward stateful tuning.
 
+## Change-Point Detectors and the Counter
+
+Change-point detectors (BOCPD, CUSUM) emit a counter, not just a gauge:
+
+```
+anomaly_change_point_total{id, group, detector, <source labels>}
+```
+
+The counter increments by 1 on each *fresh* fire at the latest sample — no double-counting on overlapping rolling-window calls. Useful queries:
+
+```promql
+# Count change-points in the last 10 minutes.
+increase(anomaly_change_point_total[10m])
+
+# Fleet-wide change-point burst (alert when many services regress at once).
+sum by (group) (rate(anomaly_change_point_total[1m]))
+```
+
+The counter resets to zero on process restart (consistent with the project's stateless promise) — Prometheus's counter-reset detection handles that natively.
+
+Two operator-facing knobs:
+
+```yaml
+defaults:
+  emit_change_points: true   # default; flip to false to suppress the counter wholesale
+```
+
+```yaml
+detectors:
+  - name: BOCPD
+    params:
+      threshold: 0.5   # per-detector override of alert_thresholds.score
+```
+
+Per-detector threshold is honoured in **both** the live-scoring path and the calibration cycle. Don't set the group's `alert_thresholds.score` to a BOCPD-friendly value (e.g. 0.5) — it would also gate the sigma-multiplier detectors in the same group. Use the per-detector override instead.
+
+See [`change-points.md`](change-points.md) for the algorithm details and worked examples.
+
 ## Query Caching
 
 The detector ships an in-process LRU + TTL cache for PromQL responses. Two unrelated callers that issue the same query inside the TTL share one TSDB hit — useful when the same expression is configured under multiple `id`s, when an ensemble runs several detectors against the same source query, or when `refresh_interval` is shorter than the rolling `step` and consecutive ticks land in the same bucket.

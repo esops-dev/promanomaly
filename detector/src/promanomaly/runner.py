@@ -574,6 +574,12 @@ class Runner:
                 # the v0.2 baseline before ensemble fusion landed.
                 continue
             emit_samples = not is_suppressed
+            # Per-detector threshold override. BOCPD's score is a posterior
+            # probability in [0, 1], so the group-level alert_thresholds.score
+            # (typically 3.0) makes no sense for it. Detectors opt in by
+            # surfacing a ``threshold`` parameter; everyone else falls back
+            # to the query/group threshold.
+            effective_threshold = _effective_threshold(plan, threshold_score)
             try:
                 score_row = await self._run_detector(plan, series)
             except concurrent.futures.TimeoutError:
@@ -609,7 +615,7 @@ class Runner:
                 series=series,
                 plan=plan,
                 score_row=score_row,
-                threshold_score=threshold_score,
+                threshold_score=effective_threshold,
                 min_abs=min_abs,
                 min_rel=min_rel,
                 defaults=defaults,
@@ -736,6 +742,12 @@ class Runner:
         baseline = float(score_row.get("baseline", 0.0))
         latest_y = float(series.samples["y"].iloc[-1])
 
+        # Detectors that handle their own threshold semantics (BOCPD's
+        # probability score, future change-point detectors) flag
+        # ``is_outside=True`` in the score row. The runner ORs that with
+        # the statistical threshold check so MAD/Hampel/IQR (which leave
+        # is_outside=False) keep their existing behaviour.
+        detector_says_outside = bool(score_row.get("is_outside", False))
         outside = self._apply_threshold(
             score=score,
             baseline=baseline,
@@ -743,6 +755,7 @@ class Runner:
             threshold_score=threshold_score,
             min_abs=min_abs,
             min_rel=min_rel,
+            detector_says_outside=detector_says_outside,
         )
         duration_seconds = self._store.update_duration(
             group=group.name,
@@ -770,6 +783,28 @@ class Runner:
                     metric="anomaly_duration_seconds",
                     labels=labels,
                     value=duration_seconds,
+                )
+            )
+
+        # Change-point detectors (BOCPD, CUSUM, ...) flag their fires via
+        # the optional ``change_point`` column in the score row. Other
+        # detectors omit the column entirely so they don't pollute
+        # ``anomaly_change_point_total`` with always-zero counters.
+        if defaults.emit_change_points and "change_point" in score_row.index:
+            fired = bool(score_row["change_point"])
+            cp_count = self._store.record_change_point(
+                group=group.name,
+                query_id=query.id,
+                series_key=series.label_key,
+                detector_name=plan.name,
+                detector_instance=plan.instance,
+                fired=fired,
+            )
+            samples.append(
+                Sample(
+                    metric="anomaly_change_point_total",
+                    labels=labels,
+                    value=float(cp_count),
                 )
             )
 
@@ -809,6 +844,7 @@ class Runner:
         threshold_score: float,
         min_abs: float,
         min_rel: float,
+        detector_says_outside: bool = False,
     ) -> bool:
         """Combine the statistical threshold with the practical floors.
 
@@ -816,8 +852,13 @@ class Runner:
         dashboards still see the statistical signal even when the floor
         suppresses the firing. Both floors must be satisfied when set:
         either floor at zero is treated as "no opinion".
+
+        ``detector_says_outside`` lets a detector that knows its own
+        threshold semantics (e.g. BOCPD's probability score) override the
+        statistical-score check while still passing through the practical
+        floors.
         """
-        statistical_outside = score >= threshold_score
+        statistical_outside = detector_says_outside or score >= threshold_score
         delta = abs(latest_y - baseline)
         # Zero baseline (sparse counters that haven't fired yet,
         # zero-clamped gauges) makes "fraction of baseline" undefined.
@@ -964,6 +1005,13 @@ class Runner:
             # important when a stratified detector widened the fetch
             # for the rest of the group.
             sliced = self._slice_for_detector(plan, series.samples, defaults)
+            # Calibration must use the same threshold the runner would
+            # use when scoring this detector live — otherwise BOCPD
+            # (probability score) gets compared against the group's
+            # sigma-multiplier threshold (typically 3.0) and its F1
+            # collapses to 0. Honour the same per-detector ``threshold``
+            # override the live-scoring path reads.
+            cal_threshold = _effective_threshold(plan, threshold_score)
             try:
                 # Match the kwarg-forwarding instantiation path used by
                 # ``_run_detector`` — without this, detectors that consume
@@ -975,7 +1023,7 @@ class Runner:
                     samples=sliced,
                     detector_factory=factory,
                     params=plan.params,
-                    threshold=threshold_score,
+                    threshold=cal_threshold,
                     expected_samples=expected,
                     now=now,
                 )
@@ -1049,6 +1097,28 @@ class Runner:
             self._ops.detect_duration_seconds.labels(
                 group=result.group, detector=detector_name
             ).set(elapsed)
+
+
+def _effective_threshold(plan: _DetectorPlan, fallback: float) -> float:
+    """Resolve the alerting threshold for a detector plan.
+
+    A detector that handles its own threshold semantics (BOCPD's
+    probability score, future change-point detectors with non-sigma
+    scoring) declares a ``threshold`` value in its ``defaults`` /
+    ``param_spec``; the value flows through ``plan.params`` and the
+    runner uses it instead of the group-level
+    ``alert_thresholds.score``. Both the live-scoring path and the
+    calibration cycle resolve through this helper so they agree on the
+    cutoff — diverging here is the bug that makes BOCPD's auto-select
+    F1 collapse to zero.
+    """
+    raw = plan.params.get("threshold")
+    if raw is None:
+        return fallback
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _invoke_detector(

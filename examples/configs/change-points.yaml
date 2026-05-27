@@ -1,0 +1,67 @@
+# Change-point detection example.
+#
+# Pairs BOCPD (probabilistic) with CUSUM (classical) on the same signals
+# so operators can compose alerts on either or both. Layered with MAD for
+# ordinary outlier detection — the two classes are complementary, not
+# overlapping (see docs/change-points.md).
+
+apiVersion: promanomaly.io/v1alpha1
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 10s
+
+server:
+  listen: ":9092"
+  refresh_interval: 1m
+
+safety:
+  max_series_per_query: 500
+  max_total_series: 5000
+  on_source_failure: serve_stale
+
+defaults:
+  window: 1h
+  step: 15s
+  min_points: 60
+  warmup_policy: emit_warming_up
+  emit_baseline: true
+  emit_change_points: true
+  emit_duration: true
+  alert_thresholds:
+    score: 3.0
+
+groups:
+  - name: error_rates
+    priority: 10
+    queries:
+      - id: error_rate
+        promql: sum by (service) (rate(http_requests_total{status=~"5.."}[5m]))
+        detectors:
+          # Ordinary outlier detection — fires on individual high-error
+          # samples regardless of regime.
+          - name: MAD
+          # Change-point detection — fires when the baseline shifts
+          # (deploy regression, autoscaler step, feature-flag flip).
+          - name: BOCPD
+            params:
+              hazard: 250      # default; tune toward smaller for shorter expected runs
+              threshold: 0.5   # posterior >= 0.5 fires
+              lag: 15
+          - name: CUSUM
+            params:
+              k: 0.5           # default
+              h: 5.0           # default — 5 sigma decision threshold
+
+  - name: traffic_step_changes
+    priority: 5
+    queries:
+      - id: request_rate
+        promql: sum by (service) (rate(http_requests_total[5m]))
+        detectors:
+          - name: CUSUM
+            params:
+              # Step-change-prone capacity metrics tolerate a tighter h
+              # because the underlying signal is high-volume and noise is
+              # narrow relative to a regime shift.
+              h: 4.0

@@ -23,6 +23,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Offline change-point analysis via the ``promanomaly analyze`` CLI.
+# Kept as an optional extra because ruptures pulls in scipy and a C
+# extension; the detector service itself doesn't need either. Install
+# with ``pip install promanomaly[analyze]`` to enable the CLI.
+analyze = [
+    "ruptures>=1.1.9",
+]
 dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
@@ -31,6 +38,7 @@ dev = [
     "mypy>=1.13.0",
     "types-PyYAML",
     "pandas-stubs",
+    "ruptures>=1.1.9",
 ]
 
 [project.scripts]
@@ -42,6 +50,8 @@ Hampel = "promanomaly.detectors.hampel:Hampel"
 ZScoreEWMA = "promanomaly.detectors.zscore_ewma:ZScoreEWMA"
 IQR = "promanomaly.detectors.iqr:IQR"
 HourOfDayMAD = "promanomaly.detectors.hour_of_day_mad:HourOfDayMAD"
+BOCPD = "promanomaly.detectors.bocpd:BOCPD"
+CUSUM = "promanomaly.detectors.cusum:CUSUM"
 
 [build-system]
 requires = ["hatchling"]
@@ -77,6 +87,7 @@ module = [
     "apscheduler.*",
     "prometheus_client.*",
     "uvicorn.*",
+    "ruptures.*",
 ]
 ignore_missing_imports = true
 

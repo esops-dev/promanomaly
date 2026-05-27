@@ -67,3 +67,15 @@ groups:
           - name: ZScoreEWMA
             params:
               alpha: 0.1
+
+      - id: node_cpu_user_rate
+        # Change-point coverage on a related signal: BOCPD + CUSUM exercise
+        # the v0.3 wiring (anomaly_change_point_total counter, per-detector
+        # threshold override, change-point dashboard). The group-level
+        # auto_select still runs here — BOCPD's own threshold parameter
+        # makes its calibration F1 comparable to CUSUM's sigma-multiplier
+        # F1, so the winner is meaningful rather than always-CUSUM.
+        promql: 'avg by (instance) (rate(node_cpu_seconds_total{mode="user"}[1m]))'
+        detectors:
+          - name: BOCPD
+          - name: CUSUM
