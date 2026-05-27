@@ -1,15 +1,51 @@
 # yamllint rules consumed by `chart-testing` (`ct lint`) and mirrored
-# by the local `make chart-lint` target. These match the chart-testing
-# defaults so what passes locally also passes in CI:
-#   * document-start and line-length are disabled — Kubernetes manifests
-#     and chart values commonly omit `---` and run wide.
-#   * truthy is disabled — Helm template output frequently includes
-#     truthy-looking strings in unrelated contexts.
-# Everything else stays at the yamllint default, including the
-# two-space-before-inline-comment rule that `ct lint` enforces on
-# every chart values file.
+# by the local `make chart-lint` target.
+#
+# Kept byte-aligned with the lintconf bundled inside `chart-testing` so
+# that local `yamllint -c .chart-testing-lintconf.yaml ...` produces the
+# same verdict as CI's `ct lint`. Drifting here is the bug where a chart
+# passes locally but fails in CI — which is exactly what happened on the
+# v0.3 PR. If you change a rule below, run the matching `ct lint`
+# locally first.
 ---
 rules:
-  document-start: disable
-  line-length: disable
-  truthy: disable
+  braces:
+    min-spaces-inside: 0
+    max-spaces-inside: 0
+    min-spaces-inside-empty: -1
+    max-spaces-inside-empty: -1
+  brackets:
+    min-spaces-inside: 0
+    max-spaces-inside: 0
+    min-spaces-inside-empty: -1
+    max-spaces-inside-empty: -1
+  colons:
+    max-spaces-before: 0
+    max-spaces-after: 1
+  commas:
+    max-spaces-before: 0
+    min-spaces-after: 1
+    max-spaces-after: 1
+  comments:
+    require-starting-space: true
+    min-spaces-from-content: 2
+  document-end: disable
+  document-start: disable           # No --- to start a file
+  empty-lines:
+    max: 2
+    max-start: 0
+    max-end: 0
+  hyphens:
+    max-spaces-after: 1
+  indentation:
+    spaces: consistent
+    indent-sequences: whatever      # - list indentation handles both forms
+    check-multi-line-strings: false
+  key-duplicates: enable
+  line-length: disable              # Lines can be any length
+  new-line-at-end-of-file: enable
+  new-lines:
+    type: unix
+  trailing-spaces: enable
+  truthy:
+    level: warning
