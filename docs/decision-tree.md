@@ -45,7 +45,16 @@ Want a non-parametric detector with different sensitivity from MAD?
 └── Yes → IQR (pairs well with MAD inside an `ensemble:`)
 
 Strong daily/hourly pattern (request rate, batch counters)?
-└── Yes → HourOfDayMAD
+├── Yes, weekday + weekend look the same → HourOfDayMAD
+└── Yes, weekday + weekend differ materially → DayOfWeekMAD
+
+Not sure whether daily or weekly structure dominates?
+└── Run `promanomaly calibrate-buckets --query ... --from -14d` and let the
+    autocorrelation suggest the right detector + bucket width.
+
+Note: both stratified detectors bucket in UTC. If your team thinks in a
+non-UTC timezone, bucket boundaries won't align with local "midnight" or
+local "Monday morning" — see `docs/detectors.md` for the caveat.
 
 Breaks on deploys or rolling restarts?
 └── Yes → BOCPD (probabilistic) or CUSUM (sigma-multiplier). See `change-points.md`.

@@ -40,8 +40,24 @@ def _diurnal_history(
 def test_metadata() -> None:
     detector = HourOfDayMAD()
     assert detector.name == "HourOfDayMAD"
-    assert detector.defaults == {"lookback": "7d", "bucket_width": "1h"}
+    # v0.5 added the sliding-window opt-in alongside the existing lookback /
+    # bucket_width knobs — same shape DayOfWeekMAD ships with.
+    assert detector.defaults == {
+        "lookback": "7d",
+        "bucket_width": "1h",
+        "baseline_refresh_interval": "1h",
+    }
     assert "bucket" in detector.description.lower()
+
+
+def test_baseline_refresh_interval_opt_in() -> None:
+    # The runner's sliding-window strategy keys off this classmethod;
+    # HourOfDayMAD opts in with a 1h default so the 7d lookback doesn't
+    # re-fetch on every refresh.
+    assert HourOfDayMAD.baseline_refresh_interval_seconds({}) == pytest.approx(3600.0)
+    assert HourOfDayMAD.baseline_refresh_interval_seconds(
+        {"baseline_refresh_interval": "30m"}
+    ) == pytest.approx(1800.0)
 
 
 def test_query_window_seconds_honours_lookback() -> None:

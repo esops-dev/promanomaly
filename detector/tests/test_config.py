@@ -38,6 +38,10 @@ def test_parse_duration_supports_human_units() -> None:
     assert parse_duration("1.5h") == 5400.0
     assert parse_duration("250ms") == 0.25
     assert parse_duration(60) == 60.0
+    # ``w`` (weeks) added in v0.5 so stratified detectors with multi-week
+    # lookbacks (DayOfWeekMAD's ``lookback: 4w``) read naturally.
+    assert parse_duration("4w") == 4 * 7 * 86400.0
+    assert parse_duration("1w") == 7 * 86400.0
 
 
 def test_minimum_config_validates() -> None:

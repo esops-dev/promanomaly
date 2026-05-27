@@ -51,6 +51,12 @@ class HourOfDayMAD:
         Width of each bucket. ``1h`` gives 24 buckets across a day;
         smaller values give finer stratification at the cost of more
         per-bucket sample sparsity.
+    ``baseline_refresh_interval`` (duration, default ``1h``)
+        Cadence at which the long baseline window is re-pulled from the
+        TSDB. The latest sample is still fetched every
+        ``server.refresh_interval`` via a short range query; only the
+        long baseline obeys this slower cadence. Opts the detector into
+        the runner's sliding-window fetch strategy.
 
     Threshold sensitivity is set via ``alert_thresholds.score``.
     """
@@ -61,7 +67,11 @@ class HourOfDayMAD:
         "and scores the latest sample against prior samples from the same "
         "bucket. Catches diurnal anomalies a fixed-window MAD smears away."
     )
-    defaults: ClassVar[dict[str, Any]] = {"lookback": "7d", "bucket_width": "1h"}
+    defaults: ClassVar[dict[str, Any]] = {
+        "lookback": "7d",
+        "bucket_width": "1h",
+        "baseline_refresh_interval": "1h",
+    }
     param_spec: ClassVar[tuple[ParamSpec, ...]] = (
         ParamSpec(
             name="lookback",
@@ -74,6 +84,15 @@ class HourOfDayMAD:
             type_="duration",
             default="1h",
             doc="Width of each hour-of-day bucket; must divide 24h evenly.",
+        ),
+        ParamSpec(
+            name="baseline_refresh_interval",
+            type_="duration",
+            default="1h",
+            doc=(
+                "Cadence at which the long baseline is re-pulled from the "
+                "TSDB; the latest sample is still fetched every refresh."
+            ),
         ),
     )
 
@@ -90,6 +109,23 @@ class HourOfDayMAD:
         lookback = params.get("lookback", cls.defaults["lookback"])
         try:
             return float(parse_duration(lookback))
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def baseline_refresh_interval_seconds(cls, params: dict[str, Any]) -> float | None:
+        """Cadence at which the cached baseline fetch may be reused.
+
+        Returning a value here opts the detector into the runner's
+        sliding-window fetch strategy: the heavy long-history query
+        runs once per ``baseline_refresh_interval``, and every refresh
+        still pulls the latest short window and stitches it onto the
+        cached baseline before scoring. Mirrors the DayOfWeekMAD
+        contract so both stratified detectors benefit equally.
+        """
+        raw = params.get("baseline_refresh_interval", cls.defaults["baseline_refresh_interval"])
+        try:
+            return float(parse_duration(raw))
         except (TypeError, ValueError):
             return None
 
@@ -125,11 +161,15 @@ class HourOfDayMAD:
 
         # Build the same-bucket mask. Exclude the latest sample from
         # the bucket so we score it against its history, not itself.
-        buckets = np.array(
-            [_bucket_for_timestamp(float(ts), bucket_seconds) for ts in timestamps[:-1]],
-            dtype=int,
-        )
-        same_bucket_values = values[:-1][buckets == latest_bucket]
+        # Vectorised: a 7d * 15s-step series is ~40k samples and the
+        # equivalent Python loop dominated detector compute time
+        # before vectorisation. The integer division mirrors
+        # ``_bucket_for_timestamp`` element-for-element — pinned by
+        # ``tests/test_stratified_bucket_vectorisation.py``.
+        history_ts = timestamps[:-1]
+        history_values = values[:-1]
+        history_buckets = (history_ts % 86400.0 // bucket_seconds).astype(np.int64)
+        same_bucket_values = history_values[history_buckets == latest_bucket]
 
         if same_bucket_values.size == 0:
             # Sparse-bucket fallback: not enough history for this bucket

@@ -36,6 +36,7 @@ from .logging import configure_logging
 from .runner import Runner, _build_detector
 from .source import PromQLSource, QuerySeries, SourceQueryError
 from .state import SnapshotStore
+from .stratified import query_window_seconds_for, stratified_cost_summary
 
 
 @click.group(invoke_without_command=True, context_settings={"help_option_names": ["-h", "--help"]})
@@ -194,6 +195,25 @@ async def _run_probe(
                     # execute each rendered variant. Reports the
                     # projected total series so operators see at
                     # PR-time what would land in production.
+                    # Stratified detectors layered on top of discover:
+                    # blocks need the same TSDB-cost projection that
+                    # non-discover queries get — without this, the
+                    # most expensive combination (stratified x
+                    # discovery-fan-out) is the one with no PR-time
+                    # cost signal.
+                    stratified_for_template = _stratified_summary_for_query(query, cfg)
+                    if stratified_for_template is not None:
+                        click.echo(
+                            json.dumps(
+                                {
+                                    "group": group.name,
+                                    "query": query.id,
+                                    "status": "stratified_template",
+                                    "stratified": stratified_for_template,
+                                },
+                                sort_keys=True,
+                            )
+                        )
                     discovered_count = await _probe_discover_query(
                         source=source,
                         group_name=group.name,
@@ -204,6 +224,7 @@ async def _run_probe(
                         step=step,
                         max_series=cfg.safety.max_series_per_query,
                         counters=lambda kind: None,
+                        stratified=stratified_for_template,
                     )
                     if discovered_count.errored:
                         errored += discovered_count.errored
@@ -217,6 +238,9 @@ async def _run_probe(
                     "query": query.id,
                     "promql": query.promql,
                 }
+                stratified = _stratified_summary_for_query(query, cfg)
+                if stratified is not None:
+                    entry["stratified"] = stratified
                 try:
                     result = await source.range_query(
                         promql=query.promql,
@@ -275,6 +299,20 @@ async def _run_probe(
     return 0
 
 
+def _stratified_summary_for_query(query: Any, cfg: Config) -> dict[str, Any] | None:
+    """Thin wrapper around :func:`stratified_cost_summary` for the CLI.
+
+    Bridges the CLI's ``cfg`` object to the shared helper's
+    ``refresh_interval_seconds`` argument so the cli and runner never
+    drift on what counts as a stratified detector.
+    """
+    return stratified_cost_summary(
+        query=query,
+        resolve_cls=get_detector,
+        refresh_interval_seconds=cfg.server.refresh_interval_seconds,
+    )
+
+
 @dataclass
 class _DiscoverProbeResult:
     """Accumulator returned by ``_probe_discover_query``."""
@@ -296,8 +334,15 @@ async def _probe_discover_query(
     step: float,
     max_series: int,
     counters: Any,
+    stratified: dict[str, Any] | None = None,
 ) -> _DiscoverProbeResult:
-    """Resolve discovery probes, expand, execute, and emit JSON lines."""
+    """Resolve discovery probes, expand, execute, and emit JSON lines.
+
+    When ``stratified`` is supplied (the template has at least one
+    detector opted into the sliding-window strategy), each rendered
+    variant carries the same stratified-cost projection — operators see
+    the per-rendered-id TSDB cost as well as the template-level total.
+    """
     del counters
     result = _DiscoverProbeResult()
     value_sets: dict[str, list[str]] = {}
@@ -370,6 +415,8 @@ async def _probe_discover_query(
             "promql": variant.rendered_promql,
             "discovered_labels": variant.labels,
         }
+        if stratified is not None:
+            entry["stratified"] = stratified
         try:
             qresult = await source.range_query(
                 promql=variant.rendered_promql,
@@ -449,9 +496,14 @@ def dry_run(config_path: str) -> None:
 )
 @click.option(
     "--window",
-    default="1h",
+    default="auto",
     show_default=True,
-    help="Rolling window of recent data to pull (e.g. 1h, 30m).",
+    help=(
+        "Rolling window of recent data to pull (e.g. 1h, 30m). 'auto' "
+        "uses the detector's preferred lookback when it exposes one "
+        "(stratified detectors), else falls back to '1h'. Pass an "
+        "explicit duration to override."
+    ),
 )
 @click.option(
     "--step",
@@ -496,6 +548,19 @@ def detect_once(
         key, value = raw.split("=", 1)
         parsed_params[key.strip()] = _coerce_param(value.strip())
 
+    # ``--window auto`` honours the detector's preferred lookback when
+    # one is declared (stratified detectors). Without this, an operator
+    # running ``detect-once --detector DayOfWeekMAD`` would get a 1h
+    # fetch and the bucket-median baseline would collapse — same
+    # operator footgun the runner's _fetch_and_plan widening exists to
+    # avoid. An explicit ``--window`` always wins so power users can
+    # still override.
+    if window.strip().lower() == "auto":
+        detector_window = query_window_seconds_for(cls, parsed_params)
+        window_seconds = detector_window if detector_window is not None else 3600.0
+    else:
+        window_seconds = parse_duration(window)
+
     async def _run() -> int:
         source = PromQLSource(datasource_url, parse_duration(timeout))
         try:
@@ -503,7 +568,7 @@ def detect_once(
             result = await source.range_query(
                 promql=promql,
                 end=time.time(),
-                window_seconds=parse_duration(window),
+                window_seconds=window_seconds,
                 step_seconds=parse_duration(step),
             )
         finally:
@@ -807,6 +872,362 @@ def _print_analyze_text(findings: list[dict[str, Any]]) -> None:
     for row in findings:
         labels = ",".join(f"{k}={v}" for k, v in sorted(row["labels"].items())) or "-"
         click.echo(f"{row['iso8601']:30}  {row['score']:8.2f}  {labels}")
+
+
+@cli.command(name="calibrate-buckets")
+@click.option("--query", "promql", required=True, help="PromQL query to analyse.")
+@click.option(
+    "--from",
+    "from_",
+    required=True,
+    help=(
+        "Range start. RFC3339 (e.g. 2024-01-15T00:00:00Z), unix seconds, "
+        "or a relative '-14d' / '-3h' offset from --to."
+    ),
+)
+@click.option(
+    "--to",
+    "to_",
+    default="now",
+    show_default=True,
+    help="Range end. RFC3339, unix seconds, or 'now' (default).",
+)
+@click.option(
+    "--datasource-url",
+    default="http://localhost:8428/",
+    show_default=True,
+    help="PromQL-compatible datasource URL.",
+)
+@click.option(
+    "--step",
+    default="5m",
+    show_default=True,
+    help=(
+        "Sample step for the range query. The autocorrelation analysis "
+        "is performed at this resolution; a 5m step over a 14d window "
+        "keeps the calculation cheap while still resolving sub-hour "
+        "structure."
+    ),
+)
+@click.option(
+    "--output",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    show_default=True,
+    help=(
+        "Output format. 'text' prints the recommended detector + a "
+        "ready-to-paste YAML snippet; 'json' is the raw analysis."
+    ),
+)
+@click.option(
+    "--timeout",
+    default="30s",
+    show_default=True,
+    help="Datasource HTTP timeout.",
+)
+def calibrate_buckets(
+    promql: str,
+    from_: str,
+    to_: str,
+    datasource_url: str,
+    step: str,
+    output: str,
+    timeout: str,
+) -> None:
+    """Suggest the right stratified-baseline bucketing for a signal.
+
+    Pulls the historical range, runs an autocorrelation analysis at the
+    requested step, and reports the dominant periodicity. Maps the
+    finding onto one of the stratified detector configurations
+    (HourOfDayMAD when daily structure dominates, DayOfWeekMAD when a
+    weekly pattern is layered on top) and prints a ready-to-paste YAML
+    snippet so the operator can drop it straight into their config.
+    """
+    try:
+        to_seconds = _parse_analyze_timestamp(to_, now=time.time())
+        from_seconds = _parse_analyze_timestamp(from_, now=to_seconds)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    if from_seconds >= to_seconds:
+        raise click.UsageError("--from must be before --to")
+
+    step_seconds = parse_duration(step)
+    window_seconds = to_seconds - from_seconds
+
+    async def _fetch() -> list[QuerySeries]:
+        source = PromQLSource(datasource_url, parse_duration(timeout))
+        try:
+            await source.start()
+            result = await source.range_query(
+                promql=promql,
+                end=to_seconds,
+                window_seconds=window_seconds,
+                step_seconds=step_seconds,
+            )
+        finally:
+            await source.close()
+        return list(result.series)
+
+    try:
+        series_list = asyncio.run(_fetch())
+    except SourceQueryError as exc:
+        click.echo(f"query failed: {exc}", err=True)
+        sys.exit(2)
+
+    if not series_list:
+        click.echo("no series returned", err=True)
+        sys.exit(1)
+
+    analysis = _analyse_bucket_structure(
+        series_list=series_list,
+        step_seconds=step_seconds,
+        window_seconds=window_seconds,
+    )
+
+    if output == "json":
+        click.echo(json.dumps(analysis, indent=2, sort_keys=True))
+        return
+    _print_calibrate_text(analysis)
+
+
+def _analyse_bucket_structure(
+    *,
+    series_list: list[QuerySeries],
+    step_seconds: float,
+    window_seconds: float,
+) -> dict[str, Any]:
+    """Autocorrelation analysis: identify dominant periods + recommend a detector.
+
+    Aggregates across every returned series — operators typically point
+    this at a single PromQL that already filters to the metric they care
+    about, but if the result has multiple series we want the cohort-wide
+    pattern. The detector recommendation only fires when the dominant
+    period sits near a known stratified-detector lag (24h, 7d). Anything
+    else returns ``None`` for the recommendation so we don't pretend a
+    random ACF peak is a real periodicity.
+    """
+    import numpy as np
+
+    # Stack series into a 2D array padded with NaNs, then take the
+    # nan-mean per timestamp so series that don't share every sample
+    # don't break the calculation.
+    columns: list[np.ndarray] = []
+    for series in series_list:
+        values = series.samples["y"].to_numpy(dtype=float, copy=False)
+        if values.size:
+            columns.append(values)
+    if not columns:
+        return {"status": "empty", "recommended_detector": None}
+    max_len = max(c.size for c in columns)
+    stacked = np.full((len(columns), max_len), np.nan, dtype=float)
+    for idx, col in enumerate(columns):
+        stacked[idx, : col.size] = col
+    aggregated = np.nanmean(stacked, axis=0)
+    aggregated = aggregated[~np.isnan(aggregated)]
+    if aggregated.size < 8:
+        return {
+            "status": "too_few_samples",
+            "samples": int(aggregated.size),
+            "recommended_detector": None,
+        }
+
+    centred = aggregated - float(np.mean(aggregated))
+    variance = float(np.dot(centred, centred))
+    # Float noise on a strictly-constant input still produces a tiny
+    # positive variance; treat anything below numerical noise as
+    # constant so the recommendation surface doesn't claim periodicity
+    # on a flat signal.
+    if variance <= 1e-9:
+        return {
+            "status": "constant_signal",
+            "samples": int(aggregated.size),
+            "recommended_detector": None,
+        }
+    # Cap the lag scan to half the sample count — beyond that the ACF
+    # estimator gets noisy as the overlap shrinks. We also stop short
+    # of one week if the window doesn't cover it.
+    max_lag = min(aggregated.size // 2, int(8 * 86400.0 / step_seconds))
+    acf = np.zeros(max_lag, dtype=float)
+    for lag in range(1, max_lag):
+        acf[lag] = float(np.dot(centred[lag:], centred[:-lag])) / variance
+
+    # Find local maxima in the ACF — those are candidate periods. Skip
+    # the very-short-lag noise (< step minutes) which is autocorrelation
+    # from smoothing, not real periodicity.
+    candidates: list[tuple[int, float]] = []
+    min_lag = max(2, int(900.0 / step_seconds))  # at least 15 minutes
+    for lag in range(min_lag, max_lag - 1):
+        if acf[lag] > acf[lag - 1] and acf[lag] > acf[lag + 1] and acf[lag] > 0.1:
+            candidates.append((lag, acf[lag]))
+    candidates.sort(key=lambda r: r[1], reverse=True)
+    top_candidates = candidates[:5]
+
+    dominant_period_seconds: float | None = None
+    dominant_strength = 0.0
+    if top_candidates:
+        dominant_period_seconds = top_candidates[0][0] * step_seconds
+        dominant_strength = top_candidates[0][1]
+
+    recommendation = _recommend_detector(
+        dominant_period_seconds=dominant_period_seconds,
+        candidates=[(lag * step_seconds, score) for lag, score in top_candidates],
+        window_seconds=window_seconds,
+    )
+
+    return {
+        "status": "ok",
+        "samples": int(aggregated.size),
+        "step_seconds": float(step_seconds),
+        "window_seconds": float(window_seconds),
+        "dominant_period_seconds": dominant_period_seconds,
+        "dominant_strength": dominant_strength,
+        "top_candidates": [
+            {
+                "period_seconds": lag * step_seconds,
+                "period_label": _humanise_seconds(lag * step_seconds),
+                "strength": float(score),
+            }
+            for lag, score in top_candidates
+        ],
+        "recommended_detector": recommendation,
+    }
+
+
+_DAY = 86400.0
+_WEEK = 7 * _DAY
+_HOUR = 3600.0
+
+
+def _recommend_detector(
+    *,
+    dominant_period_seconds: float | None,
+    candidates: list[tuple[float, float]],
+    window_seconds: float,
+) -> dict[str, Any] | None:
+    """Map the dominant ACF period onto a stratified detector config."""
+    if dominant_period_seconds is None:
+        return None
+    weekly_present = any(_close_to(period, _WEEK, tol=0.1) for period, _ in candidates)
+    daily_present = any(_close_to(period, _DAY, tol=0.1) for period, _ in candidates)
+    has_weekly_window = window_seconds >= 2 * _WEEK
+
+    if weekly_present and has_weekly_window:
+        return {
+            "name": "DayOfWeekMAD",
+            "reason": (
+                "Weekly periodicity detected; (day-of-week, hour) "
+                "stratification matches the signal shape."
+            ),
+            "params": {"lookback": "4w", "bucket_width": "1h"},
+            "config_snippet": (
+                "detectors:\n"
+                "  - name: DayOfWeekMAD\n"
+                "    params:\n"
+                "      lookback: 4w\n"
+                "      bucket_width: 1h\n"
+            ),
+        }
+    if daily_present:
+        return {
+            "name": "HourOfDayMAD",
+            "reason": (
+                "Daily periodicity detected; hour-of-day stratification "
+                "captures the dominant structure."
+            ),
+            "params": {"lookback": "7d", "bucket_width": "1h"},
+            "config_snippet": (
+                "detectors:\n"
+                "  - name: HourOfDayMAD\n"
+                "    params:\n"
+                "      lookback: 7d\n"
+                "      bucket_width: 1h\n"
+            ),
+        }
+    # Sub-hour periodicity → fine-grained bucket width with the
+    # short-lookback hour-of-day detector; user gets a starting point
+    # even when the signal doesn't fit the canonical 24h/7d shapes.
+    if dominant_period_seconds < _HOUR and dominant_period_seconds > 0:
+        bucket = _round_to_dividing_bucket(dominant_period_seconds)
+        return {
+            "name": "HourOfDayMAD",
+            "reason": (
+                f"Sub-hour periodicity detected ({_humanise_seconds(dominant_period_seconds)}); "
+                "narrow the bucket_width to match."
+            ),
+            "params": {"lookback": "7d", "bucket_width": bucket},
+            "config_snippet": (
+                "detectors:\n"
+                "  - name: HourOfDayMAD\n"
+                "    params:\n"
+                "      lookback: 7d\n"
+                f"      bucket_width: {bucket}\n"
+            ),
+        }
+    return None
+
+
+def _close_to(value: float, target: float, *, tol: float) -> bool:
+    """True when ``value`` is within ``tol`` (relative) of ``target``."""
+    if target == 0.0:
+        return value == 0.0
+    return abs(value - target) / target <= tol
+
+
+def _round_to_dividing_bucket(period_seconds: float) -> str:
+    """Pick a bucket_width that divides 24h and is close to ``period_seconds``."""
+    # Sorted ascending so we always pick the narrower bucket on a tie.
+    candidates_s = [60, 300, 600, 900, 1800, 3600]
+    best = min(candidates_s, key=lambda c: abs(c - period_seconds))
+    if best < 3600 and best % 60 == 0:
+        minutes = best // 60
+        return f"{minutes}m"
+    return "1h"
+
+
+def _humanise_seconds(seconds: float) -> str:
+    if seconds >= _WEEK:
+        return f"{seconds / _WEEK:.1f}w"
+    if seconds >= _DAY:
+        return f"{seconds / _DAY:.1f}d"
+    if seconds >= _HOUR:
+        return f"{seconds / _HOUR:.1f}h"
+    if seconds >= 60.0:
+        return f"{seconds / 60.0:.1f}m"
+    return f"{seconds:.1f}s"
+
+
+def _print_calibrate_text(analysis: dict[str, Any]) -> None:
+    status = analysis.get("status")
+    if status != "ok":
+        click.echo(f"calibration failed: {status}")
+        return
+    click.echo(f"samples analysed       : {analysis['samples']}")
+    click.echo(f"step                   : {_humanise_seconds(analysis['step_seconds'])}")
+    click.echo(f"window                 : {_humanise_seconds(analysis['window_seconds'])}")
+    dominant = analysis.get("dominant_period_seconds")
+    if dominant:
+        click.echo(
+            f"dominant period        : {_humanise_seconds(dominant)} "
+            f"(strength {analysis['dominant_strength']:.3f})"
+        )
+    candidates = analysis.get("top_candidates") or []
+    if candidates:
+        click.echo("top candidate periods  :")
+        for cand in candidates:
+            click.echo(f"  - {cand['period_label']:>8}   strength {cand['strength']:.3f}")
+    rec = analysis.get("recommended_detector")
+    if rec is None:
+        click.echo("recommended detector   : (no stratified detector clearly fits)")
+        click.echo(
+            "  Consider MAD / Hampel on the rolling window, or rerun with a longer --from window."
+        )
+        return
+    click.echo(f"recommended detector   : {rec['name']}")
+    click.echo(f"reason                 : {rec['reason']}")
+    click.echo("")
+    click.echo("Paste into your group's query:")
+    click.echo("")
+    click.echo(rec["config_snippet"].rstrip())
 
 
 @cli.command(name="inspect")

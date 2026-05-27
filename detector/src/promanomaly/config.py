@@ -44,18 +44,24 @@ def _validate_prom_name(value: str, *, field: str) -> str:
     return value
 
 
-_DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)\s*$")
+# ``w`` (weeks) is supported alongside Prometheus's ms/s/m/h/d because
+# stratified detectors with multi-week lookbacks (DayOfWeekMAD's
+# ``lookback: 4w``) are unwieldy as ``28d``. We use lowercase ``w`` only;
+# capital ``M`` (months) is deliberately omitted because month length is
+# ambiguous and would mislead operators sizing buffers.
+_DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(ms|s|m|h|d|w)\s*$")
 _DURATION_UNITS = {
     "ms": 0.001,
     "s": 1.0,
     "m": 60.0,
     "h": 3600.0,
     "d": 86400.0,
+    "w": 7 * 86400.0,
 }
 
 
 def parse_duration(value: str | int | float) -> float:
-    """Parse ``"5m"`` / ``"30s"`` / ``"1h"`` style strings to seconds.
+    """Parse ``"5m"`` / ``"30s"`` / ``"1h"`` / ``"4w"`` style strings to seconds.
 
     Plain numbers are interpreted as seconds (caller convenience for
     config files that already use floats).
@@ -64,7 +70,7 @@ def parse_duration(value: str | int | float) -> float:
         return float(value)
     match = _DURATION_RE.match(str(value))
     if not match:
-        raise ValueError(f"invalid duration {value!r}; expected e.g. '30s', '5m', '1h'")
+        raise ValueError(f"invalid duration {value!r}; expected e.g. '30s', '5m', '1h', '4w'")
     return float(match.group(1)) * _DURATION_UNITS[match.group(2)]
 
 

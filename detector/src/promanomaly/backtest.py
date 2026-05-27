@@ -45,6 +45,7 @@ from .config import Config, QueryConfig, load_config, parse_duration
 from .detectors import UnknownDetectorError, get
 from .runner import _build_detector
 from .source import PromQLSource, QuerySeries, SourceQueryError
+from .stratified import query_window_seconds_for
 
 # ---------------------------------------------------------------------------
 # Result dataclasses
@@ -256,12 +257,22 @@ def _build_injected_window(window: pd.DataFrame, pattern: str) -> pd.DataFrame:
 # windows by N detectors by 4 = bounded for "make backtest" use.
 _DEFAULT_MAX_WINDOWS: int = 200
 
+# Inject-mode multiplier for stratified detectors. Smaller than the
+# 4x non-stratified default because the per-window size is already
+# weeks rather than hours — a 4x multiplier on a 4w DayOfWeekMAD
+# lookback asks the TSDB for 16w of data, beyond typical retention.
+# 2x still gives two distinct latest-sample positions for the
+# sliding-window evaluation while staying within reach of 8w
+# retention. See docs/scaling-stratified.md for the rationale.
+_STRATIFIED_INJECT_MULTIPLIER: float = 2.0
+
 
 def _evaluate_series(
     *,
     series: QuerySeries,
     plans: list[dict[str, Any]],
-    window_samples: int,
+    default_window_samples: int,
+    step_seconds: float,
     inject: bool,
     metrics_by_key: dict[tuple[str, str | None], DetectorMetrics],
     max_windows: int,
@@ -273,18 +284,25 @@ def _evaluate_series(
     probability cutoff are honoured uniformly with the live runner. A
     single shared ``threshold`` arg here would collapse them onto the
     group-level alert score and break BOCPD's F1.
+
+    Per-plan sub-window sizing: stratified detectors expose
+    ``query_window_seconds`` and need a much wider sub-window than the
+    group default (4w vs 1h). Iterating per-plan rather than per-window
+    means a mixed-detector query (e.g. MAD + DayOfWeekMAD) can score
+    each detector on the slice it actually expects to see.
     """
-    stride = max(1, window_samples // 4)
-    windows = _sliding_windows(series.samples, window_samples, stride)
-    if len(windows) > max_windows:
-        windows = windows[:max_windows]
-    for window in windows:
-        for plan in plans:
-            key = (plan["name"], plan["instance"])
-            metrics = metrics_by_key.setdefault(
-                key, DetectorMetrics(detector=plan["name"], instance=plan["instance"])
-            )
-            threshold = plan["_threshold"]
+    for plan in plans:
+        plan_window_samples = _plan_window_samples(plan, default_window_samples, step_seconds)
+        stride = max(1, plan_window_samples // 4)
+        windows = _sliding_windows(series.samples, plan_window_samples, stride)
+        if len(windows) > max_windows:
+            windows = windows[:max_windows]
+        key = (plan["name"], plan["instance"])
+        metrics = metrics_by_key.setdefault(
+            key, DetectorMetrics(detector=plan["name"], instance=plan["instance"])
+        )
+        threshold = plan["_threshold"]
+        for window in windows:
             real_fire = _detector_fires(plan["cls"], plan["params"], window, threshold)
             metrics.real_windows += 1
             if real_fire:
@@ -312,6 +330,23 @@ def _evaluate_series(
                 else:
                     metrics.false_negative += 1
                     bucket["false_negative"] += 1
+
+
+def _plan_window_samples(
+    plan: dict[str, Any], default_window_samples: int, step_seconds: float
+) -> int:
+    """Sub-window size in samples for one plan.
+
+    Stratified plans (``query_window_seconds`` exposed) get a per-plan
+    window matching their detector's expected lookback; everyone else
+    falls back to the group default. Mirrors the runner's slicing logic
+    so backtest verdicts agree with live verdicts for the same
+    (detector, params) on the same data.
+    """
+    override = query_window_seconds_for(plan["cls"], plan["params"])
+    if override is None:
+        return default_window_samples
+    return max(1, int(override / max(1.0, step_seconds)))
 
 
 async def run_backtest(
@@ -384,11 +419,39 @@ async def run_backtest(
         # live runs agree on the cutoff.
         for plan in plans:
             plan["_threshold"] = _effective_threshold(plan["params"], threshold)
+        # Stratified detectors (DayOfWeekMAD, HourOfDayMAD) expose a
+        # longer ``query_window_seconds`` than the group default. Mirror
+        # the runner's _fetch_and_plan widening here — without this,
+        # backtest hands a 1h slice to a detector that wants 4w of data
+        # and the bucket-median baseline silently collapses. The injected
+        # sub-windows that ``_evaluate_series`` walks are sized to the
+        # detector's own widow via ``window_samples``, so the wider
+        # fetch flows down to the right place automatically.
+        fetch_window_seconds = history_seconds
+        for plan in plans:
+            override = query_window_seconds_for(plan["cls"], plan["params"])
+            if override is None:
+                continue
+            # In inject mode we want multiple distinct sub-windows to
+            # score; for non-stratified detectors that's 4x the group
+            # window (matches the bare ``history_seconds`` multiplier
+            # above). For stratified detectors the window is already
+            # *much* larger (4w default for DayOfWeekMAD), so a 4x
+            # multiplier would blow past typical TSDB retention (16w)
+            # and produce an empty fetch. Cap at 2x for stratified —
+            # still gives two distinct latest-sample positions while
+            # staying within reach of an 8w-retention TSDB. Operators
+            # who want more can pass ``--from`` to set the range
+            # explicitly.
+            multiplier = _STRATIFIED_INJECT_MULTIPLIER if inject and start is None else 1.0
+            wanted = override * multiplier
+            if wanted > fetch_window_seconds:
+                fetch_window_seconds = wanted
         try:
             qresult = await source.range_query(
                 promql=query.promql,
                 end=end_ts,
-                window_seconds=history_seconds,
+                window_seconds=fetch_window_seconds,
                 step_seconds=step_seconds,
                 max_series=config.safety.max_series_per_query,
             )
@@ -407,7 +470,8 @@ async def run_backtest(
             _evaluate_series(
                 series=series,
                 plans=plans,
-                window_samples=window_samples,
+                default_window_samples=window_samples,
+                step_seconds=step_seconds,
                 inject=inject,
                 metrics_by_key=metrics_by_key,
                 max_windows=max_windows,
