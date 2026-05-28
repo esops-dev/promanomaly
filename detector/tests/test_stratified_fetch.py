@@ -18,9 +18,10 @@ import pytest
 
 from promanomaly.config import CURRENT_API_VERSION, Config
 from promanomaly.exporter import OperationalMetrics
-from promanomaly.runner import Runner, _stitch_series
+from promanomaly.runner import Runner
 from promanomaly.source import QuerySeries
 from promanomaly.state import SnapshotStore
+from promanomaly.stratified_fetcher import _stitch_series
 from tests.conftest import StubResponse, StubSource, make_series
 
 

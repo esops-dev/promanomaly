@@ -190,7 +190,7 @@ def is_cohort_aware(cls: type[Any]) -> bool:
 
 
 def compute_cohort_baseline(
-    cohort_values: list[np.ndarray],
+    cohort_values: list[np.ndarray[Any, Any]],
 ) -> tuple[float, float] | None:
     """Compute ``(cross_member_median, cross_member_mad)`` for one cohort.
 

@@ -11,6 +11,7 @@ starts honouring them.
 from __future__ import annotations
 
 import re
+from functools import cached_property
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -74,6 +75,43 @@ def parse_duration(value: str | int | float) -> float:
     return float(match.group(1)) * _DURATION_UNITS[match.group(2)]
 
 
+def parse_timestamp(value: str, *, now: float) -> float:
+    """Parse a CLI timestamp into unix seconds.
+
+    Accepts RFC3339 (with optional ``Z`` suffix), unix seconds as a
+    plain number, ``"now"``, or a relative ``-7d`` / ``-3h`` offset
+    from ``now``. Used by ``cli analyze``, ``cli calibrate-buckets``,
+    and ``backtest`` so all three share one mental model for time
+    inputs.
+    """
+    import datetime as _dt
+
+    value = value.strip()
+    if value == "now":
+        return float(now)
+    if value.startswith("-"):
+        # Relative offset from ``now`` — the caller chooses what ``now``
+        # means (typically the already-parsed ``--to`` when resolving
+        # ``--from``).
+        return float(now) - parse_duration(value[1:])
+    # Try unix seconds first (integer or float).
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    # RFC3339; ``fromisoformat`` handles the common ``Z`` suffix natively
+    # on Python 3.11+.
+    try:
+        dt = _dt.datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid timestamp {value!r}; expected RFC3339, unix seconds, 'now', or '-7d'"
+        ) from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.UTC)
+    return dt.timestamp()
+
+
 Duration = Annotated[str, StringConstraints(strip_whitespace=True, min_length=2)]
 PromName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
@@ -116,7 +154,6 @@ class ReloadAuthConfig(_ModelBase):
 
 class ReloadConfig(_ModelBase):
     enabled: bool = True
-    watch_configmap: bool = True
     auth: ReloadAuthConfig = Field(default_factory=ReloadAuthConfig)
 
 
@@ -212,7 +249,6 @@ class HighAvailabilityConfig(_ModelBase):
     lease_name: str = "promanomaly-leader"
     lease_namespace: str = "default"
     lease_duration: Duration = "15s"
-    renew_deadline: Duration = "10s"
     retry_period: Duration = "2s"
     # Unique identity used inside the Lease. Defaults to the pod name
     # via the ``POD_NAME`` env var when unset; the leader.py module
@@ -227,10 +263,6 @@ class HighAvailabilityConfig(_ModelBase):
         return parse_duration(self.lease_duration)
 
     @property
-    def renew_deadline_seconds(self) -> float:
-        return parse_duration(self.renew_deadline)
-
-    @property
     def retry_period_seconds(self) -> float:
         return parse_duration(self.retry_period)
 
@@ -242,9 +274,7 @@ class HighAvailabilityConfig(_ModelBase):
 class SafetyConfig(_ModelBase):
     max_series_per_query: int = Field(default=1000, ge=1)
     max_total_series: int = Field(default=20000, ge=1)
-    series_overflow: Literal["drop_lowest_priority", "reject", "sample"] = "drop_lowest_priority"
     detect_timeout: Duration = "5s"
-    query_timeout: Duration = "10s"
     on_source_failure: Literal["serve_stale", "drop_scores", "fail_ready"] = "serve_stale"
     # Only consulted in fail_ready mode: after this many consecutive
     # source-failed runs for a group, the group's readiness flag flips
@@ -257,14 +287,16 @@ class SafetyConfig(_ModelBase):
     # ``query_cache.backend=redis`` and by the HA snapshot cache.
     redis: RedisConfig = Field(default_factory=RedisConfig)
     discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
+    # Hard cap on the runner's stratified baseline cache. Each entry
+    # holds a multi-week per-series fetch and is keyed by (group,
+    # rendered_id); without a cap, discover templates that churn
+    # ephemeral ids would grow the cache without bound. LRU eviction
+    # by ``fetched_at`` kicks in when this limit is reached.
+    max_stratified_cache_entries: int = Field(default=2000, ge=1)
 
     @property
     def detect_timeout_seconds(self) -> float:
         return parse_duration(self.detect_timeout)
-
-    @property
-    def query_timeout_seconds(self) -> float:
-        return parse_duration(self.query_timeout)
 
 
 class AlertThresholds(_ModelBase):
@@ -336,6 +368,23 @@ class ExporterLabelsConfig(_ModelBase):
                 "always emitted"
             )
         return value
+
+    @cached_property
+    def allow_set(self) -> frozenset[str]:
+        """Pre-built ``frozenset`` view of :attr:`allow` for hot-path lookups.
+
+        The label filter on the runner's per-series fan-out is called
+        several times per series per refresh; rebuilding the ``set`` on
+        each call shows up at 10k+ series. ``cached_property`` is cheap
+        on a pydantic model because the model is reconstructed on
+        reload (no stale cache).
+        """
+        return frozenset(self.allow)
+
+    @cached_property
+    def drop_set(self) -> frozenset[str]:
+        """Pre-built ``frozenset`` view of :attr:`drop`; see :attr:`allow_set`."""
+        return frozenset(self.drop)
 
 
 class ExporterConfig(_ModelBase):
@@ -620,20 +669,13 @@ class Config(_ModelBase):
             raise ValueError(f"duplicate group name: {names}")
         return groups
 
-    @model_validator(mode="after")
-    def _validate_refresh_window_ratio(self) -> Config:
+    @property
+    def aggressive_refresh(self) -> bool:
         # Operational guard: ``refresh_interval`` should be at least
         # 1/6 of the rolling ``window``. Below that the scheduler fires
         # six or more passes per window's worth of data and the rolling
-        # baseline lags behind. We do NOT reject here — the roadmap is
-        # explicit that this is a warning, not a hard fail — so users
-        # who know what they are doing (sub-second test runs, etc.) can
-        # opt in. ``aggressive_refresh`` exposes the warning for the
-        # runner to log at boot.
-        return self
-
-    @property
-    def aggressive_refresh(self) -> bool:
+        # baseline lags. The roadmap is explicit that this is a warning,
+        # not a hard fail — main.py logs at boot when this returns True.
         floor = self.defaults.window_seconds / 6.0
         return self.server.refresh_interval_seconds < floor
 
@@ -643,7 +685,47 @@ def load_config(path: str | Path) -> Config:
     raw = yaml.safe_load(Path(path).read_text())
     if not isinstance(raw, dict):
         raise ValueError(f"config {path}: top level must be a mapping")
-    return Config.model_validate(raw)
+    cfg = Config.model_validate(raw)
+    _validate_detector_params(cfg)
+    return cfg
+
+
+def _validate_detector_params(cfg: Config) -> None:
+    """Type-check user-supplied detector params against each detector's ParamSpec.
+
+    Local import: the detectors registry depends on ``config.parse_duration``,
+    so a top-level import would be circular. Done at config-load (not as a
+    pydantic validator) so the lookup runs once per load rather than once
+    per validated ``DetectorEntry`` instance.
+
+    Unknown param keys pass through — the runner merges defaults silently
+    and detectors are documented as ignoring unknown keys for forward
+    compatibility. Only declared keys are type-checked.
+    """
+    from .detectors import UnknownDetectorError
+    from .detectors.registry import get as get_detector
+
+    for group in cfg.groups:
+        for query in group.queries:
+            for entry in query.detectors:
+                try:
+                    cls = get_detector(entry.name)
+                except UnknownDetectorError:
+                    # Unknown detector is surfaced at runtime via
+                    # ``surface_misconfigurations``; not our concern here.
+                    continue
+                specs = {spec.name: spec for spec in getattr(cls, "param_spec", ()) or ()}
+                for key, value in (entry.params or {}).items():
+                    spec = specs.get(key)
+                    if spec is None:
+                        continue
+                    try:
+                        spec.validate(value)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"group {group.name!r} query {query.id!r} "
+                            f"detector {entry.name!r}: {exc}"
+                        ) from exc
 
 
 __all__ = [

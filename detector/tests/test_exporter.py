@@ -55,3 +55,71 @@ def test_render_rejects_colon_in_metric() -> None:
     samples = [Sample(metric="bad:name", labels=(), value=1.0)]
     with pytest.raises(InvalidMetricNameError):
         render_samples(samples)
+
+
+def test_exporter_caches_rendered_snapshot_bytes() -> None:
+    """The render cache keys on ``(group, snapshot.timestamp)`` so two
+    consecutive scrapes against an unchanged snapshot reuse the same
+    bytes object without re-running per-sample regex validation. A new
+    snapshot (different timestamp) busts the cache and re-renders."""
+    from promanomaly.exporter import Exporter, OperationalMetrics
+    from promanomaly.state import GroupSnapshot, SnapshotStore
+
+    store = SnapshotStore()
+    ops = OperationalMetrics()
+    exporter = Exporter(store, ops, source=None)
+
+    samples = [
+        Sample(metric="anomaly_score", labels=(("group", "g"), ("id", "a")), value=1.0),
+    ]
+    store.write(GroupSnapshot(group="g", timestamp=100.0, samples=samples))
+
+    body1, _ = exporter.render()
+    cached_bytes = exporter._snapshot_render_bytes  # type: ignore[reportPrivateUsage]
+    body2, _ = exporter.render()
+    # Second render reuses the cached bytes (no re-render, no new alloc).
+    assert exporter._snapshot_render_bytes is cached_bytes  # type: ignore[reportPrivateUsage]
+    # Operational metrics still re-render per scrape, so the full body
+    # is not guaranteed to be identical (it is, but only because nothing
+    # changed). The cache-bytes identity is the real assertion.
+    assert body1 == body2
+
+    # New snapshot at a new timestamp busts the cache and the bytes
+    # object differs.
+    store.write(GroupSnapshot(group="g", timestamp=200.0, samples=samples))
+    exporter.render()
+    assert exporter._snapshot_render_bytes is not cached_bytes  # type: ignore[reportPrivateUsage]
+
+
+def test_query_variant_delegates_attribute_reads_to_underlying_config() -> None:
+    """``_QueryVariant`` overrides ``id`` and ``promql`` for discover
+    fan-out and delegates every other field back to the original
+    ``QueryConfig``. The wrapper exists to avoid ``pydantic.model_copy``
+    on every variant — at hundreds of fan-outs per refresh that was the
+    dominant per-tick allocation cost. Test pins the contract so a
+    future schema addition cannot silently break delegation."""
+    from promanomaly.config import QueryConfig
+    from promanomaly.runner import _QueryVariant
+
+    base = QueryConfig.model_validate(
+        {
+            "id": "cpu",
+            "promql": "rate(cpu[5m])",
+            "expect": True,
+            "expect_grace_runs": 5,
+            "detectors": [{"name": "MAD"}],
+        }
+    )
+    variant = _QueryVariant(
+        base, rendered_id="cpu_node17", rendered_promql='rate(cpu{node="17"}[5m])'
+    )
+
+    # Overrides win for id/promql.
+    assert variant.id == "cpu_node17"
+    assert variant.promql == 'rate(cpu{node="17"}[5m])'
+    # Every other field reads through to the underlying QueryConfig.
+    assert variant.expect is True
+    assert variant.expect_grace_runs == 5
+    assert variant.detectors == base.detectors
+    # And nested attribute access still works (no eager unwrapping).
+    assert variant.detectors[0].name == "MAD"

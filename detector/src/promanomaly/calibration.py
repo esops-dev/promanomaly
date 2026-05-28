@@ -66,14 +66,14 @@ def _f1(precision: float, recall: float) -> float:
     return 2.0 * precision * recall / denom
 
 
-def _inject_point_spike(values: np.ndarray) -> np.ndarray:
+def _inject_point_spike(values: np.ndarray[Any, Any]) -> np.ndarray[Any, Any]:
     out = values.copy()
     spread = float(np.std(values)) or 1.0
     out[-1] = float(np.median(values)) + 10.0 * spread
     return out
 
 
-def _inject_step_change(values: np.ndarray) -> np.ndarray:
+def _inject_step_change(values: np.ndarray[Any, Any]) -> np.ndarray[Any, Any]:
     out = values.copy()
     spread = float(np.std(values)) or 1.0
     # Step lands in the last 10% of the window so the latest sample is
@@ -84,11 +84,12 @@ def _inject_step_change(values: np.ndarray) -> np.ndarray:
     return out
 
 
-def _inject_level_drift(values: np.ndarray) -> np.ndarray:
+def _inject_level_drift(values: np.ndarray[Any, Any]) -> np.ndarray[Any, Any]:
     out = values.copy()
     spread = float(np.std(values)) or 1.0
     drift = np.linspace(0.0, 4.0 * spread, num=out.size)
-    return out + drift
+    result: np.ndarray[Any, Any] = out + drift
+    return result
 
 
 INJECTION_PATTERNS: dict[str, Any] = {

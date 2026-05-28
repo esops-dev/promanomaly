@@ -34,9 +34,10 @@ from promanomaly.cli import cli
 from promanomaly.config import CURRENT_API_VERSION, Config
 from promanomaly.detectors import registry
 from promanomaly.exporter import OperationalMetrics
-from promanomaly.runner import Runner, _query_has_stratified_detector
+from promanomaly.runner import Runner
 from promanomaly.source import QuerySeries, SourceQueryError
 from promanomaly.state import SnapshotStore
+from promanomaly.stratified_fetcher import _query_has_stratified_detector
 from tests.conftest import StubResponse, StubSource, make_series
 
 
@@ -246,9 +247,12 @@ async def test_baseline_fetch_failure_with_stale_cache_logs_distinct_event(
         def __getattr__(self, _name: str) -> Any:
             return lambda *_a, **_kw: None
 
-    from promanomaly import runner as runner_mod
+    from promanomaly import stratified_fetcher as fetcher_mod
 
-    monkeypatch.setattr(runner_mod, "logger", _StubLogger())
+    # The warning fires from the StratifiedFetcher since the cache +
+    # fetch lifecycle live there now; patching the runner's logger
+    # would no longer catch it.
+    monkeypatch.setattr(fetcher_mod, "logger", _StubLogger())
 
     history = _diurnal_history(days=30)
     series = make_series({"k": "v"}, history)

@@ -97,12 +97,21 @@ def ha_app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Application:
     app = Application(load_config(config_path), config_path)
     # Build the shared snapshot cache lazily — same as _start_ha() does —
     # so the snapshot-publish path is wired without launching the elector.
+    # The other HAComponents fields are mocked because the publish path
+    # only consults ``snapshot_cache``.
+    from unittest.mock import MagicMock
+
+    from promanomaly.ha import HAComponents
     from promanomaly.state import SharedSnapshotCache
 
-    app._snapshot_cache = SharedSnapshotCache(
-        client=fake,
-        ttl_seconds=60.0,
-        key_prefix="promanomaly:snapshot",
+    app._ha = HAComponents(
+        elector=MagicMock(),
+        snapshot_cache=SharedSnapshotCache(
+            client=fake,
+            ttl_seconds=60.0,
+            key_prefix="promanomaly:snapshot",
+        ),
+        follower_syncer=MagicMock(),
     )
     return app
 
@@ -145,8 +154,8 @@ async def test_safe_group_run_publishes_snapshot_to_shared_cache(
     shared cache so followers can pull it."""
     ha_app._is_leader = True
     await ha_app._safe_group_run("g1")
-    assert ha_app._snapshot_cache is not None
-    loaded = ha_app._snapshot_cache.load_all()
+    assert ha_app._ha is not None
+    loaded = ha_app._ha.snapshot_cache.load_all()
     assert len(loaded) == 1
     assert loaded[0].group == "g1"
 
@@ -265,8 +274,8 @@ async def test_in_flight_run_does_not_publish_after_demotion(
         samples=[Sample(metric="anomaly_score", labels=(("group", "g1"),), value=42.0)],
     )
     ha_app._store.write(seed)
-    assert ha_app._snapshot_cache is not None
-    ha_app._snapshot_cache.publish(seed)
+    assert ha_app._ha is not None
+    ha_app._ha.snapshot_cache.publish(seed)
 
     await ha_app._safe_group_run("g1")
 
@@ -275,6 +284,6 @@ async def test_in_flight_run_does_not_publish_after_demotion(
     # snapshot publish is the cross-pod hazard and that one is gated
     # by the leader check. So the shared cache still carries the
     # original snapshot.
-    loaded = ha_app._snapshot_cache.load_all()
+    loaded = ha_app._ha.snapshot_cache.load_all()
     assert len(loaded) == 1
     assert loaded[0].samples[0].value == 42.0

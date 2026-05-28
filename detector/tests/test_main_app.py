@@ -8,6 +8,7 @@ The PromQL client is stubbed so the tests stay deterministic and fast.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -86,9 +87,16 @@ def test_metrics_and_healthz_after_first_run(stub_app: tuple[Application, StubSo
     app, _stub = stub_app
     with TestClient(app.build_app()) as client:
         assert client.get("/healthz").text == "ok"
-        # The lifespan hook fires an immediate first run; by the time
-        # TestClient returns control the snapshot is in place.
-        ready = client.get("/ready")
+        # The lifespan hook spawns the first-run task but does not await
+        # it (per the project guide: "First run: immediate. Each group
+        # runs as an asyncio task"). Poll /ready to give the background
+        # task a chance to land its snapshot — mirrors what Kubernetes
+        # does with the readiness probe in production.
+        for _ in range(50):
+            ready = client.get("/ready")
+            if ready.status_code == 200:
+                break
+            time.sleep(0.05)
         assert ready.status_code == 200
         body = client.get("/metrics").text
         assert "anomaly_score" in body

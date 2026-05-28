@@ -189,11 +189,26 @@ class OperationalMetrics:
     """Bounded-cardinality operational metrics, served from a private registry.
 
     Kept apart from snapshot metrics so reload-driven group churn never
-    leaks high-cardinality samples through prometheus_client.
+    leaks high-cardinality samples through prometheus_client. Metrics
+    are declared in four ownership-grouped private methods (runner,
+    cache, leader, discovery) so adding a metric in one domain doesn't
+    require scanning a 140-line ``__init__``. The flat public
+    attributes are kept for backwards compatibility with callers that
+    do ``ops.failures_total.labels(...).inc()``.
     """
 
     def __init__(self) -> None:
         self.registry = CollectorRegistry()
+        self._declare_runner_metrics()
+        self._declare_cache_metrics()
+        self._declare_leader_metrics()
+        self._declare_discovery_metrics()
+
+    # ------------------------------------------------------------------
+    # Runner-owned metrics: per-group timing, readiness, source-failure
+    # and per-series failure counters, detector compute timing.
+    # ------------------------------------------------------------------
+    def _declare_runner_metrics(self) -> None:
         self.last_run_timestamp_seconds = Gauge(
             "anomaly_last_run_timestamp_seconds",
             "Wall-clock timestamp of the last successful group run.",
@@ -271,10 +286,13 @@ class OperationalMetrics:
             ["group", "detector"],
             registry=self.registry,
         )
-        # Query-cache observability. Cardinality is bounded — one set of
-        # series per cache (single instance per process today; the v0.4
-        # Redis variant will publish the same metric family without
-        # changing dashboards).
+
+    # ------------------------------------------------------------------
+    # Cache-owned metrics. Cardinality is bounded — one set of series per
+    # cache (single instance per process today; the v0.4 Redis variant
+    # publishes the same metric family without changing dashboards).
+    # ------------------------------------------------------------------
+    def _declare_cache_metrics(self) -> None:
         self.query_cache_hits_total = Counter(
             "anomaly_query_cache_hits_total",
             "PromQL responses served from the in-process query cache.",
@@ -300,8 +318,12 @@ class OperationalMetrics:
             "Number of entries currently held in the in-process query cache.",
             registry=self.registry,
         )
-        # Leader election (HA mode only). Cardinality is bounded — one
-        # per replica via ``instance`` label.
+
+    # ------------------------------------------------------------------
+    # Leader-election metrics (HA mode only). Cardinality is bounded —
+    # one set of series per replica via ``instance`` label.
+    # ------------------------------------------------------------------
+    def _declare_leader_metrics(self) -> None:
         self.leader_elected = Gauge(
             "anomaly_leader_elected",
             "1 on the replica currently holding the leader Lease, 0 on followers.",
@@ -314,9 +336,13 @@ class OperationalMetrics:
             ["instance"],
             registry=self.registry,
         )
-        # Dynamic series discovery (v0.4). Per-run fan-out gauges and the
-        # per-variable failure counter; cardinality is bounded by the
-        # number of configured (group, query, variable) tuples.
+
+    # ------------------------------------------------------------------
+    # Discovery metrics (v0.4). Per-run fan-out gauges and the per-
+    # variable failure counter; cardinality is bounded by the number of
+    # configured (group, query, variable) tuples.
+    # ------------------------------------------------------------------
+    def _declare_discovery_metrics(self) -> None:
         self.discovery_expansions = Gauge(
             "anomaly_discovery_expansions",
             "Number of discovered series the last run fanned out to per query.",
@@ -349,37 +375,53 @@ class Exporter:
         # Counter snapshots used to map cache stats (absolute counters
         # maintained inside the cache) onto prometheus_client Counters
         # (which only expose .inc()). We forward the delta on each
-        # render so the wire output is monotonic. ``_cache_id`` lets us
-        # detect when the cache instance has been replaced by a reload
-        # (``replace_cache`` swaps in a fresh TTLCache); without it the
-        # snapshot would lag behind, treating the new cache's growing
-        # stats as deltas relative to the old cache's final totals.
-        self._cache_id: int | None = None
+        # render so the wire output is monotonic. ``_cache_version``
+        # lets us detect when the cache instance has been replaced by a
+        # reload (``replace_cache`` swaps in a fresh TTLCache); using a
+        # monotonic counter on the cache rather than ``id()`` avoids the
+        # subtle bug where a GC'd cache leaves its address free for the
+        # new cache to land on, and the swap would go unnoticed.
+        self._cache_version: int | None = None
         self._cache_stat_snapshot: dict[str, int] = {
             "hits": 0,
             "misses": 0,
             "evictions": 0,
             "expirations": 0,
         }
+        # The snapshot-render path is the dominant per-scrape cost at
+        # 10k+ series: per-sample regex validation + per-label escape +
+        # f-string assembly easily runs into hundreds of thousands of
+        # operations. Cache the rendered bytes keyed by the snapshots'
+        # (group, timestamp) tuple — a new snapshot bumps the timestamp,
+        # so a cache hit means nothing material changed and the bytes
+        # are still correct. At 1s scrape / 1m refresh that's 59/60
+        # scrapes served from cache.
+        self._snapshot_render_key: tuple[tuple[str, float], ...] | None = None
+        self._snapshot_render_bytes: bytes = b""
 
     def render(self) -> tuple[bytes, str]:
         self._refresh_cache_metrics()
         op_bytes = self._operational.render()
-        snapshot_text = render_samples(self._store.all_samples())
-        body = op_bytes + snapshot_text.encode("utf-8")
+        snapshots = self._store.all_snapshots()
+        key = tuple(sorted((snap.group, snap.timestamp) for snap in snapshots))
+        if key != self._snapshot_render_key:
+            text = render_samples(sample for snap in snapshots for sample in snap.samples)
+            self._snapshot_render_bytes = text.encode("utf-8")
+            self._snapshot_render_key = key
+        body = op_bytes + self._snapshot_render_bytes
         return body, CONTENT_TYPE_LATEST
 
     def _refresh_cache_metrics(self) -> None:
         if self._source is None or self._source.cache is None:
             return
         cache = self._source.cache
-        if id(cache) != self._cache_id:
+        if cache.version != self._cache_version:
             # Reload swapped the cache out. The previous cache's totals
             # were already inc'd onto the counters and stay there; the
             # new cache restarts at 0, so reset the snapshot too —
             # otherwise the next several renders skip updates while the
             # new cache "catches up" to the stale snapshot.
-            self._cache_id = id(cache)
+            self._cache_version = cache.version
             self._cache_stat_snapshot = {
                 "hits": 0,
                 "misses": 0,
