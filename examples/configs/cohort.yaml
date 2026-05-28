@@ -1,0 +1,82 @@
+# Cohort comparison — flag one bad node in a fleet of nominally identical workers.
+#
+# The Cohort detector groups all series returned by a query into cohorts
+# (one cohort per unique label set, ignoring `cohort_label`) and scores
+# each member by how far its rolling mean deviates from the cohort
+# baseline. Five clean nodes + one bad one is the canonical case; this
+# config sizes `min_cohort_size: 5` accordingly.
+#
+# This example also enables OpenTelemetry tracing — turn it on by
+# uncommenting the `telemetry:` block and installing the `[otel]` extra.
+
+apiVersion: promanomaly.io/v1alpha1
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 10s
+
+server:
+  listen: ":9092"
+  refresh_interval: 1m
+
+safety:
+  max_series_per_query: 1000
+  max_total_series: 20000
+  detect_timeout: 5s
+  query_timeout: 10s
+
+defaults:
+  window: 1h
+  step: 15s
+  min_points: 60
+  alert_thresholds:
+    score: 3.0
+  # Cohort calibration is best-effort under the current synthetic-injection
+  # cycle (see docs/scaling-stratified.md for the same caveat applied to
+  # stratified baselines). Disable here so the gauge isn't published with
+  # under-calibrated numbers; turn it back on if you also run a single-series
+  # detector in this group.
+  emit_baseline_stability: false
+
+# Uncomment to enable OpenTelemetry tracing — install with `pip install
+# promanomaly[otel]`. The detector emits `promanomaly.group_run`,
+# `promanomaly.query`, and `promanomaly.detect` spans to the configured
+# collector. See docs/telemetry.md for the full surface.
+#
+# telemetry:
+#   otlp:
+#     endpoint: "otel-collector.observability.svc:4317"
+#     insecure: true
+#     service_name: promanomaly
+
+groups:
+  - name: node_fleet
+    queries:
+      # CPU busy ratio across every node — the canonical "is one node hot?" case.
+      - id: cpu_busy_ratio
+        promql: 1 - rate(node_cpu_seconds_total{mode="idle"}[5m])
+        detectors:
+          - name: Cohort
+            params:
+              cohort_label: instance
+              min_cohort_size: 5
+      # Memory available — same fleet, different signal.
+      - id: memory_available_bytes
+        promql: node_memory_MemAvailable_bytes
+        detectors:
+          - name: Cohort
+            params:
+              cohort_label: instance
+              min_cohort_size: 5
+
+  - name: pod_fleet
+    queries:
+      # Per-pod request latency for one Deployment — cohort key is every
+      # label *except* pod, so different services land in separate cohorts.
+      - id: request_latency_seconds
+        promql: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
+        detectors:
+          - name: Cohort
+            params:
+              cohort_label: pod
+              min_cohort_size: 3

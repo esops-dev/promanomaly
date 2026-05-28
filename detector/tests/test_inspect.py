@@ -210,3 +210,54 @@ def test_inspect_cli_missing_target_fails() -> None:
     result = runner.invoke(cli, ["inspect", "--id", "metric_a"])
     # --target is required; click should exit non-zero.
     assert result.exit_code != 0
+
+
+@pytest.mark.asyncio
+async def test_inspect_builds_cohort_context_for_cohort_aware_detector(
+    stub_source: StubSource,
+) -> None:
+    # Cohort detectors need cross-member visibility; without the inspect
+    # cohort-context pre-pass, inspecting one member would always score 0
+    # because the detector wouldn't have its baseline injected. Pin that
+    # the inspect path mirrors the runner's per-cohort baseline build.
+    import numpy as np
+    import pandas as pd
+
+    n = 40
+    members = [
+        ("node-a", 10.0),
+        ("node-b", 10.1),
+        ("node-c", 9.9),
+        ("node-d", 10.05),
+        ("node-e", 9.95),
+        ("node-bad", 30.0),
+    ]
+    series = []
+    for name, mean in members:
+        rng = np.random.default_rng(hash(name) & 0xFFFFFFFF)
+        values = mean + rng.normal(0.0, 0.05, size=n)
+        df = pd.DataFrame({"timestamp": np.arange(n, dtype=float) * 15.0, "y": values})
+        series.append(make_series({"job": "node", "instance": name}, df))
+    stub_source.respond(lambda _: StubResponse(series=series))
+    cfg = _config(detectors=[{"name": "Cohort"}])
+    store = SnapshotStore()
+
+    payload = await inspect_series(
+        config=cfg,
+        source=stub_source,
+        store=store,
+        metric_id="metric_a",
+        label_selector="instance=node-bad",
+    )
+    assert payload["status"] == "ok"
+    assert payload["matched_series"] == 1
+    detector = payload["series"][0]["detectors"][0]
+    assert detector["name"] == "Cohort"
+    assert detector["status"] == "ok"
+    # cohort_label opt-in label appears on the inspect view too.
+    assert detector["cohort_label"] == "instance"
+    # The pre-pass found a 6-member cohort, well above the default
+    # min_cohort_size of 5.
+    assert detector["cohort_size"] == 6
+    # The divergent member should score above the default threshold of 3.
+    assert detector["score"] > 3.0

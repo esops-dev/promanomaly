@@ -342,6 +342,39 @@ class ExporterConfig(_ModelBase):
     output_labels: ExporterLabelsConfig = Field(default_factory=ExporterLabelsConfig)
 
 
+class OTLPConfig(_ModelBase):
+    """OpenTelemetry OTLP exporter settings.
+
+    Off by default — ``endpoint`` left unset means no tracer is built and
+    every ``Telemetry.span`` call is a zero-overhead no-op. Operators
+    typically point ``endpoint`` at a collector running in the same
+    cluster (e.g. ``otel-collector.observability.svc:4317``).
+    """
+
+    # gRPC endpoint of the OpenTelemetry collector. ``None`` (the
+    # default) disables tracing entirely.
+    endpoint: str | None = None
+    # Use plaintext gRPC. Defaults to True because the collector is
+    # usually reached through in-cluster Service DNS; flip to False
+    # when the collector terminates TLS.
+    insecure: bool = True
+    # service.name resource attribute reported alongside every span;
+    # operators commonly distinguish multiple deployments via this label.
+    service_name: str = "promanomaly"
+
+
+class TelemetryConfig(_ModelBase):
+    """Optional tracing configuration.
+
+    Currently only OTLP is supported; the project guide is explicit that
+    we don't reinvent the ecosystem. Adding Jaeger / Zipkin / etc. as
+    separate top-level blocks is straightforward when an operator
+    actually needs them.
+    """
+
+    otlp: OTLPConfig | None = None
+
+
 _DISCOVER_VARIABLE_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
@@ -531,6 +564,7 @@ class Config(_ModelBase):
     defaults: DefaultsConfig = Field(default_factory=DefaultsConfig)
     exporter: ExporterConfig = Field(default_factory=ExporterConfig)
     highAvailability: HighAvailabilityConfig = Field(default_factory=HighAvailabilityConfig)
+    telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     groups: list[GroupConfig]
 
     @model_validator(mode="after")
@@ -628,6 +662,7 @@ __all__ = [
     "ExporterLabelsConfig",
     "GroupConfig",
     "HighAvailabilityConfig",
+    "OTLPConfig",
     "QueryCacheConfig",
     "QueryConfig",
     "RedisConfig",
@@ -635,6 +670,7 @@ __all__ = [
     "ReloadConfig",
     "SafetyConfig",
     "ServerConfig",
+    "TelemetryConfig",
     "load_config",
     "parse_duration",
 ]

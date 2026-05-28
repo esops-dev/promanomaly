@@ -253,6 +253,53 @@ Single-pass, `O(window)`; intuitive sigma-multiplier units; less natural for non
 
 If unsure: start with CUSUM, layer BOCPD when you want posterior-confidence gating. See [`change-points.md`](change-points.md) for worked examples (synthetic step change, deploy-induced regression).
 
+## Cohort — Fleet-Relative Comparison
+
+```yaml
+detectors:
+  - name: Cohort
+    params:
+      cohort_label: instance    # default; the label that varies between members
+      min_cohort_size: 5        # default; cohorts smaller than this are skipped
+```
+
+**Best for**  
+Fleets of nominally identical workloads — nodes, pods, replicas of a service — where the anomaly only appears when a member is compared against its peers. Each individual series can look perfectly normal in its own rolling window; the divergence is the signal.
+
+**How it works**  
+The runner groups every series returned by the query into **cohorts** — series sharing every label except `cohort_label`. For each cohort with at least `min_cohort_size` members:
+
+1. At every timestamp `t` in the rolling window, compute the cross-member median and MAD of the values.
+2. Summarise to a single `(cohort_median, cohort_mad)` by taking the median over time of each per-step statistic (which keeps the baseline insensitive to short bursts in one member).
+3. For each member, score `|rolling_mean(member) - cohort_median| / cohort_mad` — the member's typical level expressed in cohort-MAD units.
+
+Cohorts below `min_cohort_size` are skipped silently: members receive a zero-score row but no firing. The detector emits an opt-in `cohort_label="<name>"` output label so dashboards can pivot on the chosen grouping.
+
+**Parameters**
+- `cohort_label` (default `"instance"`) — the label that varies between cohort members. Common choices: `instance`, `pod`, `replica`. Every *other* label on the series identifies the cohort itself.
+- `min_cohort_size` (default `5`) — minimum members required for scoring. Guards against the degenerate two-member case where one member is the cohort's own median by definition.
+
+**Trade-offs**
+- Catches the "one bad node in the fleet" case that no single-series detector can.
+- **Not** multivariate / covariance-shift analysis — that lives in the roadmap's future-considerations list, not in Cohort itself. Cohort comparison is the restricted, well-understood version of the problem.
+- Calibration / `auto_select` are designed around single-series detectors. The runner **skips the calibration cycle entirely for cohort-aware detectors**, so `anomaly_confidence_score` and `anomaly_baseline_stability` are simply not emitted for Cohort. Pair Cohort with explicit detector selection rather than `auto_select`, and prefer a dedicated group when mixing it with single-series detectors so the calibration gauges for the latter aren't blocked by Cohort's presence. The runner emits a one-time boot warning (`cohort_with_auto_select_true`) when it detects a Cohort plan in a group with `auto_select: true`.
+- `/debug/inspect` and the `inspect` CLI build the same per-cohort baseline the runner uses, so inspecting one member shows the real cross-member score — not the zero a naive single-series inspection would return.
+
+**Edge cases worth knowing**
+
+- **Constant fleet (cohort MAD = 0).** When most cohort members sit on the same exact value, the median absolute deviation collapses to zero and the score collapses to zero too. This matches the MAD detector's behaviour on a flatline window and biases toward false negatives, not false positives. Cohort is built for **noisy continuous signals** (CPU, latency, throughput). For discrete or quantised signals (`up{}`, integer counters with little variation), pair Cohort with PromQL preprocessing (e.g. `rate()`, `irate()`) that introduces meaningful variation, or use a different detector on a derived signal.
+- **Self-inclusion in the baseline.** The cross-cohort median and MAD are computed over **every** member, including the one being scored. For typical fleet sizes (≥ 10) this bias is negligible; for the minimum-size case (`min_cohort_size: 5`) a single outlier nudges the baseline toward itself and slightly shrinks its own score. The current implementation accepts this for simplicity — leave-one-out would require recomputing N baselines per query and the operational gain is small at the fleet sizes Cohort targets.
+- **Cohort + `discover:`.** When `discover.variable` and `cohort_label` reference the **same** label, each discover-rendered query receives only one member per cohort — every cohort falls below `min_cohort_size` and Cohort emits zero-score rows for all members. Either pick a `cohort_label` that's *not* one of the discovered variables, or drop the `discover:` block and let the cohort form from a single PromQL fetch.
+
+**Worked example — `cohort_label: instance` across six nodes**
+
+Given six series sharing `job=node` and differing only on `instance`, where five hover at ~10 and one drifts to ~30:
+- Cohort median converges to ~10, cohort MAD to ~0.1.
+- Score for the divergent member is `|30 - 10| / 0.1 = 200` — well above the default alert threshold of 3.
+- Scores for the five clean members are near zero.
+
+See [`patterns.md`](patterns.md) for composing Cohort output with other detectors via PromQL joins on `(id, group, instance)`.
+
 ## Auto-select Best Detector Per Series
 
 ```yaml

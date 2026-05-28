@@ -1,0 +1,129 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "schemaVersion": 38,
+  "title": "promanomaly cohort drift",
+  "tags": ["promanomaly", "anomaly-detection", "cohort"],
+  "templating": {
+    "list": [
+      {
+        "name": "group",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "query": "label_values(anomaly_score{detector=\"Cohort\"}, group)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true
+      },
+      {
+        "name": "id",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "query": "label_values(anomaly_score{detector=\"Cohort\", group=~\"$group\"}, id)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Cohort members currently diverging",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "count(anomaly_outside_threshold{detector=\"Cohort\", group=~\"$group\", id=~\"$id\"} == 1)",
+          "instant": true
+        }
+      ],
+      "gridPos": {"h": 4, "w": 8, "x": 0, "y": 0},
+      "options": {"colorMode": "value", "graphMode": "none"}
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Active cohorts",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "count(count by (id, group) (anomaly_score{detector=\"Cohort\", group=~\"$group\", id=~\"$id\"}))",
+          "instant": true
+        }
+      ],
+      "gridPos": {"h": 4, "w": 8, "x": 8, "y": 0},
+      "options": {"colorMode": "value", "graphMode": "none"}
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Max divergence score (60s)",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "max(max_over_time(anomaly_score{detector=\"Cohort\", group=~\"$group\", id=~\"$id\"}[1m]))",
+          "instant": true
+        }
+      ],
+      "gridPos": {"h": 4, "w": 8, "x": 16, "y": 0},
+      "options": {"colorMode": "value", "graphMode": "area"}
+    },
+    {
+      "id": 4,
+      "type": "table",
+      "title": "Top-N currently diverging cohort members",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "topk(10, anomaly_score{detector=\"Cohort\", group=~\"$group\", id=~\"$id\"})",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 4}
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Cohort divergence score over time",
+      "description": "Per-member divergence from the cohort baseline. A member rising above the rest is the 'one bad node in the fleet' case the Cohort detector targets.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "anomaly_score{detector=\"Cohort\", group=~\"$group\", id=~\"$id\"}",
+          "legendFormat": "{{id}} :: {{instance}}{{pod}}{{replica}}{{node}}"
+        }
+      ],
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 13}
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Cohort baseline vs. individual members",
+      "description": "anomaly_baseline carries the cross-member median for the Cohort detector. Overlay the source signal to see where each member sits relative to the fleet.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "anomaly_baseline{detector=\"Cohort\", group=~\"$group\", id=~\"$id\"}",
+          "legendFormat": "{{id}} baseline :: {{instance}}{{pod}}{{replica}}{{node}}"
+        }
+      ],
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 22}
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Outside-threshold transitions (sustained divergence)",
+      "description": "anomaly_outside_threshold transitions for Cohort. Used by the AnomalyOutsideThreshold reference alert with for: 5m flap suppression.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "anomaly_outside_threshold{detector=\"Cohort\", group=~\"$group\", id=~\"$id\"}",
+          "legendFormat": "{{id}} :: {{instance}}{{pod}}{{replica}}{{node}}"
+        }
+      ],
+      "gridPos": {"h": 7, "w": 24, "x": 0, "y": 31}
+    }
+  ]
+}

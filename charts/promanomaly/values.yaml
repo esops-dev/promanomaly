@@ -137,6 +137,18 @@ exporter:
     allow: []
     drop: []
 
+# Optional distributed tracing via OpenTelemetry OTLP-gRPC. Off by default;
+# leaving ``endpoint`` unset (or empty) means the detector never imports
+# the SDK and every ``Telemetry.span(...)`` call is a zero-overhead no-op.
+# Set ``endpoint`` (and install the container image with the [otel] extra)
+# to emit ``promanomaly.group_run`` / ``promanomaly.query`` /
+# ``promanomaly.detect`` spans. See docs/telemetry.md.
+telemetry:
+  otlp:
+    endpoint: ""           # e.g. "otel-collector.observability.svc:4317"
+    insecure: true         # set false when the collector terminates TLS
+    service_name: promanomaly
+
 # Inline detector groups. Mutually exclusive with ``existingConfigMap``.
 #
 # REQUIRED: the schema validator rejects a config without at least one

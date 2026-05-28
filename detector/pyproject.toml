@@ -43,6 +43,16 @@ analyze = [
 ha = [
     "kubernetes>=31.0.0",
 ]
+# OpenTelemetry tracing for the query -> detect -> export pipeline.
+# Off by default (zero overhead unless ``telemetry.otlp`` is configured);
+# install with ``pip install promanomaly[otel]`` to enable. The SDK
+# pulls in protobuf + gRPC, which is why it's an optional extra rather
+# than a base dependency.
+otel = [
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.27.0",
+]
 dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
@@ -74,6 +84,7 @@ HourOfDayMAD = "promanomaly.detectors.hour_of_day_mad:HourOfDayMAD"
 DayOfWeekMAD = "promanomaly.detectors.day_of_week_mad:DayOfWeekMAD"
 BOCPD = "promanomaly.detectors.bocpd:BOCPD"
 CUSUM = "promanomaly.detectors.cusum:CUSUM"
+Cohort = "promanomaly.detectors.cohort:Cohort"
 
 [build-system]
 requires = ["hatchling"]
@@ -112,6 +123,7 @@ module = [
     "ruptures.*",
     "kubernetes.*",
     "fakeredis.*",
+    "opentelemetry.*",
 ]
 ignore_missing_imports = true
 

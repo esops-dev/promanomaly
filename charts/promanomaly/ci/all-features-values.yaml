@@ -42,6 +42,16 @@ exporter:
     drop:
       - customer_id
 
+# Telemetry: wire the OTLP block through the configmap render so the
+# conditional block (skipped when endpoint is empty) is also exercised
+# in the matrix. Operators need to install the container image with the
+# [otel] extra for the SDK to be importable at boot.
+telemetry:
+  otlp:
+    endpoint: "otel-collector.observability.svc:4317"
+    insecure: true
+    service_name: promanomaly-ci
+
 groups:
   - name: ci_full
     priority: 5
@@ -84,3 +94,19 @@ groups:
             params:
               lookback: 7d
               bucket_width: 1h
+
+  # Cohort detection lives in its own group so its calibration-skip
+  # behaviour does not affect the single-series detectors above (mixing
+  # them in one auto_select group would silently demote Cohort because
+  # only single-series detectors get calibration records). See
+  # docs/detectors.md.
+  - name: ci_cohort
+    priority: 3
+    queries:
+      - id: cpu_busy_ratio
+        promql: 1 - rate(node_cpu_seconds_total{mode="idle"}[5m])
+        detectors:
+          - name: Cohort
+            params:
+              cohort_label: instance
+              min_cohort_size: 5

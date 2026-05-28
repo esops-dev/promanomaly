@@ -45,6 +45,7 @@ from .logging import configure_logging, get_logger
 from .runner import Runner
 from .source import PromQLSource, QueryResult
 from .state import FollowerSyncer, SharedSnapshotCache, SnapshotStore
+from .telemetry import Telemetry
 
 logger = get_logger(__name__)
 
@@ -68,11 +69,18 @@ class Application:
             auth=config.datasource.auth,
             cache=_build_query_cache(config, self._redis),
         )
+        # OpenTelemetry tracing — built from config exactly once at boot.
+        # Reload swaps in a fresh Telemetry via ``Runner._telemetry`` only
+        # when the endpoint actually changed; for now any reload that
+        # touches telemetry config requires a restart, which is documented
+        # in docs/telemetry.md alongside the zero-overhead caveat.
+        self._telemetry = Telemetry.from_config(config.telemetry)
         self._runner = Runner(
             config=config,
             source=self._source,
             store=self._store,
             operational=self._ops,
+            telemetry=self._telemetry,
         )
         self._exporter = Exporter(self._store, self._ops, self._source)
         self._scheduler: AsyncIOScheduler | None = None
@@ -138,6 +146,11 @@ class Application:
             self._scheduler.shutdown(wait=False)
             self._scheduler = None
         await self._source.close()
+        # Flush buffered OpenTelemetry spans before the process exits.
+        # BatchSpanProcessor queues spans on a background thread; without
+        # the explicit shutdown the last batch is dropped on rolling
+        # restarts. No-op when telemetry was never enabled.
+        self._telemetry.shutdown()
 
     # ------------------------------------------------------------------
     # Endpoints
