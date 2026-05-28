@@ -27,20 +27,21 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from .cohort_context import build_cohort_context
 from .config import Config, DefaultsConfig, GroupConfig, QueryConfig
-from .detectors import UnknownDetectorError, get
+from .detectors import UnknownDetectorError
 from .detectors.cohort import (
     _PARAM_COHORT_MAD,
     _PARAM_COHORT_MEDIAN,
     _PARAM_COHORT_SIZE,
     cohort_key_for,
-    compute_cohort_baseline,
     is_cohort_aware,
 )
-from .runner import _build_detector
+from .plan import build_detector as _build_detector
+from .plan import build_detector_plans, effective_threshold
 from .source import PromQLSource, QuerySeries, SourceQueryError
 from .state import SnapshotStore
-from .stratified import query_window_seconds_for
+from .stratified import detector_input_window_seconds
 
 
 class InspectError(Exception):
@@ -145,20 +146,6 @@ def _trim_window(series: QuerySeries) -> list[dict[str, float]]:
     return [{"timestamp": float(t), "y": float(y)} for t, y in zip(timestamps, ys, strict=True)]
 
 
-def _detector_input_window_seconds(cls: Any, params: dict[str, Any], defaults: float) -> float:
-    """Mirror Runner._detector_input_window_seconds for inspect-time scoring.
-
-    Delegates to the shared ``query_window_seconds_for`` helper — same
-    value-gating (non-positive returns None) and exception-swallowing
-    semantics as the runner's fetch-window decision so inspect and live
-    scoring widen identically for stratified detectors. A buggy
-    detector that raises from ``query_window_seconds`` falls back to
-    the group default instead of crashing the /debug/inspect endpoint.
-    """
-    override = query_window_seconds_for(cls, params)
-    return override if override is not None else defaults
-
-
 async def inspect_series(
     *,
     config: Config,
@@ -183,28 +170,16 @@ async def inspect_series(
     defaults: DefaultsConfig = config.defaults
 
     # Build the per-detector plan up front so calibration lookups and
-    # detector runs can share one validated plan.
-    plans: list[dict[str, Any]] = []
+    # detector runs can share one validated plan. Uses the same shared
+    # builder as the runner so any change there flows through here
+    # without divergence — previously this loop was a hand-rolled clone.
+    try:
+        plans = build_detector_plans(query, defaults)
+    except UnknownDetectorError as exc:
+        raise InspectError("unknown_detector", str(exc)) from exc
     desired_window = defaults.window_seconds
-    for entry in query.detectors:
-        try:
-            cls = get(entry.name)
-        except UnknownDetectorError as exc:
-            raise InspectError("unknown_detector", str(exc)) from exc
-        merged: dict[str, Any] = {}
-        merged.update(getattr(cls, "defaults", {}) or {})
-        merged.update(entry.params or {})
-        merged.setdefault("window", defaults.window)
-        merged.setdefault("step", defaults.step)
-        plans.append(
-            {
-                "name": entry.name,
-                "instance": entry.instance,
-                "cls": cls,
-                "params": merged,
-            }
-        )
-        det_window = _detector_input_window_seconds(cls, merged, defaults.window_seconds)
+    for plan in plans:
+        det_window = detector_input_window_seconds(plan.cls, plan.params, defaults.window_seconds)
         if det_window > desired_window:
             desired_window = det_window
 
@@ -232,9 +207,9 @@ async def inspect_series(
     # Pre-compute cohort baselines from the *unfiltered* result set so a
     # cohort-aware detector inspecting one member still sees the full
     # cohort context — the operator-friendly answer to "why did this
-    # member score 4.7?". Mirrors the runner's pre-pass exactly; cheap
-    # no-op when no plan is cohort-aware.
-    cohort_context = _build_inspect_cohort_context(plans, qresult.series)
+    # member score 4.7?". Uses the runner's shared builder so any change
+    # to cohort semantics flows through both paths without divergence.
+    cohort_context = build_cohort_context(plans, qresult.series)
     series_payload: list[dict[str, Any]] = []
     for series in matching:
         sample_count = len(series.samples)
@@ -242,10 +217,10 @@ async def inspect_series(
         observed_runs = store.observed_runs(group.name, query.id, series.label_key)
         per_detector: list[dict[str, Any]] = []
         for plan in plans:
-            cls = plan["cls"]
-            params = plan["params"]
-            instance: str | None = plan["instance"]
-            name: str = plan["name"]
+            cls = plan.cls
+            params = plan.params
+            instance = plan.instance
+            name = plan.name
             calibration = store.get_calibration(
                 group.name, query.id, series.label_key, name, instance
             )
@@ -263,7 +238,7 @@ async def inspect_series(
                 continue
             # Mirror the runner's slicing so the detector sees the same
             # window it would see during a scheduled run.
-            det_window = _detector_input_window_seconds(cls, params, defaults.window_seconds)
+            det_window = detector_input_window_seconds(cls, params, defaults.window_seconds)
             latest_ts = float(series.samples["timestamp"].iloc[-1])
             cutoff = latest_ts - det_window
             sliced = series.samples[series.samples["timestamp"] >= cutoff]
@@ -276,21 +251,16 @@ async def inspect_series(
             # documented zero-score path.
             effective_params = params
             if is_cohort_aware(cls):
-                cohort_label = str(
-                    params.get(
-                        "cohort_label",
-                        getattr(cls, "defaults", {}).get("cohort_label", "instance"),
-                    )
-                )
+                cohort_label = cohort_context.label_by_plan.get((name, instance), "instance")
                 det_entry["cohort_label"] = cohort_label
                 cohort_key = cohort_key_for(series.labels, cohort_label)
-                cohort_baseline = cohort_context.get(((name, instance), cohort_key))
+                cohort_baseline = cohort_context.baselines.get(((name, instance), cohort_key))
                 if cohort_baseline is not None:
                     effective_params = dict(params)
-                    effective_params[_PARAM_COHORT_MEDIAN] = cohort_baseline["median"]
-                    effective_params[_PARAM_COHORT_MAD] = cohort_baseline["mad"]
-                    effective_params[_PARAM_COHORT_SIZE] = cohort_baseline["size"]
-                    det_entry["cohort_size"] = cohort_baseline["size"]
+                    effective_params[_PARAM_COHORT_MEDIAN] = cohort_baseline.cohort_median
+                    effective_params[_PARAM_COHORT_MAD] = cohort_baseline.cohort_mad
+                    effective_params[_PARAM_COHORT_SIZE] = cohort_baseline.size
+                    det_entry["cohort_size"] = cohort_baseline.size
                 else:
                     det_entry["cohort_size"] = None
             try:
@@ -307,14 +277,7 @@ async def inspect_series(
             # handles its own threshold semantics surfaces a ``threshold``
             # param (BOCPD's probability score) so its alerting bit does
             # not get compared against the group's sigma-multiplier knob.
-            threshold_raw = params.get("threshold")
-            if threshold_raw is None:
-                threshold = float(fallback)
-            else:
-                try:
-                    threshold = float(threshold_raw)
-                except (TypeError, ValueError):
-                    threshold = float(fallback)
+            threshold = effective_threshold(params, float(fallback))
             score = float(row.get("score", 0.0))
             baseline = float(row.get("baseline", 0.0))
             det_entry["status"] = "ok"
@@ -360,64 +323,6 @@ async def inspect_series(
         "total_series": len(qresult.series),
         "series": series_payload,
     }
-
-
-def _build_inspect_cohort_context(
-    plans: list[dict[str, Any]],
-    series_list: list[QuerySeries],
-) -> dict[tuple[tuple[str, str | None], tuple[tuple[str, str], ...]], dict[str, Any]]:
-    """Mirror of ``Runner._build_cohort_context`` for the inspect path.
-
-    Kept separate (rather than imported from the runner) because the
-    inspect plan shape is a dict, not the runner's ``_DetectorPlan``
-    dataclass — refactoring both to share one builder would just trade
-    one duplication for another. Light enough at one cohort_label / one
-    cohort_key partition per plan that the code reuse isn't worth a
-    cross-module type change.
-    """
-    out: dict[tuple[tuple[str, str | None], tuple[tuple[str, str], ...]], dict[str, Any]] = {}
-    if not series_list:
-        return out
-    for plan in plans:
-        cls = plan["cls"]
-        if not is_cohort_aware(cls):
-            continue
-        params = plan["params"]
-        cohort_label = str(
-            params.get(
-                "cohort_label",
-                getattr(cls, "defaults", {}).get("cohort_label", "instance"),
-            )
-        )
-        try:
-            min_size = int(
-                params.get(
-                    "min_cohort_size",
-                    getattr(cls, "defaults", {}).get("min_cohort_size", 5),
-                )
-            )
-        except (TypeError, ValueError):
-            min_size = 5
-        buckets: dict[tuple[tuple[str, str], ...], list[Any]] = {}
-        for series in series_list:
-            if not series.samples.shape[0]:
-                continue
-            key = cohort_key_for(series.labels, cohort_label)
-            values = series.samples["y"].to_numpy(dtype=float, copy=False)
-            buckets.setdefault(key, []).append(values)
-        for cohort_key, member_arrays in buckets.items():
-            if len(member_arrays) < min_size:
-                continue
-            baseline = compute_cohort_baseline(member_arrays)
-            if baseline is None:
-                continue
-            median, mad = baseline
-            out[((plan["name"], plan["instance"]), cohort_key)] = {
-                "median": median,
-                "mad": mad,
-                "size": len(member_arrays),
-            }
-    return out
 
 
 __all__ = ["InspectError", "inspect_series", "parse_label_selector"]

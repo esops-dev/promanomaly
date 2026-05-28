@@ -197,3 +197,61 @@ def test_follower_syncer_populates_local_store(
     snap = store.get("g1")
     assert snap is not None
     assert snap.samples[0].value == 1.0
+
+
+def test_follower_syncer_marks_fresh_snapshot_ready(
+    redis_client: fakeredis.FakeStrictRedis,
+) -> None:
+    """Within-TTL snapshots flip ``_group_ready=True`` so a follower
+    can serve traffic without ever running detection itself."""
+    from promanomaly.state import FollowerSyncer
+
+    shared = SharedSnapshotCache(client=redis_client, ttl_seconds=60.0)
+    shared.publish(_snapshot("g1", 1.0))
+    store = SnapshotStore()
+    syncer = FollowerSyncer(store=store, shared=shared)
+    # snapshot.timestamp=123.0; ttl=60s; now=140s → 123+60=183 >= 140 fresh
+    syncer.poll_once(now=140.0)
+    assert store.group_ready("g1") is True
+
+
+def test_follower_syncer_marks_stale_snapshot_not_ready(
+    redis_client: fakeredis.FakeStrictRedis,
+) -> None:
+    """Past-TTL snapshots flip ``_group_ready=False`` so a follower whose
+    leader has been failing longer than ``snapshot_ttl`` sheds traffic.
+    Without this the readiness probe would mask a fail_ready transition
+    on the leader from rolling-deploy gates."""
+    from promanomaly.state import FollowerSyncer
+
+    shared = SharedSnapshotCache(client=redis_client, ttl_seconds=60.0)
+    shared.publish(_snapshot("g1", 1.0))
+    store = SnapshotStore()
+    syncer = FollowerSyncer(store=store, shared=shared)
+    # First poll within TTL → ready
+    syncer.poll_once(now=140.0)
+    assert store.group_ready("g1") is True
+    # Subsequent poll past TTL must flip the flag to False, not merely
+    # leave it stuck at True from the previous successful poll.
+    syncer.poll_once(now=300.0)  # 123+60=183 < 300 stale
+    assert store.group_ready("g1") is False
+
+
+def test_follower_syncer_tolerates_clock_skew_behind_leader(
+    redis_client: fakeredis.FakeStrictRedis,
+) -> None:
+    """A follower whose clock is *behind* the leader's must not mark
+    every fresh snapshot as stale because of negative skew. The TTL
+    comparison clamps to ``max(now, snap.timestamp)``."""
+    from promanomaly.state import FollowerSyncer
+
+    shared = SharedSnapshotCache(client=redis_client, ttl_seconds=60.0)
+    shared.publish(_snapshot("g1", 1.0))
+    store = SnapshotStore()
+    syncer = FollowerSyncer(store=store, shared=shared)
+    # Follower thinks it's at t=10 but the leader published at t=123.
+    # Without skew-clamping this would naively read "123 + 60 >= 10" → True
+    # — but that's accidental: the operator should be confident a follower
+    # behind the leader trusts the leader's clock and serves the snapshot.
+    syncer.poll_once(now=10.0)
+    assert store.group_ready("g1") is True

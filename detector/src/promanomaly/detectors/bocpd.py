@@ -26,13 +26,35 @@ import pandas as pd
 
 from .base import ParamSpec
 
+try:
+    from scipy.special import gammaln as _scipy_gammaln  # type: ignore[import-untyped]
+except ImportError:
+    _scipy_gammaln = None
+
+
+def _vec_lgamma(values: np.ndarray[Any, Any]) -> np.ndarray[Any, Any]:
+    """Vectorised ``math.lgamma`` with a scipy fast-path.
+
+    BOCPD evaluates the Student's-t predictive density at every
+    run-length on every sample, so the lgamma calls dominate detector
+    compute. ``scipy.special.gammaln`` is 50-100x faster than the
+    pure-Python loop and is already a transitive dependency (ruptures,
+    pandas, statsmodels all pull it in). When it isn't installed —
+    minimal-image deployments without the ``[analyze]`` extra — we
+    fall back to a numpy ``fromiter`` over ``math.lgamma`` which
+    matches the previous implementation.
+    """
+    if _scipy_gammaln is not None:
+        return np.asarray(_scipy_gammaln(values), dtype=float)
+    return np.fromiter((math.lgamma(float(v)) for v in values), dtype=float, count=int(values.size))
+
 
 def _student_t_logpdf(
     x: float,
-    df: np.ndarray,
-    loc: np.ndarray,
-    scale: np.ndarray,
-) -> np.ndarray:
+    df: np.ndarray[Any, Any],
+    loc: np.ndarray[Any, Any],
+    scale: np.ndarray[Any, Any],
+) -> np.ndarray[Any, Any]:
     """Log-pdf of the (location-scale) Student's-t distribution.
 
     Vectorised over ``df``/``loc``/``scale`` so BOCPD can evaluate the
@@ -42,14 +64,11 @@ def _student_t_logpdf(
     """
     scale = np.maximum(scale, 1e-12)
     z = (x - loc) / scale
-    # vectorised lgamma via numpy.vectorize is slow; use math.lgamma per
-    # element since ``df`` arrays are short (capped to the rolling window
-    # in fit_score) and this avoids pulling scipy in.
     half_df = df / 2.0
     half_df_plus_one = (df + 1.0) / 2.0
-    log_gamma_num = np.array([math.lgamma(float(v)) for v in half_df_plus_one])
-    log_gamma_den = np.array([math.lgamma(float(v)) for v in half_df])
-    result: np.ndarray = (
+    log_gamma_num = _vec_lgamma(half_df_plus_one)
+    log_gamma_den = _vec_lgamma(half_df)
+    result: np.ndarray[Any, Any] = (
         log_gamma_num
         - log_gamma_den
         - 0.5 * np.log(df * math.pi)
@@ -59,7 +78,7 @@ def _student_t_logpdf(
     return result
 
 
-def _logsumexp(values: np.ndarray) -> float:
+def _logsumexp(values: np.ndarray[Any, Any]) -> float:
     """Numerically stable log-sum-exp; small enough to vendor."""
     if values.size == 0:
         return float("-inf")
@@ -237,7 +256,13 @@ class BOCPD:
         # the cumulative mass at the recent run-lengths — the standard
         # way to surface the change-point signal from a BOCPD posterior.
         recent_lag = min(lag + 1, weights.size)
-        cp_prob = float(weights[:recent_lag].sum())
+        # Clamp into [0, 1] — the weights *should* be a normalised
+        # probability distribution, but the underlying floating-point
+        # logsumexp + scipy.special.gammaln path occasionally returns
+        # 1.0 + 1e-16 due to round-off. Clamping keeps the published
+        # score within the documented contract without changing the
+        # firing decision (the threshold is far from the edges).
+        cp_prob = float(min(1.0, max(0.0, weights[:recent_lag].sum())))
         # MAP-style baseline: weighted average of regime means by their
         # posterior run-length mass. Falls back to the overall mean if
         # the posterior is degenerate (all zero mass).

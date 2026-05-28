@@ -138,8 +138,10 @@ async def test_warmup_emit_with_flag_emits_score_and_flag(stub_source: StubSourc
     result = await runner.run_group("g1")
     metrics = {s.metric for s in result.samples}
     assert metrics == {"anomaly_warming_up", "anomaly_score", "anomaly_outside_threshold"}
-    score = next(s for s in result.samples if s.metric == "anomaly_score")
-    assert dict(score.labels)["warming_up"] == "true"
+    # All three metrics share the same label set so joins on (id, group)
+    # survive the warmup boundary.
+    for sample in result.samples:
+        assert dict(sample.labels)["warming_up"] == "true", sample
 
 
 @pytest.mark.asyncio

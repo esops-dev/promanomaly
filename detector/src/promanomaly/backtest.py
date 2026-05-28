@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import datetime as _dt
 import json
 import time
 from dataclasses import dataclass, field
@@ -41,9 +40,10 @@ import numpy as np
 import pandas as pd
 
 from .calibration import INJECTION_PATTERNS
-from .config import Config, QueryConfig, load_config, parse_duration
-from .detectors import UnknownDetectorError, get
-from .runner import _build_detector
+from .config import Config, QueryConfig, load_config, parse_timestamp
+from .detectors import UnknownDetectorError
+from .plan import build_detector as _build_detector
+from .plan import build_detector_plans, effective_threshold
 from .source import PromQLSource, QuerySeries, SourceQueryError
 from .stratified import query_window_seconds_for
 
@@ -160,40 +160,10 @@ def _detector_fires(
     return float(row.get("score", 0.0)) >= threshold
 
 
-def _parse_timestamp(value: str, *, now: float) -> float:
-    """Parse RFC3339 / unix-seconds / 'now' / relative '-7d' to unix seconds.
-
-    Mirrors the ``analyze`` CLI's parser so backtest and analyze share
-    one mental model for time inputs.
-    """
-    value = value.strip()
-    if value == "now":
-        return float(now)
-    if value.startswith("-"):
-        return float(now) - parse_duration(value[1:])
-    try:
-        return float(value)
-    except ValueError:
-        pass
-    try:
-        dt = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError(
-            f"invalid timestamp {value!r}; expected RFC3339, unix seconds, 'now', or '-7d'"
-        ) from exc
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=_dt.UTC)
-    return dt.timestamp()
-
-
-def _effective_threshold(params: dict[str, Any], fallback: float) -> float:
-    raw = params.get("threshold")
-    if raw is None:
-        return fallback
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return fallback
+_parse_timestamp = parse_timestamp
+# Re-exported under the historical private name for tests that monkeypatch
+# the backtest entrypoint directly.
+_effective_threshold = effective_threshold
 
 
 # ---------------------------------------------------------------------------
@@ -202,28 +172,27 @@ def _effective_threshold(params: dict[str, Any], fallback: float) -> float:
 
 
 def _build_plans(query: QueryConfig, config: Config) -> list[dict[str, Any]]:
-    """Validate detectors + merge defaults, mirroring Runner._fetch_and_plan."""
-    plans: list[dict[str, Any]] = []
-    defaults = config.defaults
-    for entry in query.detectors:
-        try:
-            cls = get(entry.name)
-        except UnknownDetectorError as exc:
-            raise click.ClickException(str(exc)) from exc
-        params: dict[str, Any] = {}
-        params.update(getattr(cls, "defaults", {}) or {})
-        params.update(entry.params or {})
-        params.setdefault("window", defaults.window)
-        params.setdefault("step", defaults.step)
-        plans.append(
-            {
-                "name": entry.name,
-                "instance": entry.instance,
-                "cls": cls,
-                "params": params,
-            }
-        )
-    return plans
+    """Validate detectors + merge defaults, sharing :func:`build_detector_plans`.
+
+    Returns plans as plain dicts so the rest of the backtest core can
+    decorate them with the per-plan ``_threshold`` key without growing
+    the public :class:`DetectorPlan` shape with backtest-only state.
+    Mirrors :meth:`Runner._fetch_and_plan` so backtest scoring cannot
+    drift away from live scoring after a detector-schema change.
+    """
+    try:
+        plans = build_detector_plans(query, config.defaults)
+    except UnknownDetectorError as exc:
+        raise click.ClickException(str(exc)) from exc
+    return [
+        {
+            "name": p.name,
+            "instance": p.instance,
+            "cls": p.cls,
+            "params": p.params,
+        }
+        for p in plans
+    ]
 
 
 def _sliding_windows(samples: pd.DataFrame, window_samples: int, stride: int) -> list[pd.DataFrame]:
@@ -241,7 +210,7 @@ def _sliding_windows(samples: pd.DataFrame, window_samples: int, stride: int) ->
     return windows
 
 
-def _inject(values: np.ndarray, pattern: str) -> np.ndarray:
+def _inject(values: np.ndarray[Any, Any], pattern: str) -> np.ndarray[Any, Any]:
     fn = INJECTION_PATTERNS[pattern]
     return fn(values)  # type: ignore[no-any-return]
 

@@ -19,22 +19,20 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import inspect
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
-import numpy as np
 import pandas as pd
 import structlog
 
-from .calibration import DetectorCalibration, calibrate_detector
+from .calibration import calibrate_detector
+from .cohort_context import CohortContext, build_cohort_context
 from .config import (
     Config,
     DefaultsConfig,
     DetectorEntry,
-    EnsembleConfig,
     GroupConfig,
     QueryConfig,
 )
@@ -44,7 +42,6 @@ from .detectors.cohort import (
     _PARAM_COHORT_MEDIAN,
     _PARAM_COHORT_SIZE,
     cohort_key_for,
-    compute_cohort_baseline,
     is_cohort_aware,
 )
 from .discovery import (
@@ -54,14 +51,26 @@ from .discovery import (
     probe_variable,
     render_template,
 )
+from .ensemble import DetectorOutcome
+from .ensemble import fuse as fuse_ensemble
 from .exporter import OperationalMetrics
+from .plan import (
+    DetectorPlan,
+    build_detector,
+    build_detector_plans,
+    effective_threshold,
+    merge_params,
+)
+from .selector import select_winner
 from .source import PromQLSource, QueryResult, QuerySeries, SourceQueryError
 from .state import GroupSnapshot, Sample, SnapshotStore
 from .stratified import (
     baseline_refresh_seconds_for,
     collect_misconfigurations,
+    detector_input_window_seconds,
     query_window_seconds_for,
 )
+from .stratified_fetcher import StratifiedFetcher
 from .telemetry import Telemetry
 
 logger = structlog.get_logger(__name__)
@@ -80,27 +89,9 @@ REASON_QUERY_EXCEPTION = "query_exception"
 REASON_CARDINALITY = "cardinality_overflow"
 
 
-@dataclass
-class _DetectorPlan:
-    name: str
-    instance: str | None
-    cls: type[Detector]
-    params: dict[str, Any]
-
-
-@dataclass
-class _DetectorOutcome:
-    """Per-detector score + alerting bit for one series.
-
-    Captured per series so the ensemble fuser (when configured) can
-    fold the individual detector verdicts into a single composite
-    score without re-running detectors. The runner only retains these
-    long enough to compute composites and discards them.
-    """
-
-    plan: _DetectorPlan
-    score: float
-    outside: bool
+# Re-exported under the historical private name so the dozens of in-file
+# references stay tight. :class:`DetectorPlan` is the public alias.
+_DetectorPlan = DetectorPlan
 
 
 @dataclass
@@ -116,74 +107,6 @@ class _GroupInnerResult:
     # that fetched successfully but returned zero series still counts
     # here — the run produced fresh information about that query.
     queries_succeeded: int = 0
-
-
-@dataclass(frozen=True)
-class _CohortBaseline:
-    """Per-cohort cross-member median + MAD precomputed by the runner.
-
-    Built once per ``(plan, cohort_key)`` before scoring loops over the
-    cohort's members so every member sees the same baseline. Stored
-    frozen because the runner threads it through several layers and
-    accidental mutation would silently corrupt subsequent members'
-    scores.
-    """
-
-    cohort_median: float
-    cohort_mad: float
-    size: int
-
-
-@dataclass
-class _CohortContext:
-    """All cohort baselines for one query run, indexed by plan + cohort key.
-
-    Cohort-aware plans look up their per-series baseline via
-    ``baselines[(plan.name, plan.instance), cohort_key]``. ``label_by_plan``
-    records the resolved ``cohort_label`` per plan so the runner can stamp
-    the opt-in ``cohort_label`` output label on emitted samples.
-    """
-
-    baselines: dict[
-        tuple[tuple[str, str | None], tuple[tuple[str, str], ...]],
-        _CohortBaseline,
-    ] = field(default_factory=dict)
-    label_by_plan: dict[tuple[str, str | None], str] = field(default_factory=dict)
-
-
-@dataclass
-class _StratifiedBaseline:
-    """Cached long-history fetch for one (group, query) under the
-    sliding-window strategy.
-
-    The runner caches the heavy multi-week baseline pull and only
-    refreshes it at ``baseline_refresh_interval`` cadence; every detector
-    run still pulls the short window fresh and stitches it onto this
-    cache before scoring. Keyed by (group, rendered_id); rebuilt from
-    zero on restart and on config reload (state for removed groups is
-    dropped by :meth:`Runner.replace_config`).
-
-    ``promql`` is captured so a reload that changes the PromQL string of
-    a kept ``(group, query_id)`` invalidates the cache — otherwise the
-    runner would silently stitch the old signal's baseline onto the new
-    signal's short window.
-
-    ``template_query_id`` and ``template_promql`` carry the
-    pre-substitution form for discover-templated queries (and equal the
-    rendered form for non-discover queries). Reload identity is checked
-    against the template, not the rendered form, so reloading a
-    discover template's PromQL invalidates all its rendered descendants
-    at once — and reloading without any change preserves them.
-    """
-
-    fetched_at: float
-    promql: str
-    window_seconds: float
-    step_seconds: float
-    series_by_key: dict[tuple[tuple[str, str], ...], QuerySeries]
-    template_query_id: str = ""
-    template_promql: str = ""
-    truncated: bool = False
 
 
 @dataclass
@@ -243,23 +166,10 @@ class Runner:
         # Per-detector compute time captured during the current run;
         # flushed onto the operational gauge at the end of the run.
         self._detect_durations: dict[str, float] = {}
-        # Stratified-detector baseline cache. Keyed by (group, query_id)
-        # — the heavy multi-week pull lives here and is reused for
-        # ``baseline_refresh_interval`` before the next fetch. The short
-        # latest-sample window is pulled every refresh and stitched in
-        # before scoring. Entries for removed groups / queries are
-        # dropped by ``replace_config`` so a reload that trims the
-        # config does not leak stale baselines.
-        self._stratified_baseline_cache: dict[tuple[str, str], _StratifiedBaseline] = {}
-        # Per (group, query.id template) -> dict mapping
-        # ``rendered_id`` -> consecutive runs absent. Used to evict
-        # stratified baseline cache entries for ``discover:``-templated
-        # queries whose rendered ids stop appearing — without this,
-        # workloads that churn through ephemeral identities (pod names,
-        # replica IDs that never recycle) grow the cache without bound.
-        # Ages out on the same ``safety.discovery.forget_after_runs``
-        # threshold the snapshot store uses for signal-missing tracking.
-        self._discovery_stratified_misses: dict[tuple[str, str], dict[str, int]] = {}
+        # Stratified baseline cache + sliding-window fetch live behind
+        # this facade; the runner delegates to it rather than owning
+        # the heavy cache state directly.
+        self._stratified = StratifiedFetcher(source=source, config=config)
         # Surface stratified-config issues once at boot — but only on
         # single-replica deployments. In HA mode every follower would
         # otherwise log the same warning, multiplying the noise by the
@@ -284,29 +194,23 @@ class Runner:
     # ------------------------------------------------------------------
     def stratified_cache_keys_for_testing(self) -> set[tuple[str, str]]:
         """Snapshot of currently-cached ``(group, rendered_id)`` keys."""
-        return set(self._stratified_baseline_cache.keys())
+        return self._stratified.cache_keys()
 
     def stratified_cache_size_for_testing(self) -> int:
         """Total live stratified baseline cache entries."""
-        return len(self._stratified_baseline_cache)
+        return self._stratified.cache_size()
 
     def discovery_stratified_misses_for_testing(
         self,
     ) -> dict[tuple[str, str], dict[str, int]]:
         """Defensive copy of the discovery-churn miss tracker."""
-        return {key: dict(inner) for key, inner in self._discovery_stratified_misses.items()}
+        return self._stratified.discovery_misses_copy()
 
     def age_stratified_cache_entry_for_testing(
         self, cache_key: tuple[str, str], delta_seconds: float
     ) -> None:
-        """Backdate one cache entry's ``fetched_at`` for staleness tests.
-
-        Pure test ergonomics — avoids tests sleeping for the
-        ``baseline_refresh_interval`` to observe re-fetch behaviour.
-        Raises KeyError if the entry doesn't exist so the test fails
-        loudly rather than silently no-op'ing.
-        """
-        self._stratified_baseline_cache[cache_key].fetched_at -= delta_seconds
+        """Backdate one cache entry's ``fetched_at`` for staleness tests."""
+        self._stratified.age_cache_entry(cache_key, delta_seconds)
 
     def replace_config(self, new_config: Config) -> None:
         """Hot-replace the config without disposing the runner.
@@ -327,20 +231,10 @@ class Runner:
         for added in new_names - old_names:
             self._group_locks[added] = asyncio.Lock()
         self._store.clear_calibrations()
-        self._prune_stratified_cache_on_reload(new_config)
-        # The discovery-churn miss tracker is keyed by the *template*
-        # query id; drop entries for templates that no longer exist so a
-        # reload that removes a discover: query frees its tracker state
-        # along with its cache.
-        new_template_keys: set[tuple[str, str]] = {
-            (group.name, query.id)
-            for group in new_config.groups
-            for query in group.queries
-            if query.discover
-        }
-        for tracker_key in list(self._discovery_stratified_misses):
-            if tracker_key not in new_template_keys:
-                del self._discovery_stratified_misses[tracker_key]
+        # StratifiedFetcher owns its cache + discovery-churn tracker;
+        # ``replace_config`` here both updates its config snapshot and
+        # prunes the entries the new shape no longer covers.
+        self._stratified.replace_config(new_config)
         self._config = new_config
         # Re-check stratified config after the reload — operators may
         # have introduced a bad ``baseline_refresh_interval`` value
@@ -581,7 +475,7 @@ class Runner:
         # never recycle) doesn't grow the cache without bound. Cheap
         # no-op when no detector on the query opts into the
         # sliding-window strategy.
-        self._prune_stratified_cache_for_discovery(
+        self._stratified.prune_for_discovery(
             group=group,
             query=query,
             active_rendered_ids={v.rendered_id for v in variants},
@@ -671,23 +565,25 @@ class Runner:
         ``unknown_detector`` only when the runner actually tries to
         use that detector — we don't want to double-log here).
         """
+        self._check_cohort_with_auto_select()
+        self._check_stratified_findings()
 
-        def _resolve(name: str) -> type[Any]:
-            return get(name)
+    def _check_cohort_with_auto_select(self) -> None:
+        """Cohort + ``auto_select: true`` -> silently-suppressed output.
 
-        # Cohort + ``auto_select: true`` warning: the runner skips the
-        # calibration cycle for cohort-aware plans so they have no F1
-        # to compare against. Combined with auto_select's "winner-only"
-        # emission rule, that silently drops the Cohort output. Only
-        # the literal ``True`` form trips this; ``explicit_plus_best``
-        # emits every detector and is fine.
+        The runner skips the calibration cycle for cohort-aware plans
+        so they have no F1 to compare against. Combined with
+        ``auto_select``'s "winner-only" emission rule, that silently
+        drops the Cohort output. Only literal ``True`` trips this;
+        ``explicit_plus_best`` emits every detector and is fine.
+        """
         for group in self._config.groups:
             if group.auto_select is not True:
                 continue
             for query in group.queries:
                 for entry in query.detectors:
                     try:
-                        cls = _resolve(entry.name)
+                        cls = get(entry.name)
                     except UnknownDetectorError:
                         continue
                     if is_cohort_aware(cls):
@@ -708,132 +604,18 @@ class Runner:
                             ),
                         )
 
+    def _check_stratified_findings(self) -> None:
+        """Dispatch stratified-config findings to their per-kind logger."""
         findings = collect_misconfigurations(
             self._config.groups,
-            _resolve,
+            get,
             self._config.server.refresh_interval_seconds,
         )
         for finding in findings:
             kind = finding.get("kind")
-            if kind == "invalid_value":
-                logger.warning(
-                    "stratified_baseline_refresh_invalid",
-                    group=finding["group"],
-                    query=finding["query"],
-                    detector=finding["detector"],
-                    instance=finding["instance"],
-                    baseline_refresh_seconds=finding["baseline_refresh_seconds"],
-                    note=(
-                        "baseline_refresh_interval must be > 0; sliding-window "
-                        "strategy disabled for this detector"
-                    ),
-                )
-            elif kind == "below_refresh_interval":
-                logger.warning(
-                    "stratified_baseline_refresh_below_refresh_interval",
-                    group=finding["group"],
-                    query=finding["query"],
-                    detector=finding["detector"],
-                    instance=finding["instance"],
-                    baseline_refresh_seconds=finding["baseline_refresh_seconds"],
-                    refresh_interval_seconds=finding["refresh_interval_seconds"],
-                    note=(
-                        "baseline_refresh_interval shorter than "
-                        "server.refresh_interval: cache always stale, heavy "
-                        "fetch fires every refresh"
-                    ),
-                )
-            elif kind == "invalid_lookback":
-                logger.warning(
-                    "stratified_lookback_invalid",
-                    group=finding["group"],
-                    query=finding["query"],
-                    detector=finding["detector"],
-                    instance=finding["instance"],
-                    query_window_seconds=finding["query_window_seconds"],
-                    note=(
-                        "lookback must be > 0; sliding-window strategy "
-                        "disabled and bucket baseline will be empty"
-                    ),
-                )
-
-    def _prune_stratified_cache_on_reload(self, new_config: Config) -> None:
-        """Evict stratified cache entries the new config no longer owns.
-
-        Three eviction conditions, all checked against the *template*
-        identity (id + promql before any discover: substitution) so a
-        reload's effect on a discover query's many rendered descendants
-        is uniform:
-
-        - Template id absent from the new config (group removed or
-          query renamed / deleted).
-        - Template promql changed under the reload — would otherwise
-          stitch the old signal's baseline onto the new signal's short
-          fetch.
-        - Template still present but no longer has a stratified
-          detector — the cache entry is dead weight (``_fetch_stratified``
-          will never read it) and just consumes memory until forget-
-          after-runs trims it.
-        """
-        # Build the set of (group, template_query_id) -> template_promql
-        # for queries in the new config that still have at least one
-        # stratified detector. Anything else makes a cache entry
-        # ineligible to live through the reload.
-        live_templates: dict[tuple[str, str], str] = {}
-        for group in new_config.groups:
-            for query in group.queries:
-                has_stratified = any(
-                    _query_has_stratified_detector(entry) for entry in query.detectors
-                )
-                if has_stratified:
-                    live_templates[(group.name, query.id)] = query.promql
-
-        for cache_key in list(self._stratified_baseline_cache):
-            cached = self._stratified_baseline_cache[cache_key]
-            template_id = cached.template_query_id or cache_key[1]
-            template_promql = cached.template_promql or cached.promql
-            live_template_promql = live_templates.get((cache_key[0], template_id))
-            if live_template_promql is None or live_template_promql != template_promql:
-                del self._stratified_baseline_cache[cache_key]
-
-    def _prune_stratified_cache_for_discovery(
-        self,
-        *,
-        group: GroupConfig,
-        query: QueryConfig,
-        active_rendered_ids: set[str],
-    ) -> None:
-        """Age out stratified baseline cache entries for vanished discover ids.
-
-        Mirrors the snapshot store's ``forget_after_runs`` semantics for
-        the signal-missing tracker, so both state-bounding paths age out
-        on the same threshold. Currently-active rendered ids reset the
-        miss counter; absent ones increment it and get evicted from the
-        cache (and the tracker) once they cross
-        ``safety.discovery.forget_after_runs`` consecutive absent runs.
-
-        Cheap when the query has no stratified detectors — the tracker
-        dict stays empty and no cache lookups happen.
-        """
-        forget_after = self._config.safety.discovery.forget_after_runs
-        tracker_key = (group.name, query.id)
-        misses = self._discovery_stratified_misses.setdefault(tracker_key, {})
-
-        # Register currently-active rendered ids with miss_count=0
-        # (new arrivals enter here; returning ones reset).
-        for rid in active_rendered_ids:
-            misses[rid] = 0
-
-        # Increment misses for known-but-absent rendered ids; evict
-        # entries that cross the threshold from both the miss tracker
-        # and the stratified cache itself.
-        for rid in list(misses):
-            if rid in active_rendered_ids:
-                continue
-            misses[rid] += 1
-            if misses[rid] > forget_after:
-                del misses[rid]
-                self._stratified_baseline_cache.pop((group.name, rid), None)
+            logger_fn = _MISCONFIG_LOGGERS.get(kind) if isinstance(kind, str) else None
+            if logger_fn is not None:
+                logger_fn(finding)
 
     async def _probe_discovery_variables(
         self,
@@ -937,11 +719,17 @@ class Runner:
         # variant's discovered labels. ``query`` keeps the original
         # config (and its templates) for diagnostics + state-store keys
         # the runner maintains per logical query rather than per
-        # expansion.
-        effective_query = (
-            query.model_copy(update={"id": variant.rendered_id, "promql": variant.rendered_promql})
+        # expansion. A lightweight delegating wrapper avoids re-running
+        # pydantic validation on every fan-out — at hundreds of variants
+        # per refresh ``model_copy`` was a measurable per-tick cost. The
+        # ``cast`` here reflects the wrapper's behavioural contract:
+        # every attribute the runner reads on a ``QueryConfig`` resolves
+        # through ``_QueryVariant.__getattr__``.
+        effective_query = cast(
+            QueryConfig,
+            _QueryVariant(query, variant.rendered_id, variant.rendered_promql)
             if variant.labels
-            else query
+            else query,
         )
 
         try:
@@ -1024,7 +812,7 @@ class Runner:
         # per-cohort baseline once here (rather than re-deriving it per
         # member) so every member sees the same numbers. Cheap no-op
         # when no plan in the query opts into ``cohort_aware``.
-        cohort_context = self._build_cohort_context(plans, qresult.series)
+        cohort_context = build_cohort_context(plans, qresult.series)
 
         for series in qresult.series:
             out.series_count += 1
@@ -1049,13 +837,7 @@ class Runner:
         defaults = self._config.defaults
         # Validate the detector references up front so we fail loudly
         # before paying for the source query.
-        plans: list[_DetectorPlan] = []
-        for entry in query.detectors:
-            cls = get(entry.name)  # may raise UnknownDetectorError
-            params = self._merge_params(cls, entry, defaults)
-            plans.append(
-                _DetectorPlan(name=entry.name, instance=entry.instance, cls=cls, params=params)
-            )
+        plans = build_detector_plans(query, defaults)
 
         # Split plans into stratified (sliding-window strategy) and
         # plain rolling. Stratified plans expose
@@ -1083,7 +865,7 @@ class Runner:
             # with different baseline refresh intervals — fresher data
             # for everyone, at the cost of more TSDB load.
             baseline_refresh = min(refresh for _, refresh in stratified_meta)
-            result = await self._fetch_stratified(
+            result = await self._stratified.fetch(
                 group=group,
                 query=query,
                 end=end,
@@ -1117,162 +899,19 @@ class Runner:
                 result = QueryResult(series=result.series[:running_budget], truncated=True)
         return result, plans
 
-    async def _fetch_stratified(
-        self,
-        *,
-        group: GroupConfig,
-        query: QueryConfig,
-        end: float,
-        short_window_seconds: float,
-        baseline_window_seconds: float,
-        baseline_refresh_seconds: float,
-        template_query: QueryConfig | None = None,
-    ) -> QueryResult:
-        """Sliding-window fetch for queries with a stratified detector.
-
-        Pulls the short window every refresh and the long baseline
-        window only when the per-(group, query) cache is stale (or the
-        baseline window has grown via a reload). The two results are
-        stitched per-series — cached baseline samples before the earliest
-        timestamp in the short window, then the fresh short window —
-        before being handed back to the scoring path.
-
-        TSDB-failure semantics: a baseline fetch raising
-        :class:`SourceQueryError` propagates so the surrounding
-        ``safety.on_source_failure`` policy applies; a stale-but-present
-        cache is not silently reused. A short-window failure likewise
-        propagates. The bookkeeping is done in the runner so detectors
-        never see partial state.
-
-        ``template_query`` (when set, i.e. for discover-templated
-        variants) carries the pre-substitution id + promql. The cache
-        records those so reload-time identity checks compare templates
-        rather than rendered ids — without that, every reload would
-        wipe every discover-derived cache entry (the template id never
-        equals the rendered id).
-        """
-        defaults = self._config.defaults
-        max_series = self._config.safety.max_series_per_query
-        cache_key = (group.name, query.id)
-        template = template_query or query
-
-        # A SourceQueryError on either fetch propagates so the
-        # surrounding ``safety.on_source_failure`` policy applies
-        # (serve_stale preserves the previous snapshot, drop_scores
-        # skips just this query). We log a structured event with the
-        # cache-present flag so operators can distinguish "TSDB blip
-        # but we have history we're refusing to silently age" from a
-        # cold-start failure. The exception still propagates; the
-        # log event is purely additional context. See
-        # docs/scaling-stratified.md (Caching & HA Behavior).
-        try:
-            short_result = await self._source.range_query(
-                promql=query.promql,
-                end=end,
-                window_seconds=short_window_seconds,
-                step_seconds=defaults.step_seconds,
-                max_series=max_series,
-            )
-        except SourceQueryError as exc:
-            logger.warning(
-                "stratified_baseline_fetch_failed",
-                group=group.name,
-                query=query.id,
-                phase="short",
-                reason=exc.reason,
-                detail=exc.message,
-                cache_present=cache_key in self._stratified_baseline_cache,
-            )
-            raise
-
-        cached = self._stratified_baseline_cache.get(cache_key)
-        baseline_stale = (
-            cached is None
-            or (end - cached.fetched_at) >= baseline_refresh_seconds
-            or cached.window_seconds != baseline_window_seconds
-            or cached.step_seconds != defaults.step_seconds
-            # Defensive: if a caller swapped the config in-place (rather
-            # than through replace_config), the cache's recorded promql
-            # may no longer match. Reload covers the common path; this
-            # guard covers anything that doesn't.
-            or cached.promql != query.promql
-        )
-        if baseline_stale:
-            try:
-                baseline_result = await self._source.range_query(
-                    promql=query.promql,
-                    end=end,
-                    window_seconds=baseline_window_seconds,
-                    step_seconds=defaults.step_seconds,
-                    max_series=max_series,
-                )
-            except SourceQueryError as exc:
-                logger.warning(
-                    "stratified_baseline_fetch_failed",
-                    group=group.name,
-                    query=query.id,
-                    phase="baseline",
-                    reason=exc.reason,
-                    detail=exc.message,
-                    cache_present=cached is not None,
-                )
-                raise
-            cached = _StratifiedBaseline(
-                fetched_at=end,
-                promql=query.promql,
-                window_seconds=baseline_window_seconds,
-                step_seconds=defaults.step_seconds,
-                series_by_key={s.label_key: s for s in baseline_result.series},
-                template_query_id=template.id,
-                template_promql=template.promql,
-                truncated=baseline_result.truncated,
-            )
-            self._stratified_baseline_cache[cache_key] = cached
-
-        assert cached is not None  # mypy: established by either branch above
-        stitched: list[QuerySeries] = []
-        for series in short_result.series:
-            base = cached.series_by_key.get(series.label_key)
-            stitched.append(_stitch_series(base, series))
-
-        return QueryResult(
-            series=stitched,
-            truncated=short_result.truncated or cached.truncated,
-        )
-
     def _merge_params(
         self,
         cls: type[Detector],
         entry: DetectorEntry,
         defaults: DefaultsConfig,
     ) -> dict[str, Any]:
-        merged: dict[str, Any] = {}
-        merged.update(getattr(cls, "defaults", {}) or {})
-        merged.update(entry.params or {})
-        # Surface group-level defaults so detectors can read window/step
-        # without re-plumbing through the runner.
-        merged.setdefault("window", defaults.window)
-        merged.setdefault("step", defaults.step)
-        return merged
+        return merge_params(cls, entry.params, defaults)
 
     def _detector_input_window_seconds(
         self, plan: _DetectorPlan, defaults: DefaultsConfig
     ) -> float:
-        """Return how many seconds of data this detector wants to see.
-
-        Stratified detectors expose ``query_window_seconds`` to expand
-        the fetch; that same value is also the detector's intended
-        input window. Plain rolling detectors fall back to the group
-        default — so when MAD shares a query with HourOfDayMAD, MAD
-        still scores on the last ``defaults.window`` of data instead
-        of the 7d the fetch pulled.
-        """
-        override = getattr(plan.cls, "query_window_seconds", None)
-        if callable(override):
-            value = override(plan.params)
-            if value is not None:
-                return float(value)
-        return defaults.window_seconds
+        """Thin wrapper around :func:`detector_input_window_seconds`."""
+        return detector_input_window_seconds(plan.cls, plan.params, defaults.window_seconds)
 
     def _slice_for_detector(
         self, plan: _DetectorPlan, samples: pd.DataFrame, defaults: DefaultsConfig
@@ -1291,70 +930,6 @@ class Runner:
             return samples.tail(1).reset_index(drop=True)
         return sliced.reset_index(drop=True)
 
-    def _build_cohort_context(
-        self,
-        plans: list[_DetectorPlan],
-        series_list: list[QuerySeries],
-    ) -> _CohortContext:
-        """Pre-compute cohort baselines for every cohort-aware plan.
-
-        For each cohort-aware plan, partitions ``series_list`` by
-        ``cohort_key`` (all labels except the configured ``cohort_label``)
-        and computes the cross-member median + MAD for each cohort that
-        meets ``min_cohort_size``. Cohorts below the floor produce no
-        entry — the Cohort detector observes the absence and emits a
-        zero-score row, which the runner forwards as ``anomaly_score=0``.
-
-        Costs are bounded by ``safety.max_series_per_query``; on a 1000-
-        series query the inner numpy work is microseconds.
-        """
-        context = _CohortContext()
-        if not series_list:
-            return context
-
-        for plan in plans:
-            if not is_cohort_aware(plan.cls):
-                continue
-            cohort_label = str(
-                plan.params.get(
-                    "cohort_label",
-                    getattr(plan.cls, "defaults", {}).get("cohort_label", "instance"),
-                )
-            )
-            try:
-                min_size = int(
-                    plan.params.get(
-                        "min_cohort_size",
-                        getattr(plan.cls, "defaults", {}).get("min_cohort_size", 5),
-                    )
-                )
-            except (TypeError, ValueError):
-                min_size = 5
-            context.label_by_plan[(plan.name, plan.instance)] = cohort_label
-
-            # Partition series by cohort key.
-            buckets: dict[tuple[tuple[str, str], ...], list[np.ndarray]] = {}
-            for series in series_list:
-                if not series.samples.shape[0]:
-                    continue
-                key = cohort_key_for(series.labels, cohort_label)
-                values = series.samples["y"].to_numpy(dtype=float, copy=False)
-                buckets.setdefault(key, []).append(values)
-
-            for cohort_key, member_arrays in buckets.items():
-                if len(member_arrays) < min_size:
-                    continue
-                baseline = compute_cohort_baseline(member_arrays)
-                if baseline is None:
-                    continue
-                cohort_median, cohort_mad = baseline
-                context.baselines[((plan.name, plan.instance), cohort_key)] = _CohortBaseline(
-                    cohort_median=cohort_median,
-                    cohort_mad=cohort_mad,
-                    size=len(member_arrays),
-                )
-        return context
-
     async def _score_series(
         self,
         *,
@@ -1363,7 +938,7 @@ class Runner:
         plans: list[_DetectorPlan],
         series: QuerySeries,
         defaults: DefaultsConfig,
-        cohort_context: _CohortContext | None = None,
+        cohort_context: CohortContext | None = None,
     ) -> list[Sample]:
         thresholds = query.alert_thresholds or defaults.alert_thresholds
         threshold_score = thresholds.score
@@ -1374,9 +949,18 @@ class Runner:
             else defaults.min_relative_delta
         )
 
-        observed_runs = self._store.observe(group.name, query.id, series.label_key)
+        # ``observe()`` is consumed by the ``/debug/inspect`` endpoint
+        # (warmup_observed_runs); we don't gate the warmup branch on it
+        # because a sparse series with min_points samples in-window
+        # is genuinely ready to score regardless of run count.
+        self._store.observe(group.name, query.id, series.label_key)
         sample_count = len(series.samples)
         warm = sample_count < defaults.min_points
+        # Filter once per series; the same filtered dict is threaded into
+        # ``_warmup_samples``, ``_format_detector_samples`` (per plan), and
+        # ``fuse_ensemble`` so the allow/drop scan doesn't repeat once per
+        # detector. At 10k series x several detectors this was material.
+        filtered_labels = self._filter_source_labels(series.labels)
         if warm:
             return self._warmup_samples(
                 group=group,
@@ -1384,7 +968,7 @@ class Runner:
                 series=series,
                 plans=plans,
                 policy=defaults.warmup_policy,
-                observed_runs=observed_runs,
+                filtered_labels=filtered_labels,
             )
 
         # Calibration cycle: refresh per-detector confidence / stability
@@ -1392,11 +976,33 @@ class Runner:
         # only pay the synthetic-injection cost a small handful of times
         # per series per day. Errors are swallowed — calibration is a
         # secondary signal and must never take a normal detection run
-        # down.
+        # down. Run on the shared executor: synthetic-injection plus N
+        # detector replays is CPU-bound and would otherwise stall every
+        # other coroutine on the event loop for tens of ms per series.
         if self._calibration_due(group, query, series, plans, defaults):
-            self._refresh_calibrations(group, query, series, plans, defaults, threshold_score)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                self._executor,
+                self._refresh_calibrations,
+                group,
+                query,
+                series,
+                plans,
+                defaults,
+                threshold_score,
+            )
 
-        winner = self._select_winner(group, query, series, plans) if group.auto_select else None
+        winner = (
+            select_winner(
+                group_name=group.name,
+                query_id=query.id,
+                series_label_key=series.label_key,
+                plans=plans,
+                get_calibration=self._store.get_calibration,
+            )
+            if group.auto_select
+            else None
+        )
         # When ensemble: is configured we must execute every detector
         # (even auto_select losers) so the fuser sees every vote.
         # Without ensemble, the historical optimization stands —
@@ -1406,7 +1012,7 @@ class Runner:
         run_losers = group.ensemble is not None or group.auto_select == "explicit_plus_best"
 
         produced: list[Sample] = []
-        outcomes: list[_DetectorOutcome] = []
+        outcomes: list[DetectorOutcome] = []
         for plan in plans:
             is_winner = winner is not None and (plan.name, plan.instance) == winner
             is_suppressed = group.auto_select is True and winner is not None and not is_winner
@@ -1420,7 +1026,7 @@ class Runner:
             # (typically 3.0) makes no sense for it. Detectors opt in by
             # surfacing a ``threshold`` parameter; everyone else falls back
             # to the query/group threshold.
-            effective_threshold = _effective_threshold(plan, threshold_score)
+            plan_threshold = effective_threshold(plan.params, threshold_score)
             # Cohort-aware plans get their per-cohort baseline stamped
             # into a copy of plan.params before scoring. Lookups missing
             # in ``cohort_context`` (too-small cohorts) leave the params
@@ -1468,6 +1074,7 @@ class Runner:
                     group=group.name,
                     query=query.id,
                     detector=plan.name,
+                    exception_type=type(exc).__name__,
                     error=str(exc),
                 )
                 self._ops.failures_total.labels(
@@ -1483,23 +1090,25 @@ class Runner:
                 series=series,
                 plan=plan,
                 score_row=score_row,
-                threshold_score=effective_threshold,
+                threshold_score=plan_threshold,
                 min_abs=min_abs,
                 min_rel=min_rel,
                 defaults=defaults,
                 mark_as_winner=is_winner,
                 cohort_label_extra=cohort_label_extra,
+                filtered_labels=filtered_labels,
             )
-            outcomes.append(_DetectorOutcome(plan=plan, score=score, outside=outside))
+            outcomes.append(DetectorOutcome(score=score, outside=outside))
             if emit_samples:
                 produced.extend(samples)
 
         if group.ensemble is not None and outcomes:
             produced.extend(
-                self._format_ensemble_samples(
+                fuse_ensemble(
                     group=group,
                     query=query,
                     series=series,
+                    source_labels=filtered_labels,
                     outcomes=outcomes,
                     ensemble=group.ensemble,
                 )
@@ -1547,14 +1156,15 @@ class Runner:
         series: QuerySeries,
         plans: list[_DetectorPlan],
         policy: str,
-        observed_runs: int,
+        filtered_labels: dict[str, str] | None = None,
     ) -> list[Sample]:
-        del observed_runs  # currently informational only
         produced: list[Sample] = []
         if policy == "suppress":
             return produced
         for plan in plans:
-            labels = self._series_labels(group, query, series, plan)
+            labels = self._series_labels(
+                group, query, series, plan, filtered_labels=filtered_labels
+            )
             if policy == "emit_warming_up":
                 produced.append(
                     Sample(
@@ -1565,11 +1175,15 @@ class Runner:
                 )
                 continue
             if policy == "emit_with_flag":
+                # Stamp ``warming_up="true"`` on every metric emitted
+                # during warmup so the label set stays consistent
+                # across the warmup boundary — joins on (id, group)
+                # would otherwise break the moment scoring begins.
                 flagged = (*labels, ("warming_up", "true"))
                 produced.append(
                     Sample(
                         metric="anomaly_warming_up",
-                        labels=labels,
+                        labels=flagged,
                         value=1.0,
                     )
                 )
@@ -1599,6 +1213,7 @@ class Runner:
         defaults: DefaultsConfig,
         mark_as_winner: bool = False,
         cohort_label_extra: str | None = None,
+        filtered_labels: dict[str, str] | None = None,
     ) -> tuple[float, bool, list[Sample]]:
         """Return ``(score, outside, samples)`` for one detector run.
 
@@ -1619,7 +1234,9 @@ class Runner:
             # varies across cohort members so operators can join the
             # composite output against the source signal easily.
             extras["cohort_label"] = cohort_label_extra
-        labels = self._series_labels(group, query, series, plan, extras=extras)
+        labels = self._series_labels(
+            group, query, series, plan, extras=extras, filtered_labels=filtered_labels
+        )
         score = float(score_row.get("score", 0.0))
         baseline = float(score_row.get("baseline", 0.0))
         latest_y = float(series.samples["y"].iloc[-1])
@@ -1756,54 +1373,6 @@ class Runner:
             practical_outside = practical_outside and rel_delta >= min_rel
         return bool(statistical_outside and practical_outside)
 
-    def _format_ensemble_samples(
-        self,
-        *,
-        group: GroupConfig,
-        query: QueryConfig,
-        series: QuerySeries,
-        outcomes: list[_DetectorOutcome],
-        ensemble: EnsembleConfig,
-    ) -> list[Sample]:
-        """Fuse per-detector outcomes into composite metrics.
-
-        Two fusion methods are supported and only two; the project guide
-        is deliberate about not growing this list. ``max`` is a logical
-        OR; ``voting`` fires only when ``min_detectors`` agree. The
-        composite score is the max raw score across detectors in both
-        modes, so the gauge is useful as a "how loud is the loudest
-        detector" indicator independent of the firing rule.
-        """
-        # ``id`` and ``group`` are the only labels on composite metrics —
-        # we intentionally drop ``detector`` because the composite spans
-        # multiple detectors, and source-side labels would balloon the
-        # cardinality at fan-in.
-        src = self._filter_source_labels(series.labels)
-        result: dict[str, str] = dict(src)
-        result["id"] = query.id
-        result["group"] = group.name
-        labels = tuple(sorted(result.items()))
-
-        composite_score = max((o.score for o in outcomes), default=0.0)
-        if ensemble.method == "max":
-            fires = any(o.outside for o in outcomes)
-        elif ensemble.method == "voting":
-            agree = sum(1 for o in outcomes if o.outside)
-            fires = agree >= ensemble.min_detectors
-        else:
-            # Defensive: schema already restricts to {max, voting} so
-            # this branch only trips on a future enum addition. Treat
-            # as "do not emit" rather than crashing the whole group.
-            return []
-        return [
-            Sample(metric="anomaly_composite_score", labels=labels, value=composite_score),
-            Sample(
-                metric="anomaly_composite_outside_threshold",
-                labels=labels,
-                value=1.0 if fires else 0.0,
-            ),
-        ]
-
     def _series_labels(
         self,
         group: GroupConfig,
@@ -1811,6 +1380,8 @@ class Runner:
         series: QuerySeries,
         plan: _DetectorPlan,
         extras: dict[str, str] | None = None,
+        *,
+        filtered_labels: dict[str, str] | None = None,
     ) -> tuple[tuple[str, str], ...]:
         # Output-label filtering: explicit drop wins, then allow restricts
         # to an explicit set. The canonical labels (id, group, detector,
@@ -1818,7 +1389,16 @@ class Runner:
         # carries opt-in labels (e.g. ``best_detector`` for auto-select)
         # that bypass the allow/drop filter because they are tool-private
         # and feature-gated.
-        src = self._filter_source_labels(series.labels)
+        #
+        # ``filtered_labels`` lets callers pass an already-filtered copy
+        # of ``series.labels`` so a per-series fan-out doesn't re-filter
+        # once per detector plan — the runner threads it through from
+        # ``_score_series`` to amortise the allow/drop work.
+        src = (
+            filtered_labels
+            if filtered_labels is not None
+            else self._filter_source_labels(series.labels)
+        )
         result: dict[str, str] = dict(src)
         result["id"] = query.id
         result["group"] = group.name
@@ -1911,7 +1491,7 @@ class Runner:
             # sigma-multiplier threshold (typically 3.0) and its F1
             # collapses to 0. Honour the same per-detector ``threshold``
             # override the live-scoring path reads.
-            cal_threshold = _effective_threshold(plan, threshold_score)
+            cal_threshold = effective_threshold(plan.params, threshold_score)
             try:
                 # Match the kwarg-forwarding instantiation path used by
                 # ``_run_detector`` — without this, detectors that consume
@@ -1944,39 +1524,21 @@ class Runner:
                 new_cal,
             )
 
-    def _select_winner(
-        self,
-        group: GroupConfig,
-        query: QueryConfig,
-        series: QuerySeries,
-        plans: list[_DetectorPlan],
-    ) -> tuple[str, str | None] | None:
-        # Winner = detector with highest F1; ties broken by precision,
-        # then by config order so the result is deterministic.
-        best: tuple[str, str | None] | None = None
-        best_score: tuple[float, float, int] | None = None
-        for idx, plan in enumerate(plans):
-            cal: DetectorCalibration | None = self._store.get_calibration(
-                group.name, query.id, series.label_key, plan.name, plan.instance
-            )
-            if cal is None:
-                continue
-            # Higher idx loses on ties because we want config order to
-            # win; negate so the tuple comparison ranks idx ascending.
-            score_key = (cal.f1, cal.precision, -idx)
-            if best_score is None or score_key > best_score:
-                best_score = score_key
-                best = (plan.name, plan.instance)
-        return best
-
     def _filter_source_labels(self, labels: dict[str, str]) -> dict[str, str]:
         cfg = self._config.exporter.output_labels
-        out = dict(labels)
+        # ``allow_set`` / ``drop_set`` are :func:`functools.cached_property`
+        # on the model — the frozensets are built once per config load
+        # rather than once per filter call (10k series x 3 calls/series
+        # was material at scale).
+        if not cfg.allow and not cfg.drop:
+            return dict(labels)
         if cfg.allow:
-            allow = set(cfg.allow)
-            out = {k: v for k, v in out.items() if k in allow}
+            allow = cfg.allow_set
+            out = {k: v for k, v in labels.items() if k in allow}
+        else:
+            out = dict(labels)
         if cfg.drop:
-            drop = set(cfg.drop)
+            drop = cfg.drop_set
             out = {k: v for k, v in out.items() if k not in drop}
         return out
 
@@ -1999,6 +1561,64 @@ class Runner:
             ).set(elapsed)
 
 
+# Per-kind log emitters for stratified misconfigurations. Each
+# finding dict from :func:`collect_misconfigurations` is dispatched
+# through this map by ``kind`` so adding a fifth category is a single-
+# line addition rather than another ``elif`` branch.
+def _log_invalid_baseline_refresh(finding: dict[str, Any]) -> None:
+    logger.warning(
+        "stratified_baseline_refresh_invalid",
+        group=finding["group"],
+        query=finding["query"],
+        detector=finding["detector"],
+        instance=finding["instance"],
+        baseline_refresh_seconds=finding["baseline_refresh_seconds"],
+        note=(
+            "baseline_refresh_interval must be > 0; sliding-window "
+            "strategy disabled for this detector"
+        ),
+    )
+
+
+def _log_below_refresh_interval(finding: dict[str, Any]) -> None:
+    logger.warning(
+        "stratified_baseline_refresh_below_refresh_interval",
+        group=finding["group"],
+        query=finding["query"],
+        detector=finding["detector"],
+        instance=finding["instance"],
+        baseline_refresh_seconds=finding["baseline_refresh_seconds"],
+        refresh_interval_seconds=finding["refresh_interval_seconds"],
+        note=(
+            "baseline_refresh_interval shorter than "
+            "server.refresh_interval: cache always stale, heavy "
+            "fetch fires every refresh"
+        ),
+    )
+
+
+def _log_invalid_lookback(finding: dict[str, Any]) -> None:
+    logger.warning(
+        "stratified_lookback_invalid",
+        group=finding["group"],
+        query=finding["query"],
+        detector=finding["detector"],
+        instance=finding["instance"],
+        query_window_seconds=finding["query_window_seconds"],
+        note=(
+            "lookback must be > 0; sliding-window strategy "
+            "disabled and bucket baseline will be empty"
+        ),
+    )
+
+
+_MISCONFIG_LOGGERS: dict[str, Any] = {
+    "invalid_value": _log_invalid_baseline_refresh,
+    "below_refresh_interval": _log_below_refresh_interval,
+    "invalid_lookback": _log_invalid_lookback,
+}
+
+
 def _detector_window_for(plan: _DetectorPlan) -> float | None:
     """Thin wrapper around the shared stratified helper, bound to a plan."""
     return query_window_seconds_for(plan.cls, plan.params)
@@ -2009,69 +1629,39 @@ def _detector_baseline_refresh_for(plan: _DetectorPlan) -> float | None:
     return baseline_refresh_seconds_for(plan.cls, plan.params)
 
 
-def _query_has_stratified_detector(entry: DetectorEntry) -> bool:
-    """Best-effort: does this detector entry opt into the sliding-window strategy?
+# Re-exported under the historical private name so the cli package's
+# __all__ and any test monkeypatches keep working without churn.
+_build_detector = build_detector
 
-    Resolves the class via the registry; an unknown name resolves to
-    False so a misconfigured detector doesn't keep a stratified cache
-    entry alive across reload. The runner's unknown-detector handling
-    surfaces the bad reference at run time anyway.
+
+class _QueryVariant:
+    """Delegating wrapper used for discover-expanded query variants.
+
+    Overrides ``id`` and ``promql`` (the only fields the runner derives
+    per-expansion) and delegates every other attribute read back to the
+    underlying :class:`QueryConfig`. The pydantic alternative,
+    ``query.model_copy(update={...})``, re-validates the entire model
+    on every variant — at hundreds of fan-outs per refresh that was
+    the dominant per-tick allocation cost.
+
+    The ``_wrapped_query`` slot is deliberately namespaced out of any
+    plausible :class:`QueryConfig` field so a future schema addition
+    cannot collide with the wrapper's own state and silently break
+    the delegation.
     """
-    try:
-        cls = get(entry.name)
-    except Exception:
-        return False
-    merged: dict[str, Any] = dict(getattr(cls, "defaults", {}) or {})
-    merged.update(entry.params or {})
-    return (
-        query_window_seconds_for(cls, merged) is not None
-        and baseline_refresh_seconds_for(cls, merged) is not None
-    )
 
+    __slots__ = ("_wrapped_query", "id", "promql")
 
-def _stitch_series(base: QuerySeries | None, fresh: QuerySeries) -> QuerySeries:
-    """Combine a cached baseline window with the latest short window.
+    def __init__(self, query: QueryConfig, rendered_id: str, rendered_promql: str) -> None:
+        self._wrapped_query = query
+        self.id = rendered_id
+        self.promql = rendered_promql
 
-    Cached baseline samples whose timestamp is at or after the earliest
-    timestamp in the fresh window are dropped — the fresh fetch is the
-    source of truth for the overlap. New series (no cached baseline)
-    fall back to the short window unchanged; the detector then either
-    handles the small slice or surfaces ``insufficient_data`` per its
-    own contract.
-    """
-    if base is None or base.samples.empty:
-        return fresh
-    if fresh.samples.empty:
-        return base
-    earliest_fresh_ts = float(fresh.samples["timestamp"].iloc[0])
-    base_keep = base.samples[base.samples["timestamp"] < earliest_fresh_ts]
-    if base_keep.empty:
-        combined = fresh.samples.reset_index(drop=True)
-    else:
-        combined = pd.concat([base_keep, fresh.samples], ignore_index=True)
-    return QuerySeries(labels=dict(fresh.labels), samples=combined)
-
-
-def _effective_threshold(plan: _DetectorPlan, fallback: float) -> float:
-    """Resolve the alerting threshold for a detector plan.
-
-    A detector that handles its own threshold semantics (BOCPD's
-    probability score, future change-point detectors with non-sigma
-    scoring) declares a ``threshold`` value in its ``defaults`` /
-    ``param_spec``; the value flows through ``plan.params`` and the
-    runner uses it instead of the group-level
-    ``alert_thresholds.score``. Both the live-scoring path and the
-    calibration cycle resolve through this helper so they agree on the
-    cutoff — diverging here is the bug that makes BOCPD's auto-select
-    F1 collapse to zero.
-    """
-    raw = plan.params.get("threshold")
-    if raw is None:
-        return fallback
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return fallback
+    def __getattr__(self, name: str) -> Any:
+        # ``__getattr__`` only fires when normal lookup fails; ``id``,
+        # ``promql``, and ``_wrapped_query`` resolve from the slots above.
+        # Everything else is delegated to the underlying QueryConfig.
+        return getattr(self._wrapped_query, name)
 
 
 def _invoke_detector(
@@ -2095,31 +1685,9 @@ def _detector_factory_for(plan: _DetectorPlan) -> Any:
     """
 
     def factory() -> Detector:
-        return _build_detector(plan.cls, plan.params)
+        return build_detector(plan.cls, plan.params)
 
     return factory
-
-
-def _build_detector(cls: type[Detector], params: dict[str, Any]) -> Detector:
-    """Instantiate ``cls`` and forward any ``params`` the constructor accepts.
-
-    Detectors that take no constructor arguments (the historical
-    contract: read params off the ``params`` dict in ``fit_score``)
-    continue to work because we only filter for names ``__init__``
-    actually accepts. Detectors that declare matching keyword args
-    receive them as kwargs — the v0.2 "params forwarded as kwargs to
-    the detector's constructor" surface. The full params dict is also
-    handed to ``fit_score`` so both styles compose freely.
-    """
-    try:
-        sig = inspect.signature(cls)
-    except (TypeError, ValueError):
-        return cls()
-    accepts_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-    if accepts_kwargs:
-        return cls(**params)
-    matched = {k: v for k, v in params.items() if k in sig.parameters}
-    return cls(**matched) if matched else cls()
 
 
 __all__ = [

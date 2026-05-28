@@ -31,7 +31,7 @@ GAUSSIAN_CONSISTENCY: float = 1.4826
 _DEFAULT_TRIM_THRESHOLD: float = 3.0
 
 
-def _mad(values: np.ndarray, center: float) -> float:
+def _mad(values: np.ndarray[Any, Any], center: float) -> float:
     """Median absolute deviation about ``center``.
 
     Returns a small but non-zero floor when the window is degenerate

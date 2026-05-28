@@ -7,30 +7,30 @@ jobs only run on Mondays, business-hours error rates differ from
 overnight ones. A single (hour-of-day) MAD smears these together; the
 7x24 grid keeps them separate.
 
-Stratified does NOT mean forecasting. The detector scores the present
-against historical observations of the same (day-of-week, hour-of-day)
-bucket; it never predicts future values. The shared sliding-window
-fetch strategy (short window each refresh, long baseline window every
-``baseline_refresh_interval``) keeps the multi-week lookback affordable
-on the TSDB — see ``docs/scaling-stratified.md``.
+See :mod:`promanomaly.detectors.stratified_base` for the shared scoring
+pipeline; this module supplies the 2D-bucket coordinate computation.
 """
 
 from __future__ import annotations
 
-import math
 from typing import Any, ClassVar
 
 import numpy as np
-import pandas as pd
 
-from ..config import parse_duration
 from .base import ParamSpec
+from .stratified_base import StratifiedMADBase
 
 # Unix epoch (1970-01-01) was a Thursday. Python's ``datetime.weekday()``
 # returns 0 for Monday, so a Thursday at the epoch is weekday=3 — add 3
 # to ``days_since_epoch`` before reducing mod 7 to get the same value
 # without paying for ``datetime.fromtimestamp`` per sample.
 _EPOCH_WEEKDAY_OFFSET = 3
+
+# Safe upper bound on within-day bucket indices used to pack (day, hour)
+# into a single int code. ``bucket_width=1s`` gives 86_400 buckets; any
+# reasonable bucket_width gives far fewer. Multiplying by ``10**6``
+# leaves the int64 well within range and prevents day/hour collisions.
+_DAY_CODE_STRIDE = 1_000_000
 
 
 def _bucket_for_timestamp(ts: float, bucket_width_seconds: float) -> tuple[int, int]:
@@ -54,7 +54,7 @@ def _bucket_for_timestamp(ts: float, bucket_width_seconds: float) -> tuple[int, 
     return day, hour_bucket
 
 
-class DayOfWeekMAD:
+class DayOfWeekMAD(StratifiedMADBase):
     """Stratified MAD detector on a 7-day x N-bucket grid.
 
     Parameters (config ``params:``)
@@ -118,67 +118,9 @@ class DayOfWeekMAD:
         ),
     )
 
-    @classmethod
-    def query_window_seconds(cls, params: dict[str, Any]) -> float | None:
-        """Inform the runner this detector needs a multi-week query window."""
-        lookback = params.get("lookback", cls.defaults["lookback"])
-        try:
-            return float(parse_duration(lookback))
-        except (TypeError, ValueError):
-            return None
-
-    @classmethod
-    def baseline_refresh_interval_seconds(cls, params: dict[str, Any]) -> float | None:
-        """Cadence at which the multi-week baseline fetch may be reused.
-
-        Returning a value here opts the detector into the runner's
-        sliding-window strategy: the heavy long-history query runs once
-        per ``baseline_refresh_interval``, while every refresh still
-        fetches the latest short window and stitches it onto the cached
-        baseline before scoring. Detectors that return ``None`` (or omit
-        the method) keep the per-run full-window fetch behaviour.
-        """
-        raw = params.get("baseline_refresh_interval", cls.defaults["baseline_refresh_interval"])
-        try:
-            return float(parse_duration(raw))
-        except (TypeError, ValueError):
-            return None
-
-    def fit_score(
-        self,
-        df: pd.DataFrame,
-        freq: str,
-        params: dict[str, Any],
-    ) -> pd.DataFrame:
-        del freq
-        bucket_raw = params.get("bucket_width", self.defaults["bucket_width"])
-        try:
-            bucket_seconds = float(parse_duration(bucket_raw))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"DayOfWeekMAD.bucket_width must be a duration, got {bucket_raw!r}"
-            ) from exc
-        if bucket_seconds <= 0:
-            raise ValueError(f"DayOfWeekMAD.bucket_width must be positive, got {bucket_seconds}")
-        if not math.isclose(86400.0 % bucket_seconds, 0.0, abs_tol=1e-6) and not math.isclose(
-            86400.0 % bucket_seconds, bucket_seconds, abs_tol=1e-6
-        ):
-            raise ValueError(f"DayOfWeekMAD.bucket_width ({bucket_raw}) must divide 24h evenly")
-
-        timestamps = df["timestamp"].to_numpy(dtype=float, copy=False)
-        values = df["y"].to_numpy(dtype=float, copy=False)
-        latest_ts = float(timestamps[-1])
-        latest_y = float(values[-1])
-
-        latest_bucket = _bucket_for_timestamp(latest_ts, bucket_seconds)
-
-        # Build the same-bucket mask. Exclude the latest sample itself so
-        # we score it against history, never against itself.
-        history_ts = timestamps[:-1]
-        history_values = values[:-1]
-        if history_ts.size == 0:
-            return _zero_score_row(latest_ts, float(np.median(values)))
-
+    def _history_bucket_codes(
+        self, history_ts: np.ndarray[Any, Any], bucket_seconds: float
+    ) -> np.ndarray[Any, Any]:
         # Vectorised bucket assignment. A 4w * 15s-step series is
         # ~161k samples and the equivalent Python + datetime loop was
         # the dominant cost in this detector before vectorisation.
@@ -186,45 +128,13 @@ class DayOfWeekMAD:
         # unix epoch was a Thursday — pinned by
         # ``tests/test_stratified_bucket_vectorisation.py``.
         days_since_epoch = (history_ts // 86400.0).astype(np.int64)
-        history_dow = (days_since_epoch + _EPOCH_WEEKDAY_OFFSET) % 7
-        history_hour = (history_ts % 86400.0 // bucket_seconds).astype(np.int64)
-        mask = (history_dow == latest_bucket[0]) & (history_hour == latest_bucket[1])
-        same_bucket_values = history_values[mask]
+        dow = (days_since_epoch + _EPOCH_WEEKDAY_OFFSET) % 7
+        hour = (history_ts % 86400.0 // bucket_seconds).astype(np.int64)
+        return dow * _DAY_CODE_STRIDE + hour
 
-        if same_bucket_values.size == 0:
-            # Sparse-bucket fallback: not enough history for this cell
-            # yet (first Tuesday-3am after deployment). Score zero rather
-            # than fabricating one — the warmup / confidence path is the
-            # right place to surface "we don't have enough data".
-            return _zero_score_row(latest_ts, float(np.median(values)))
-
-        bucket_median = float(np.median(same_bucket_values))
-        bucket_mad = float(np.median(np.abs(same_bucket_values - bucket_median)))
-        score = 0.0 if bucket_mad == 0.0 else abs(latest_y - bucket_median) / bucket_mad
-
-        return pd.DataFrame(
-            [
-                {
-                    "timestamp": latest_ts,
-                    "score": score,
-                    "baseline": bucket_median,
-                    "is_outside": False,
-                }
-            ]
-        )
-
-
-def _zero_score_row(latest_ts: float, baseline: float) -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {
-                "timestamp": latest_ts,
-                "score": 0.0,
-                "baseline": baseline,
-                "is_outside": False,
-            }
-        ]
-    )
+    def _latest_bucket_code(self, latest_ts: float, bucket_seconds: float) -> int:
+        dow, hour = _bucket_for_timestamp(latest_ts, bucket_seconds)
+        return dow * _DAY_CODE_STRIDE + hour
 
 
 __all__ = ["DayOfWeekMAD"]

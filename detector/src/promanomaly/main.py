@@ -21,9 +21,7 @@ for the first full ``refresh_interval``.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import hashlib
-import hmac
 import json
 import signal
 from pathlib import Path
@@ -32,19 +30,18 @@ from typing import Any
 import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI
 
 from .cache import RedisQueryCache, TTLCache
-from .config import Config, ReloadAuthConfig, load_config
-from .detectors import list_meta
+from .config import Config, load_config
 from .exporter import Exporter, OperationalMetrics
-from .inspect import InspectError, inspect_series
-from .leader import LeaderElector, LeaseClient, resolve_identity
+from .ha import HAComponents, build_ha_components, run_follower_loop, stop_ha
+from .leader import resolve_identity
 from .logging import configure_logging, get_logger
 from .runner import Runner
+from .server import build_app as _build_app
 from .source import PromQLSource, QueryResult
-from .state import FollowerSyncer, SharedSnapshotCache, SnapshotStore
+from .state import SnapshotStore
 from .telemetry import Telemetry
 
 logger = get_logger(__name__)
@@ -92,10 +89,7 @@ class Application:
         # the scheduler path is identical to the single-replica MVP.
         self._ha_enabled = config.highAvailability.enabled
         self._is_leader = not self._ha_enabled
-        self._elector: LeaderElector | None = None
-        self._snapshot_cache: SharedSnapshotCache | None = None
-        self._follower_syncer: FollowerSyncer | None = None
-        self._follower_task: asyncio.Task[None] | None = None
+        self._ha: HAComponents | None = None
         # Per-group in-flight detection tasks. Holding the references
         # lets ``_on_stopped_leading`` cancel them on demotion so a
         # newly elected leader can't race with a write that started on
@@ -111,6 +105,17 @@ class Application:
         self._stamp_config_hash(config)
         if self._ha_enabled:
             self._ops.leader_elected.labels(instance=self._identity).set(0.0)
+        # Serialises reload() so a rapid SIGHUP + /-/reload pair cannot
+        # race two coroutines through config load + swap. Built lazily
+        # in reload() because asyncio.Lock binds to the running loop and
+        # Application can be constructed outside one (tests).
+        self._reload_lock: asyncio.Lock | None = None
+        # Guards the leader-check + snapshot-publish sequence so a task
+        # that finished run_group cannot publish after demotion flipped
+        # the flag. ``_on_stopped_leading`` flips ``_is_leader`` under
+        # the same lock before cancellation; once flipped, any in-flight
+        # publisher waiting here sees ``_is_leader=False`` and skips.
+        self._publish_lock: asyncio.Lock | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -134,109 +139,32 @@ class Application:
                 self._spawn(self._safe_group_run(group.name))
 
     async def shutdown(self) -> None:
-        if self._elector is not None:
-            await self._elector.stop()
-            self._elector = None
-        if self._follower_task is not None:
-            self._follower_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._follower_task
-            self._follower_task = None
+        await stop_ha(self._ha)
+        self._ha = None
         if self._scheduler is not None:
             self._scheduler.shutdown(wait=False)
             self._scheduler = None
         await self._source.close()
+        # Shut down the runner's thread pool so pending detector
+        # invocations don't outlive the process. wait=False mirrors the
+        # scheduler behaviour: in-flight detection runs are abandoned
+        # rather than allowed to complete (matching the per-detector
+        # cancellation contract documented in runner.py).
+        self._runner._executor.shutdown(wait=False)
         # Flush buffered OpenTelemetry spans before the process exits.
         # BatchSpanProcessor queues spans on a background thread; without
         # the explicit shutdown the last batch is dropped on rolling
         # restarts. No-op when telemetry was never enabled.
         self._telemetry.shutdown()
 
-    # ------------------------------------------------------------------
-    # Endpoints
-    # ------------------------------------------------------------------
     def build_app(self) -> FastAPI:
-        @contextlib.asynccontextmanager
-        async def lifespan(_: FastAPI) -> Any:
-            await self.startup()
-            try:
-                yield
-            finally:
-                await self.shutdown()
+        """Build the FastAPI app for this Application.
 
-        app = FastAPI(lifespan=lifespan, title="promanomaly")
-
-        @app.get("/healthz", response_class=PlainTextResponse)
-        async def healthz() -> str:
-            return "ok"
-
-        @app.get("/ready", response_class=PlainTextResponse)
-        async def ready() -> Response:
-            if not self._config.server.ready_endpoint:
-                return PlainTextResponse("ready endpoint disabled", status_code=404)
-            if self._store.any_group_ready():
-                return PlainTextResponse("ready", status_code=200)
-            return PlainTextResponse("not ready", status_code=503)
-
-        @app.get("/metrics")
-        async def metrics() -> Response:
-            body, content_type = self._exporter.render()
-            return Response(content=body, media_type=content_type)
-
-        @app.post("/-/reload")
-        async def reload_endpoint(request: Request) -> Response:
-            if not self._config.server.reload.enabled:
-                raise HTTPException(status_code=404, detail="reload disabled")
-            self._authorise_reload(request)
-            ok, detail = await self.reload()
-            if not ok:
-                return JSONResponse({"status": "error", "detail": detail}, status_code=400)
-            return JSONResponse({"status": "ok"})
-
-        @app.get("/debug/config")
-        async def debug_config() -> JSONResponse:
-            # Bounded, read-only view of the active config (no secrets).
-            return JSONResponse(self._safe_config_view())
-
-        @app.get("/debug/detectors")
-        async def debug_detectors() -> JSONResponse:
-            # Snapshot of the detector entry-point registry. Stable shape
-            # so the CLI ``detectors list --target`` can render it
-            # without negotiation; described in docs/detectors.md.
-            # ``defaults`` is a simple {name: default} dict kept for
-            # backwards compatibility; ``params`` is the canonical richer
-            # form with per-parameter type and doc.
-            return JSONResponse([m.as_dict() for m in list_meta()])
-
-        @app.get("/debug/inspect")
-        async def debug_inspect(
-            id: str,
-            labels: str | None = None,
-        ) -> JSONResponse:
-            # Live introspection for one (id, label-selector) series.
-            # Refetches the source query so the operator sees the same
-            # rolling window the detector would see right now. Bounded
-            # cost by the source-query budget and the per-detector
-            # compute cost — the NetworkPolicy shipped with the Helm
-            # chart denies ingress to /debug/* by default so this is
-            # only reachable inside the namespace.
-            try:
-                payload = await inspect_series(
-                    config=self._config,
-                    source=self._source,
-                    store=self._store,
-                    metric_id=id,
-                    label_selector=labels,
-                )
-            except InspectError as exc:
-                client_errors = {"bad_selector", "unknown_id", "discovery_templated"}
-                return JSONResponse(
-                    {"status": "error", "reason": exc.reason, "detail": exc.message},
-                    status_code=400 if exc.reason in client_errors else 500,
-                )
-            return JSONResponse(payload)
-
-        return app
+        Thin wrapper around :func:`promanomaly.server.build_app`; the
+        route definitions live there so the HTTP surface stays
+        testable independent of the scheduler / HA wiring.
+        """
+        return _build_app(self)
 
     # ------------------------------------------------------------------
     # Reload
@@ -245,48 +173,32 @@ class Application:
         """Re-read the config from disk, validate, and swap in atomically.
 
         Validation failure leaves the previous config running unchanged —
-        a fat-finger in the YAML never breaks the running detector.
+        a fat-finger in the YAML never breaks the running detector. The
+        lock serialises concurrent reload attempts (rapid SIGHUP +
+        ``/-/reload``) so the second arrival sees the already-swapped
+        config rather than racing on disk reads.
         """
-        try:
-            new_config = load_config(self._config_path)
-        except Exception as exc:
-            logger.error("reload_validation_failed", error=str(exc))
-            return False, f"validation failed: {exc}"
+        if self._reload_lock is None:
+            self._reload_lock = asyncio.Lock()
+        async with self._reload_lock:
+            try:
+                new_config = load_config(self._config_path)
+            except Exception as exc:
+                logger.error("reload_validation_failed", error=str(exc))
+                return False, f"validation failed: {exc}"
 
-        self._runner.replace_config(new_config)
-        self._source.replace_cache(_build_query_cache(new_config, self._redis))
-        self._config = new_config
-        self._stamp_config_hash(new_config)
-        if self._scheduler is not None:
-            self._reschedule_jobs(self._scheduler)
-        # Trigger an immediate run for any groups that may have changed,
-        # mirroring the boot-time first-run pattern.
-        for group in new_config.groups:
-            self._spawn(self._safe_group_run(group.name))
-        logger.info("reload_complete")
-        return True, "ok"
-
-    def _authorise_reload(self, request: Request) -> None:
-        auth = self._config.server.reload.auth
-        if auth.type == "none":
-            return
-        if auth.type == "bearer":
-            self._authorise_bearer(request, auth)
-            return
-        # mTLS is enforced by the ingress / NetworkPolicy in practice;
-        # we accept the request if reached because the TLS handshake
-        # would have failed upstream otherwise.
-
-    @staticmethod
-    def _authorise_bearer(request: Request, auth: ReloadAuthConfig) -> None:
-        if not auth.token:
-            raise HTTPException(status_code=401, detail="unauthorised")
-        header = request.headers.get("authorization", "")
-        expected = f"Bearer {auth.token}"
-        # Constant-time comparison — short-circuiting on the first
-        # differing byte leaks token length to a timing side-channel.
-        if not hmac.compare_digest(header.encode("utf-8"), expected.encode("utf-8")):
-            raise HTTPException(status_code=401, detail="unauthorised")
+            self._runner.replace_config(new_config)
+            self._source.replace_cache(_build_query_cache(new_config, self._redis))
+            self._config = new_config
+            self._stamp_config_hash(new_config)
+            if self._scheduler is not None:
+                self._reschedule_jobs(self._scheduler)
+            # Trigger an immediate run for any groups that may have
+            # changed, mirroring the boot-time first-run pattern.
+            for group in new_config.groups:
+                self._spawn(self._safe_group_run(group.name))
+            logger.info("reload_complete")
+            return True, "ok"
 
     # ------------------------------------------------------------------
     # Scheduling
@@ -343,18 +255,18 @@ class Application:
                 return
             # Publish to the shared cache so followers see the same data.
             # In single-replica mode this branch is skipped (snapshot_cache
-            # is only built when HA is enabled). The leader check guards
-            # against a publish racing with a demotion that happened
-            # mid-run — the cooldown is the primary defence but the flag
-            # check is cheap insurance.
-            if (
-                result.succeeded
-                and self._snapshot_cache is not None
-                and (not self._ha_enabled or self._is_leader)
-            ):
+            # is only built when HA is enabled). The publish_lock makes
+            # the leader-check + publish atomic with respect to
+            # ``_on_stopped_leading``: once demotion has flipped
+            # ``_is_leader`` under the lock, any task waiting here on
+            # the same lock observes the new value and skips the publish.
+            if result.succeeded and self._ha is not None:
                 snapshot = self._store.get(group_name)
                 if snapshot is not None:
-                    self._snapshot_cache.publish(snapshot)
+                    lock = self._ensure_publish_lock()
+                    async with lock:
+                        if not self._ha_enabled or self._is_leader:
+                            self._ha.snapshot_cache.publish(snapshot)
         finally:
             if task is not None:
                 tasks = self._running_group_tasks.get(group_name)
@@ -384,26 +296,22 @@ class Application:
         """
         if self._redis is None:
             raise RuntimeError("highAvailability.enabled requires safety.redis to be configured")
-        self._snapshot_cache = SharedSnapshotCache(
-            client=self._redis,
-            ttl_seconds=self._config.highAvailability.snapshot_ttl_seconds,
-            key_prefix=f"{self._config.safety.redis.key_prefix}:snapshot",
-        )
-        self._follower_syncer = FollowerSyncer(store=self._store, shared=self._snapshot_cache)
-        ha = self._config.highAvailability
-        self._elector = LeaderElector(
-            ha=ha,
+        self._ha = build_ha_components(
+            config=self._config.highAvailability,
+            redis_config=self._config.safety.redis,
+            redis_client=self._redis,
+            store=self._store,
             identity=self._identity,
-            client=LeaseClient(
-                namespace=ha.lease_namespace,
-                name=ha.lease_name,
-                lease_duration_seconds=int(ha.lease_duration_seconds),
-            ),
             on_started_leading=self._on_started_leading,
             on_stopped_leading=self._on_stopped_leading,
         )
-        self._elector.start()
-        self._follower_task = asyncio.create_task(self._follower_loop())
+        self._ha.elector.start()
+        self._ha.follower_task = asyncio.create_task(
+            run_follower_loop(
+                self._ha.follower_syncer,
+                self._config.server.refresh_interval_seconds / 2.0,
+            )
+        )
 
     async def _on_started_leading(self) -> None:
         """Become leader: kick off an immediate run for every group.
@@ -437,7 +345,14 @@ class Application:
         The newly-elected leader will reproduce the same scores from
         the same source on its own immediate first run.
         """
-        self._is_leader = False
+        # Flip the leader flag under the publish lock so a task already
+        # past run_group but waiting on the lock sees False and skips
+        # its publish. Without this guard the synchronous test+publish
+        # sequence between ``_is_leader`` and ``snapshot_cache.publish``
+        # could slip through after demotion.
+        lock = self._ensure_publish_lock()
+        async with lock:
+            self._is_leader = False
         self._ops.leader_elected.labels(instance=self._identity).set(0.0)
         cancelled: list[asyncio.Task[None]] = [
             task for tasks in self._running_group_tasks.values() for task in tasks
@@ -457,28 +372,6 @@ class Application:
             cancelled_tasks=len(cancelled),
         )
         await asyncio.sleep(cooldown)
-
-    async def _follower_loop(self) -> None:
-        """Poll the shared snapshot cache and refresh the local store.
-
-        Sleeps ``refresh_interval / 2`` between polls so followers see a
-        new snapshot within one polling interval of the leader publishing
-        it. Errors are logged and the loop continues — a Redis blip
-        leaves followers serving the previous snapshot rather than going
-        blank.
-        """
-        if self._follower_syncer is None:
-            return
-        interval = max(1.0, self._config.server.refresh_interval_seconds / 2.0)
-        while True:
-            try:
-                await asyncio.to_thread(self._follower_syncer.poll_once)
-            except Exception as exc:
-                logger.warning("follower_poll_failed", error=str(exc))
-            try:
-                await asyncio.sleep(interval)
-            except asyncio.CancelledError:
-                return
 
     def _install_signal_handlers(self) -> None:
         """Wire SIGHUP -> ``self.reload`` through the running event loop.
@@ -503,6 +396,15 @@ class Application:
         logger.info("sighup_received")
         self._spawn(self.reload())
 
+    def _ensure_publish_lock(self) -> asyncio.Lock:
+        # asyncio.Lock binds to the running loop, so we can't build it
+        # in __init__ (Application is constructed in tests outside a
+        # loop). Lazily build on first use; safe because callers are
+        # always inside the runner's event loop.
+        if self._publish_lock is None:
+            self._publish_lock = asyncio.Lock()
+        return self._publish_lock
+
     # ------------------------------------------------------------------
     # Misc helpers
     # ------------------------------------------------------------------
@@ -512,25 +414,6 @@ class Application:
         ).hexdigest()
         self._ops.config_hash.clear()
         self._ops.config_hash.labels(sha256=digest).set(1.0)
-
-    def _safe_config_view(self) -> dict[str, Any]:
-        view = self._config.model_dump(mode="json")
-        # Strip anything that smells like a secret.
-        for sensitive in ("token", "password"):
-            self._scrub_keys(view, sensitive)
-        return view
-
-    @classmethod
-    def _scrub_keys(cls, obj: Any, key: str) -> None:
-        if isinstance(obj, dict):
-            for k in list(obj):
-                if k == key and obj[k] not in (None, ""):
-                    obj[k] = "<redacted>"
-                else:
-                    cls._scrub_keys(obj[k], key)
-        elif isinstance(obj, list):
-            for item in obj:
-                cls._scrub_keys(item, key)
 
 
 # ----------------------------------------------------------------------
@@ -620,7 +503,7 @@ def serve(config_path: str | Path) -> None:
             note="refresh_interval below window/6 — rolling baseline lags",
         )
     application = Application(config, config_path)
-    app = application.build_app()
+    app = _build_app(application)
     host, port = _parse_listen(config.server.listen)
 
     config_obj = uvicorn.Config(

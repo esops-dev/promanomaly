@@ -20,7 +20,7 @@ import pandas as pd
 from .base import ParamSpec
 
 
-def _ewma_mean_var(values: np.ndarray, alpha: float) -> tuple[float, float]:
+def _ewma_mean_var(values: np.ndarray[Any, Any], alpha: float) -> tuple[float, float]:
     """Compute EWMA mean and EWMA variance over ``values``.
 
     Uses the standard incremental update so the result matches what an

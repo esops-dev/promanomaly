@@ -273,30 +273,14 @@ def test_effective_threshold_helper_round_trip() -> None:
     """The runner exposes a small helper that both the live-scoring and
     the calibration paths call. They MUST agree on the threshold or
     auto-select picks losers — assert the helper's contract directly."""
-    from promanomaly.detectors import get as get_detector
-    from promanomaly.runner import _DetectorPlan, _effective_threshold
+    from promanomaly.plan import effective_threshold
 
-    bocpd_plan = _DetectorPlan(
-        name="BOCPD",
-        instance=None,
-        cls=get_detector("BOCPD"),
-        params={"hazard": 250, "threshold": 0.5, "lag": 15},
-    )
-    mad_plan = _DetectorPlan(
-        name="MAD",
-        instance=None,
-        cls=get_detector("MAD"),
-        params={},
-    )
     # Per-detector override wins.
-    assert _effective_threshold(bocpd_plan, 3.0) == 0.5
+    assert effective_threshold({"hazard": 250, "threshold": 0.5, "lag": 15}, 3.0) == 0.5
     # No override -> falls back to the group threshold.
-    assert _effective_threshold(mad_plan, 3.0) == 3.0
+    assert effective_threshold({}, 3.0) == 3.0
     # Garbage override -> fallback rather than crash.
-    bad_plan = _DetectorPlan(
-        name="X", instance=None, cls=type, params={"threshold": "not a number"}
-    )
-    assert _effective_threshold(bad_plan, 3.0) == 3.0
+    assert effective_threshold({"threshold": "not a number"}, 3.0) == 3.0
 
 
 @pytest.mark.asyncio

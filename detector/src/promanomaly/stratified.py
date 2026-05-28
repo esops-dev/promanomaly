@@ -58,6 +58,26 @@ def query_window_seconds_for(cls: type[Any], params: dict[str, Any]) -> float | 
     return raw
 
 
+def detector_input_window_seconds(
+    cls: type[Any], params: dict[str, Any], default_seconds: float
+) -> float:
+    """Resolve the rolling-window size one detector wants to see.
+
+    Used by both the runner (per-detector slicing inside a wider fetch)
+    and inspect (live introspection). Stratified detectors expose
+    ``query_window_seconds`` to claim a longer history; plain rolling
+    detectors fall back to ``default_seconds`` so MAD on the same query
+    as HourOfDayMAD scores on the group default rather than the 7d
+    fetch the runner pulled to satisfy HourOfDayMAD.
+
+    Defensive: a buggy detector that raises from ``query_window_seconds``
+    returns the default rather than crashing the caller (matches the
+    swallow-and-fall-back semantics of :func:`query_window_seconds_for`).
+    """
+    override = query_window_seconds_for(cls, params)
+    return override if override is not None else default_seconds
+
+
 def query_window_seconds_raw_for(cls: type[Any], params: dict[str, Any]) -> float | None:
     """Raw read of ``query_window_seconds``, no value gating.
 
@@ -254,6 +274,7 @@ __all__ = [
     "baseline_refresh_seconds_for",
     "baseline_refresh_seconds_raw_for",
     "collect_misconfigurations",
+    "detector_input_window_seconds",
     "query_window_seconds_for",
     "query_window_seconds_raw_for",
     "stratified_cost_summary",

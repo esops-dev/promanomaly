@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import itertools
 import re
+import string as _string
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -47,21 +48,28 @@ class DiscoveryError(RuntimeError):
         self.message = message
 
 
-# Characters that would break PromQL label-value quoting when substituted
-# raw into the template. Prometheus permits these inside a properly
-# escaped label value, but our naive substitution does no escaping; a
-# value containing ``"`` would close the label string early and produce
-# either a broken query (``instance="foo"bar"``) or, worse, a query
-# that parses against a different label than the operator intended.
-# Rejecting the value at probe time is safer than silently filtering or
-# escaping — discovery targeting a label that genuinely needs quoting
-# is almost certainly an operator mistake.
-_UNSAFE_VALUE_CHARS = ('"', "\\", "\n", "\r", "\t")
+# Positive allowlist for characters that may be substituted verbatim
+# into a PromQL template. Our naive substitution does no escaping, so
+# anything outside this set is either a PromQL meta-character (``"``,
+# ``\``, whitespace) or an unusual code point (Unicode bidi marks,
+# combining diacritics, control characters) that could break quoting
+# in non-obvious ways. Discovery targeting a label that genuinely
+# contains such characters is almost always an operator mistake; we
+# reject at probe time rather than silently filtering or escaping.
+#
+# The allowlist matches what operators conventionally use for instance
+# / job / cluster labels: ASCII alphanumerics + a small set of
+# punctuation common in DNS / k8s identifiers. Empty strings are also
+# rejected since they would expand into ``instance=""`` which matches
+# everything.
+_SAFE_VALUE_CHARS = frozenset(_string.ascii_letters + _string.digits + "-_.:/")
 
 
 def is_safe_discovered_value(value: str) -> bool:
     """True iff ``value`` can be substituted verbatim into a PromQL template."""
-    return not any(ch in value for ch in _UNSAFE_VALUE_CHARS)
+    if not value:
+        return False
+    return all(ch in _SAFE_VALUE_CHARS for ch in value)
 
 
 def render_template(template: str, bindings: dict[str, str]) -> str:

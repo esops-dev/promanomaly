@@ -22,11 +22,22 @@ which is in use:
 from __future__ import annotations
 
 import contextlib
+import itertools
 import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
+
+# Monotonic counter handed out to each cache instance on construction.
+# The exporter watches ``cache.version`` to detect reload-driven cache
+# swaps without relying on ``id()`` (which Python is free to recycle
+# once the old cache is GC'd).
+_VERSION_COUNTER = itertools.count(1)
+
+
+def _next_version() -> int:
+    return next(_VERSION_COUNTER)
 
 
 @dataclass
@@ -60,6 +71,7 @@ class TTLCache[K, V]:
         # OrderedDict gives us O(1) LRU bookkeeping via move_to_end.
         self._entries: OrderedDict[K, tuple[float, V]] = OrderedDict()
         self.stats = CacheStats()
+        self.version: int = _next_version()
 
     @property
     def ttl_seconds(self) -> float:
@@ -142,6 +154,7 @@ class RedisQueryCache[K, V]:
         self._prefix = key_prefix
         self._lock = threading.RLock()
         self.stats = CacheStats()
+        self.version: int = _next_version()
         # Cached size + the wall-clock the cache was last refreshed.
         # Read under ``_lock`` since /metrics renders concurrently with
         # detector runs in HA mode.

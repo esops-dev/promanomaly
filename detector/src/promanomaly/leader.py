@@ -336,8 +336,7 @@ class LeaderElector:
 
     def _renew_interval(self) -> float:
         # Re-attempt renewal at roughly one-third of the lease duration
-        # — same heuristic as controller-runtime's helper. Keeps us well
-        # inside the renew_deadline window.
+        # — same heuristic as controller-runtime's helper.
         return max(1.0, self._ha.lease_duration_seconds / 3.0)
 
     async def _wait(self, seconds: float) -> None:
