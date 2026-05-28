@@ -114,6 +114,19 @@
         }
       }
     },
+    "telemetry": {
+      "type": "object",
+      "properties": {
+        "otlp": {
+          "type": "object",
+          "properties": {
+            "endpoint": {"type": ["string", "null"]},
+            "insecure": {"type": "boolean"},
+            "service_name": {"type": "string"}
+          }
+        }
+      }
+    },
     "groups": {"type": "array"},
     "existingConfigMap": {"type": "string"},
     "service": {"type": "object"},

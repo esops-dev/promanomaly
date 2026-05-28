@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import structlog
 
@@ -38,6 +39,14 @@ from .config import (
     QueryConfig,
 )
 from .detectors import Detector, UnknownDetectorError, get
+from .detectors.cohort import (
+    _PARAM_COHORT_MAD,
+    _PARAM_COHORT_MEDIAN,
+    _PARAM_COHORT_SIZE,
+    cohort_key_for,
+    compute_cohort_baseline,
+    is_cohort_aware,
+)
 from .discovery import (
     DiscoveryError,
     ExpandedQuery,
@@ -53,6 +62,7 @@ from .stratified import (
     collect_misconfigurations,
     query_window_seconds_for,
 )
+from .telemetry import Telemetry
 
 logger = structlog.get_logger(__name__)
 
@@ -106,6 +116,39 @@ class _GroupInnerResult:
     # that fetched successfully but returned zero series still counts
     # here — the run produced fresh information about that query.
     queries_succeeded: int = 0
+
+
+@dataclass(frozen=True)
+class _CohortBaseline:
+    """Per-cohort cross-member median + MAD precomputed by the runner.
+
+    Built once per ``(plan, cohort_key)`` before scoring loops over the
+    cohort's members so every member sees the same baseline. Stored
+    frozen because the runner threads it through several layers and
+    accidental mutation would silently corrupt subsequent members'
+    scores.
+    """
+
+    cohort_median: float
+    cohort_mad: float
+    size: int
+
+
+@dataclass
+class _CohortContext:
+    """All cohort baselines for one query run, indexed by plan + cohort key.
+
+    Cohort-aware plans look up their per-series baseline via
+    ``baselines[(plan.name, plan.instance), cohort_key]``. ``label_by_plan``
+    records the resolved ``cohort_label`` per plan so the runner can stamp
+    the opt-in ``cohort_label`` output label on emitted samples.
+    """
+
+    baselines: dict[
+        tuple[tuple[str, str | None], tuple[tuple[str, str], ...]],
+        _CohortBaseline,
+    ] = field(default_factory=dict)
+    label_by_plan: dict[tuple[str, str | None], str] = field(default_factory=dict)
 
 
 @dataclass
@@ -175,11 +218,16 @@ class Runner:
         operational: OperationalMetrics,
         *,
         executor: concurrent.futures.ThreadPoolExecutor | None = None,
+        telemetry: Telemetry | None = None,
     ) -> None:
         self._config = config
         self._source = source
         self._store = store
         self._ops = operational
+        # OpenTelemetry tracing is optional and zero-overhead when disabled.
+        # ``Telemetry.disabled()`` returns a singleton with no-op spans so
+        # callers can ``with self._telemetry.span(...)`` unconditionally.
+        self._telemetry = telemetry or Telemetry.disabled()
         # CPU-bound detector work runs in this pool. Sized to ``nproc``
         # with a floor of 2 so dev boxes always have headroom; user-
         # supplied executors override the default for tests.
@@ -328,7 +376,11 @@ class Runner:
             result = GroupRunResult(group=group_name)
             source_failed = False
             try:
-                inner = await self._run_group_inner(group)
+                with self._telemetry.span(
+                    "promanomaly.group_run",
+                    group=group_name,
+                ):
+                    inner = await self._run_group_inner(group)
                 result.samples = inner.samples
                 result.series_count = inner.series_count
                 result.dropped = inner.dropped
@@ -593,11 +645,11 @@ class Runner:
             )
 
     def surface_misconfigurations(self) -> None:
-        """Log boot / reload / leader-acquisition warnings for stratified config.
+        """Log boot / reload / leader-acquisition warnings for risky config.
 
-        Three categories are surfaced; all keep the runner alive because
-        the safe fallback (no stratified strategy) is strictly better
-        than refusing to start:
+        Categories surfaced; all keep the runner alive because the safe
+        fallback (degraded behaviour) is strictly better than refusing
+        to start:
 
         - ``invalid_value`` — ``baseline_refresh_interval`` resolves to
           a non-positive number; the strategy silently degrades to the
@@ -607,6 +659,10 @@ class Runner:
           and the heavy long-history query fires every refresh.
         - ``invalid_lookback`` — ``query_window_seconds`` resolves to
           a non-positive number; the bucket baseline collapses.
+        - ``cohort_with_auto_select`` — a Cohort plan in a group with
+          ``auto_select: true`` would be silently suppressed because
+          calibration is skipped for cohort-aware detectors and the
+          winner-picking falls back to a single-series detector.
 
         Public surface because the HA leader-acquisition callback
         calls it directly: followers stay quiet so a cluster only sees
@@ -618,6 +674,39 @@ class Runner:
 
         def _resolve(name: str) -> type[Any]:
             return get(name)
+
+        # Cohort + ``auto_select: true`` warning: the runner skips the
+        # calibration cycle for cohort-aware plans so they have no F1
+        # to compare against. Combined with auto_select's "winner-only"
+        # emission rule, that silently drops the Cohort output. Only
+        # the literal ``True`` form trips this; ``explicit_plus_best``
+        # emits every detector and is fine.
+        for group in self._config.groups:
+            if group.auto_select is not True:
+                continue
+            for query in group.queries:
+                for entry in query.detectors:
+                    try:
+                        cls = _resolve(entry.name)
+                    except UnknownDetectorError:
+                        continue
+                    if is_cohort_aware(cls):
+                        logger.warning(
+                            "cohort_with_auto_select_true",
+                            group=group.name,
+                            query=query.id,
+                            detector=entry.name,
+                            instance=entry.instance,
+                            note=(
+                                "Cohort-aware detectors do not participate "
+                                "in the synthetic-injection calibration "
+                                "cycle, so auto_select: true silently "
+                                "suppresses their output. Use "
+                                "auto_select: false or "
+                                "auto_select: 'explicit_plus_best', or "
+                                "split Cohort into its own group."
+                            ),
+                        )
 
         findings = collect_misconfigurations(
             self._config.groups,
@@ -856,12 +945,17 @@ class Runner:
         )
 
         try:
-            qresult, plans = await self._fetch_and_plan(
-                group,
-                effective_query,
-                inflight_series_count=out.series_count,
-                template_query=query,
-            )
+            with self._telemetry.span(
+                "promanomaly.query",
+                group=group.name,
+                query=effective_query.id,
+            ):
+                qresult, plans = await self._fetch_and_plan(
+                    group,
+                    effective_query,
+                    inflight_series_count=out.series_count,
+                    template_query=query,
+                )
         except SourceQueryError as exc:
             logger.warning(
                 "source_query_failed",
@@ -926,6 +1020,12 @@ class Runner:
                     )
                 )
 
+        # Cohort detectors need cross-member visibility. Build the
+        # per-cohort baseline once here (rather than re-deriving it per
+        # member) so every member sees the same numbers. Cheap no-op
+        # when no plan in the query opts into ``cohort_aware``.
+        cohort_context = self._build_cohort_context(plans, qresult.series)
+
         for series in qresult.series:
             out.series_count += 1
             produced = await self._score_series(
@@ -934,6 +1034,7 @@ class Runner:
                 plans=plans,
                 series=series,
                 defaults=defaults,
+                cohort_context=cohort_context,
             )
             out.samples.extend(produced)
 
@@ -1190,6 +1291,70 @@ class Runner:
             return samples.tail(1).reset_index(drop=True)
         return sliced.reset_index(drop=True)
 
+    def _build_cohort_context(
+        self,
+        plans: list[_DetectorPlan],
+        series_list: list[QuerySeries],
+    ) -> _CohortContext:
+        """Pre-compute cohort baselines for every cohort-aware plan.
+
+        For each cohort-aware plan, partitions ``series_list`` by
+        ``cohort_key`` (all labels except the configured ``cohort_label``)
+        and computes the cross-member median + MAD for each cohort that
+        meets ``min_cohort_size``. Cohorts below the floor produce no
+        entry — the Cohort detector observes the absence and emits a
+        zero-score row, which the runner forwards as ``anomaly_score=0``.
+
+        Costs are bounded by ``safety.max_series_per_query``; on a 1000-
+        series query the inner numpy work is microseconds.
+        """
+        context = _CohortContext()
+        if not series_list:
+            return context
+
+        for plan in plans:
+            if not is_cohort_aware(plan.cls):
+                continue
+            cohort_label = str(
+                plan.params.get(
+                    "cohort_label",
+                    getattr(plan.cls, "defaults", {}).get("cohort_label", "instance"),
+                )
+            )
+            try:
+                min_size = int(
+                    plan.params.get(
+                        "min_cohort_size",
+                        getattr(plan.cls, "defaults", {}).get("min_cohort_size", 5),
+                    )
+                )
+            except (TypeError, ValueError):
+                min_size = 5
+            context.label_by_plan[(plan.name, plan.instance)] = cohort_label
+
+            # Partition series by cohort key.
+            buckets: dict[tuple[tuple[str, str], ...], list[np.ndarray]] = {}
+            for series in series_list:
+                if not series.samples.shape[0]:
+                    continue
+                key = cohort_key_for(series.labels, cohort_label)
+                values = series.samples["y"].to_numpy(dtype=float, copy=False)
+                buckets.setdefault(key, []).append(values)
+
+            for cohort_key, member_arrays in buckets.items():
+                if len(member_arrays) < min_size:
+                    continue
+                baseline = compute_cohort_baseline(member_arrays)
+                if baseline is None:
+                    continue
+                cohort_median, cohort_mad = baseline
+                context.baselines[((plan.name, plan.instance), cohort_key)] = _CohortBaseline(
+                    cohort_median=cohort_median,
+                    cohort_mad=cohort_mad,
+                    size=len(member_arrays),
+                )
+        return context
+
     async def _score_series(
         self,
         *,
@@ -1198,6 +1363,7 @@ class Runner:
         plans: list[_DetectorPlan],
         series: QuerySeries,
         defaults: DefaultsConfig,
+        cohort_context: _CohortContext | None = None,
     ) -> list[Sample]:
         thresholds = query.alert_thresholds or defaults.alert_thresholds
         threshold_score = thresholds.score
@@ -1255,8 +1421,35 @@ class Runner:
             # surfacing a ``threshold`` parameter; everyone else falls back
             # to the query/group threshold.
             effective_threshold = _effective_threshold(plan, threshold_score)
+            # Cohort-aware plans get their per-cohort baseline stamped
+            # into a copy of plan.params before scoring. Lookups missing
+            # in ``cohort_context`` (too-small cohorts) leave the params
+            # untouched; the Cohort detector observes the absent baseline
+            # and emits a zero-score row. Cohort label is captured here so
+            # ``_format_detector_samples`` can stamp the opt-in
+            # ``cohort_label`` output label.
+            effective_plan = plan
+            cohort_label_extra: str | None = None
+            if cohort_context is not None and is_cohort_aware(plan.cls):
+                plan_key = (plan.name, plan.instance)
+                cohort_label = cohort_context.label_by_plan.get(plan_key)
+                if cohort_label is not None:
+                    cohort_key = cohort_key_for(series.labels, cohort_label)
+                    baseline = cohort_context.baselines.get((plan_key, cohort_key))
+                    cohort_label_extra = cohort_label
+                    if baseline is not None:
+                        params_copy = dict(plan.params)
+                        params_copy[_PARAM_COHORT_MEDIAN] = baseline.cohort_median
+                        params_copy[_PARAM_COHORT_MAD] = baseline.cohort_mad
+                        params_copy[_PARAM_COHORT_SIZE] = baseline.size
+                        effective_plan = _DetectorPlan(
+                            name=plan.name,
+                            instance=plan.instance,
+                            cls=plan.cls,
+                            params=params_copy,
+                        )
             try:
-                score_row = await self._run_detector(plan, series)
+                score_row = await self._run_detector(effective_plan, series)
             except concurrent.futures.TimeoutError:
                 logger.warning(
                     "detector_timeout",
@@ -1295,6 +1488,7 @@ class Runner:
                 min_rel=min_rel,
                 defaults=defaults,
                 mark_as_winner=is_winner,
+                cohort_label_extra=cohort_label_extra,
             )
             outcomes.append(_DetectorOutcome(plan=plan, score=score, outside=outside))
             if emit_samples:
@@ -1317,28 +1511,33 @@ class Runner:
         loop = asyncio.get_running_loop()
         detector = _build_detector(plan.cls, plan.params)
         sliced = self._slice_for_detector(plan, series.samples, self._config.defaults)
-        future = loop.run_in_executor(
-            self._executor,
-            _invoke_detector,
-            detector,
-            sliced,
-            plan.params,
-        )
-        started = time.monotonic()
-        try:
-            df = await asyncio.wait_for(future, timeout=timeout)
-        except TimeoutError as exc:
-            future.cancel()
+        with self._telemetry.span(
+            "promanomaly.detect",
+            detector=plan.name,
+            window=int(self._detector_input_window_seconds(plan, self._config.defaults)),
+        ):
+            future = loop.run_in_executor(
+                self._executor,
+                _invoke_detector,
+                detector,
+                sliced,
+                plan.params,
+            )
+            started = time.monotonic()
+            try:
+                df = await asyncio.wait_for(future, timeout=timeout)
+            except TimeoutError as exc:
+                future.cancel()
+                self._detect_durations[plan.name] = self._detect_durations.get(plan.name, 0.0) + (
+                    time.monotonic() - started
+                )
+                raise concurrent.futures.TimeoutError("detector timeout") from exc
             self._detect_durations[plan.name] = self._detect_durations.get(plan.name, 0.0) + (
                 time.monotonic() - started
             )
-            raise concurrent.futures.TimeoutError("detector timeout") from exc
-        self._detect_durations[plan.name] = self._detect_durations.get(plan.name, 0.0) + (
-            time.monotonic() - started
-        )
-        if df.empty:
-            raise RuntimeError(f"detector {plan.name} returned no rows")
-        return df.iloc[-1]
+            if df.empty:
+                raise RuntimeError(f"detector {plan.name} returned no rows")
+            return df.iloc[-1]
 
     def _warmup_samples(
         self,
@@ -1399,6 +1598,7 @@ class Runner:
         min_rel: float,
         defaults: DefaultsConfig,
         mark_as_winner: bool = False,
+        cohort_label_extra: str | None = None,
     ) -> tuple[float, bool, list[Sample]]:
         """Return ``(score, outside, samples)`` for one detector run.
 
@@ -1412,6 +1612,13 @@ class Runner:
             # auto-select winner for this series. Opt-in labels are
             # non-breaking per the project's API contract.
             extras["best_detector"] = plan.name
+        if cohort_label_extra is not None:
+            # Opt-in label emitted by the Cohort detector exclusively
+            # (set by the runner when a cohort-aware plan scored this
+            # series). Carries the *name* of the source label that
+            # varies across cohort members so operators can join the
+            # composite output against the source signal easily.
+            extras["cohort_label"] = cohort_label_extra
         labels = self._series_labels(group, query, series, plan, extras=extras)
         score = float(score_row.get("score", 0.0))
         baseline = float(score_row.get("baseline", 0.0))
@@ -1642,6 +1849,13 @@ class Runner:
         ttl = group.auto_select_interval_seconds
         now = time.time()
         for plan in plans:
+            # Cohort-aware plans never get a calibration record because
+            # the synthetic-injection cycle can't reach across members
+            # of the cohort. Without this guard, the runner would think
+            # calibration was "due" every single tick and burn CPU on a
+            # refresh path that immediately bails out per plan.
+            if is_cohort_aware(plan.cls):
+                continue
             cal = self._store.get_calibration(
                 group.name, query.id, series.label_key, plan.name, plan.instance
             )
@@ -1668,6 +1882,18 @@ class Runner:
             int(defaults.window_seconds / max(1.0, defaults.step_seconds)),
         )
         for plan in plans:
+            # Cohort-aware detectors are single-series-shaped at the
+            # ``fit_score`` boundary but depend on injected cross-member
+            # baselines for any meaningful score. The synthetic-injection
+            # calibration path has no cohort context to thread through,
+            # so calibration here would always score 0 -> F1=0 ->
+            # confidence/stability collapse to 0 and the operator-visible
+            # gauges would publish actively misleading numbers. Skip
+            # calibration entirely for cohort-aware plans; the limitation
+            # is documented in docs/detectors.md alongside the same
+            # caveat that applies to the stratified detectors.
+            if is_cohort_aware(plan.cls):
+                continue
             cal = self._store.get_calibration(
                 group.name, query.id, series.label_key, plan.name, plan.instance
             )

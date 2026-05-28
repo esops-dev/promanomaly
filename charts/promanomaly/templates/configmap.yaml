@@ -95,6 +95,22 @@ data:
 {{ toYaml . | indent 10 }}
         {{- end }}
     {{- end }}
+    {{- /*
+      Telemetry is rendered only when ``telemetry.otlp.endpoint`` is set —
+      writing an empty endpoint into the config would still build the
+      Telemetry from_config path correctly (it falls back to the disabled
+      singleton on empty endpoints), but rendering nothing keeps the
+      rendered ConfigMap diff-clean for operators who don't use tracing.
+    */ -}}
+    {{- with .Values.telemetry }}
+    {{- if and .otlp .otlp.endpoint }}
+    telemetry:
+      otlp:
+        endpoint: {{ .otlp.endpoint | quote }}
+        insecure: {{ default true .otlp.insecure }}
+        service_name: {{ default "promanomaly" .otlp.service_name | quote }}
+    {{- end }}
+    {{- end }}
     groups:
 {{ toYaml .Values.groups | indent 6 }}
 {{- end }}

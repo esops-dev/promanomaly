@@ -60,7 +60,11 @@ Breaks on deploys or rolling restarts?
 └── Yes → BOCPD (probabilistic) or CUSUM (sigma-multiplier). See `change-points.md`.
 
 Comparing identical instances (nodes, pods, replicas)?
-└── Yes → Cohort detector (planned)
+└── Yes → Cohort detector. Set `cohort_label:` to the label that varies
+    between members (default `instance`); every other label identifies the
+    cohort itself. Pair with explicit detector selection (not `auto_select`)
+    because the synthetic-injection calibration cycle is single-series-shaped
+    and can't score a cross-member detector — see `docs/detectors.md`.
 
 Cannot decide between MAD / Hampel / IQR for a given series?
 └── Yes → set `auto_select: true` on the group and let the calibration cycle choose per series (see `docs/auto-select.md`).

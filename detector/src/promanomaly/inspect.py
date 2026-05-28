@@ -29,6 +29,14 @@ from typing import Any
 
 from .config import Config, DefaultsConfig, GroupConfig, QueryConfig
 from .detectors import UnknownDetectorError, get
+from .detectors.cohort import (
+    _PARAM_COHORT_MAD,
+    _PARAM_COHORT_MEDIAN,
+    _PARAM_COHORT_SIZE,
+    cohort_key_for,
+    compute_cohort_baseline,
+    is_cohort_aware,
+)
 from .runner import _build_detector
 from .source import PromQLSource, QuerySeries, SourceQueryError
 from .state import SnapshotStore
@@ -221,6 +229,12 @@ async def inspect_series(
         }
 
     matching = [s for s in qresult.series if _matches(s, selector)]
+    # Pre-compute cohort baselines from the *unfiltered* result set so a
+    # cohort-aware detector inspecting one member still sees the full
+    # cohort context — the operator-friendly answer to "why did this
+    # member score 4.7?". Mirrors the runner's pre-pass exactly; cheap
+    # no-op when no plan is cohort-aware.
+    cohort_context = _build_inspect_cohort_context(plans, qresult.series)
     series_payload: list[dict[str, Any]] = []
     for series in matching:
         sample_count = len(series.samples)
@@ -255,9 +269,33 @@ async def inspect_series(
             sliced = series.samples[series.samples["timestamp"] >= cutoff]
             if sliced.empty:
                 sliced = series.samples.tail(1).reset_index(drop=True)
+            # Mirror the runner's cohort-context injection so a cohort-aware
+            # detector inspected here gets the same baseline it would see
+            # during a scheduled run. Lookups that miss (cohort too small)
+            # leave params untouched and the detector falls back to its
+            # documented zero-score path.
+            effective_params = params
+            if is_cohort_aware(cls):
+                cohort_label = str(
+                    params.get(
+                        "cohort_label",
+                        getattr(cls, "defaults", {}).get("cohort_label", "instance"),
+                    )
+                )
+                det_entry["cohort_label"] = cohort_label
+                cohort_key = cohort_key_for(series.labels, cohort_label)
+                cohort_baseline = cohort_context.get(((name, instance), cohort_key))
+                if cohort_baseline is not None:
+                    effective_params = dict(params)
+                    effective_params[_PARAM_COHORT_MEDIAN] = cohort_baseline["median"]
+                    effective_params[_PARAM_COHORT_MAD] = cohort_baseline["mad"]
+                    effective_params[_PARAM_COHORT_SIZE] = cohort_baseline["size"]
+                    det_entry["cohort_size"] = cohort_baseline["size"]
+                else:
+                    det_entry["cohort_size"] = None
             try:
-                detector = _build_detector(cls, params)
-                df = detector.fit_score(sliced.reset_index(drop=True), "", params)
+                detector = _build_detector(cls, effective_params)
+                df = detector.fit_score(sliced.reset_index(drop=True), "", effective_params)
             except Exception as exc:
                 det_entry["status"] = "error"
                 det_entry["error"] = str(exc)
@@ -322,6 +360,64 @@ async def inspect_series(
         "total_series": len(qresult.series),
         "series": series_payload,
     }
+
+
+def _build_inspect_cohort_context(
+    plans: list[dict[str, Any]],
+    series_list: list[QuerySeries],
+) -> dict[tuple[tuple[str, str | None], tuple[tuple[str, str], ...]], dict[str, Any]]:
+    """Mirror of ``Runner._build_cohort_context`` for the inspect path.
+
+    Kept separate (rather than imported from the runner) because the
+    inspect plan shape is a dict, not the runner's ``_DetectorPlan``
+    dataclass — refactoring both to share one builder would just trade
+    one duplication for another. Light enough at one cohort_label / one
+    cohort_key partition per plan that the code reuse isn't worth a
+    cross-module type change.
+    """
+    out: dict[tuple[tuple[str, str | None], tuple[tuple[str, str], ...]], dict[str, Any]] = {}
+    if not series_list:
+        return out
+    for plan in plans:
+        cls = plan["cls"]
+        if not is_cohort_aware(cls):
+            continue
+        params = plan["params"]
+        cohort_label = str(
+            params.get(
+                "cohort_label",
+                getattr(cls, "defaults", {}).get("cohort_label", "instance"),
+            )
+        )
+        try:
+            min_size = int(
+                params.get(
+                    "min_cohort_size",
+                    getattr(cls, "defaults", {}).get("min_cohort_size", 5),
+                )
+            )
+        except (TypeError, ValueError):
+            min_size = 5
+        buckets: dict[tuple[tuple[str, str], ...], list[Any]] = {}
+        for series in series_list:
+            if not series.samples.shape[0]:
+                continue
+            key = cohort_key_for(series.labels, cohort_label)
+            values = series.samples["y"].to_numpy(dtype=float, copy=False)
+            buckets.setdefault(key, []).append(values)
+        for cohort_key, member_arrays in buckets.items():
+            if len(member_arrays) < min_size:
+                continue
+            baseline = compute_cohort_baseline(member_arrays)
+            if baseline is None:
+                continue
+            median, mad = baseline
+            out[((plan["name"], plan["instance"]), cohort_key)] = {
+                "median": median,
+                "mad": mad,
+                "size": len(member_arrays),
+            }
+    return out
 
 
 __all__ = ["InspectError", "inspect_series", "parse_label_selector"]

@@ -77,7 +77,12 @@ _HELP: dict[str, tuple[str, str]] = {
     # name -> (type, help-text)
     "anomaly_score": (
         "gauge",
-        "Raw anomaly score for the latest sample (units: number of MADs for MAD/Hampel).",
+        (
+            "Raw anomaly score for the latest sample. Units are detector-specific: "
+            "number of MADs for MAD/Hampel/IQR/HourOfDayMAD/DayOfWeekMAD, posterior "
+            "probability for BOCPD, sigma multiplier for CUSUM, and number of "
+            "cross-cohort MADs for Cohort."
+        ),
     ),
     "anomaly_outside_threshold": (
         "gauge",
@@ -85,7 +90,10 @@ _HELP: dict[str, tuple[str, str]] = {
     ),
     "anomaly_baseline": (
         "gauge",
-        "Detector baseline value (rolling median for MAD, local median for Hampel).",
+        (
+            "Detector baseline value (rolling median for MAD, local median for "
+            "Hampel, cross-cohort median for Cohort)."
+        ),
     ),
     "anomaly_warming_up": (
         "gauge",
