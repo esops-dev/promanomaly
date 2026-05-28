@@ -16,7 +16,7 @@
 # - Bring your own Redis (Bitnami, AWS ElastiCache, in-cluster, …);
 #   the umbrella ``promanomaly-stack`` chart does not bundle one yet.
 
-apiVersion: promanomaly.io/v1alpha1
+apiVersion: promanomaly.io/v1
 
 datasource:
   url: http://victoriametrics:8428/

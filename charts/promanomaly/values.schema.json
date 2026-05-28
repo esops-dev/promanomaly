@@ -1,6 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://promanomaly.io/schemas/v1/values.schema.json",
   "title": "promanomaly chart values",
+  "description": "Stable v1 schema. A future breaking change ships under a fresh $id (e.g. .../v2/values.schema.json) alongside a new apiVersion; this $id remains pinned to the v1 surface for the entire v1.x line.",
   "type": "object",
   "additionalProperties": true,
   "required": ["image", "datasource"],

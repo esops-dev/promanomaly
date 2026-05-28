@@ -1,6 +1,7 @@
 # Default values for the promanomaly detector chart.
-# Single-replica only — HA mode lands in a later release and adds
-# leader election. See README for the operational story.
+# Single-replica by default; HA mode (Lease-based leader election +
+# Redis snapshot cache) is opt-in via ``highAvailability.enabled``.
+# See README + examples/production/ for the HA topology.
 
 image:
   repository: ghcr.io/esops-dev/promanomaly

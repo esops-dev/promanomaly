@@ -36,7 +36,7 @@ make chart-lint       # helm lint + kubeconform
   [detector/src/promanomaly/detectors/](detector/src/promanomaly/detectors/),
   `pyproject.toml` entry points, and
   [docs/detectors.md](docs/detectors.md). CI checks all three.
-- Adding a Helm value? Regenerate `values.schema.json` (`make chart-schema`).
+- Adding a Helm value? Update [charts/promanomaly/values.schema.json](charts/promanomaly/values.schema.json) by hand to match. The schema is hand-authored alongside `values.yaml` so it can express constraints (enums, ranges, opt-in defaults) a generator can't infer from a sample — see the comment block above the `chart-lint` target in the [Makefile](Makefile).
 - Adding or changing a contracted label? Coordinate a PR pair against
   [LABELS_CONTRACT.md](LABELS_CONTRACT.md) here and in promforecast — CI
   diffs the two files and will fail if they drift.

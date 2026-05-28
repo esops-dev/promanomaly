@@ -12,7 +12,7 @@
 # if you're not sure which stratification fits your signal. See
 # docs/scaling-stratified.md for the TSDB-cost projections.
 
-apiVersion: promanomaly.io/v1alpha1
+apiVersion: promanomaly.io/v1
 
 datasource:
   url: http://victoriametrics:8428/

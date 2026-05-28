@@ -1,0 +1,159 @@
+# Sibling ConfigMap holding the production detector configuration.
+#
+# Referenced by ``helmrelease.yaml`` via ``existingConfigMap`` so the
+# detector's groups are managed independently of the chart upgrade
+# cadence. This is the production-shaped pattern documented in
+# docs/operations.md: chart bumps for the deployment surface, ConfigMap
+# bumps for the detector groups, no cross-PR coupling.
+#
+# Keep the apiVersion at ``promanomaly.io/v1``; the alpha alias is
+# documented in docs/config-schema.md and will be removed at v3.0.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promanomaly-detector-config
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: promanomaly
+    app.kubernetes.io/managed-by: gitops
+data:
+  config.yaml: |
+    apiVersion: promanomaly.io/v1
+
+    datasource:
+      url: "http://victoria-metrics-single-server.observability:8428/"
+      timeout: 10s
+      auth:
+        type: none
+
+    server:
+      listen: ":9092"
+      refresh_interval: 1m
+      reload:
+        enabled: true
+        watch_configmap: true
+        auth:
+          type: none
+
+    safety:
+      max_series_per_query: 1000
+      max_total_series: 20000
+      series_overflow: drop_lowest_priority
+      detect_timeout: 5s
+      query_timeout: 10s
+      on_source_failure: serve_stale
+      fail_ready_after: 3
+      query_cache:
+        enabled: true
+        backend: redis
+        max_entries: 4096
+        ttl: 30s
+      redis:
+        url: "redis://promanomaly-redis-master.observability:6379/0"
+        key_prefix: promanomaly
+        timeout: 2s
+      discovery:
+        forget_after_runs: 1000
+
+    highAvailability:
+      enabled: true
+      lease_name: promanomaly-leader
+      lease_namespace: observability
+      lease_duration: 15s
+      renew_deadline: 10s
+      retry_period: 2s
+      snapshot_ttl: 5m
+
+    defaults:
+      window: 1h
+      step: 15s
+      min_points: 60
+      warmup_policy: emit_warming_up
+      emit_baseline: true
+      emit_change_points: true
+      emit_baseline_stability: true
+      emit_duration: true
+      alert_thresholds:
+        score: 3.0
+
+    groups:
+      - name: error_rates
+        priority: 10
+        ensemble:
+          method: voting
+          min_detectors: 2
+        queries:
+          - id: api_error_ratio
+            promql: |
+              sum(rate(http_requests_total{job="api", code=~"5.."}[5m]))
+                /
+              sum(rate(http_requests_total{job="api"}[5m]))
+            min_relative_delta: 0.05
+            detectors:
+              - name: MAD
+              - name: ZScoreEWMA
+                params:
+                  alpha: 0.05
+            alert_thresholds:
+              score: 4.0
+          - id: ingest_error_ratio
+            promql: |
+              sum(rate(ingest_failures_total[5m]))
+                /
+              sum(rate(ingest_attempts_total[5m]))
+            min_relative_delta: 0.05
+            detectors:
+              - name: MAD
+              - name: Hampel
+                params:
+                  t0: 5
+
+      - name: request_counts
+        priority: 5
+        queries:
+          - id: api_qps
+            promql: sum(rate(http_requests_total{job="api"}[1m]))
+            detectors:
+              - name: MAD
+                instance: short
+                params:
+                  window: 15m
+              - name: MAD
+                instance: long
+                params:
+                  window: 1h
+              - name: Hampel
+                params:
+                  t0: 5
+
+      - name: queue_depths
+        priority: 5
+        queries:
+          - id: worker_queue_depth
+            promql: sum by (queue) (queue_depth)
+            detectors:
+              - name: IQR
+                params:
+                  k: 1.5
+              - name: BOCPD
+                params:
+                  hazard: 0.01
+
+      - name: node_cohort
+        priority: 3
+        queries:
+          - id: cpu_busy_ratio
+            promql: 1 - rate(node_cpu_seconds_total{mode="idle"}[5m])
+            detectors:
+              - name: Cohort
+                params:
+                  cohort_label: instance
+                  min_cohort_size: 5
+          - id: memory_available_bytes
+            promql: node_memory_MemAvailable_bytes
+            detectors:
+              - name: Cohort
+                params:
+                  cohort_label: instance
+                  min_cohort_size: 5

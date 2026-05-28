@@ -5,7 +5,7 @@
 # ordinary outlier detection — the two classes are complementary, not
 # overlapping (see docs/change-points.md).
 
-apiVersion: promanomaly.io/v1alpha1
+apiVersion: promanomaly.io/v1
 
 datasource:
   url: http://victoriametrics:8428/

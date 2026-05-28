@@ -13,7 +13,7 @@ metadata:
   labels: {{- include "promanomaly.labels" . | nindent 4 }}
 data:
   config.yaml: |
-    apiVersion: promanomaly.io/v1alpha1
+    apiVersion: promanomaly.io/v1
     datasource:
       url: {{ .Values.datasource.url | quote }}
       timeout: {{ .Values.datasource.timeout | quote }}

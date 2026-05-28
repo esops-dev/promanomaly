@@ -1,0 +1,16 @@
+# Flux HelmRepository pointing at the promanomaly chart repository.
+#
+# Reconciled every five minutes; bump ``interval`` down on clusters
+# that need fast rollouts after a chart release (note that
+# ``HelmRelease.upgrade.retries`` and ``install.remediation`` carry
+# more weight for actually getting a new chart picked up than the
+# refresh interval).
+
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: promanomaly
+  namespace: flux-system
+spec:
+  interval: 5m
+  url: https://esops-dev.github.io/promanomaly

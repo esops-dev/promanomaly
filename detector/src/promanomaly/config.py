@@ -25,8 +25,15 @@ from pydantic import (
     model_validator,
 )
 
-CURRENT_API_VERSION = "promanomaly.io/v1alpha1"
-SUPPORTED_API_VERSIONS = frozenset({CURRENT_API_VERSION})
+# Graduated from ``v1alpha1`` to ``v1`` in the v1.0 release. The previous
+# alpha alias remains valid (byte-identical schema) but loads with a
+# ``DeprecationWarning`` so operators get a nudge to bump their configs
+# without their pods CrashLoopBackOff'ing on the next image pull. A future
+# breaking change ships under a fresh apiVersion (``v2alpha1`` → ``v2``);
+# v1 stays the long-term stable surface for the entire v1.x line.
+CURRENT_API_VERSION = "promanomaly.io/v1"
+DEPRECATED_API_VERSIONS = frozenset({"promanomaly.io/v1alpha1"})
+SUPPORTED_API_VERSIONS = frozenset({CURRENT_API_VERSION}) | DEPRECATED_API_VERSIONS
 
 # Prometheus metric/label name. ``id`` and ``group`` are emitted as label
 # values but must additionally pass the same character rules as metric names
@@ -657,6 +664,23 @@ class Config(_ModelBase):
         if value not in SUPPORTED_API_VERSIONS:
             supported = sorted(SUPPORTED_API_VERSIONS)
             raise ValueError(f"unsupported apiVersion {value!r}; expected one of {supported}")
+        if value in DEPRECATED_API_VERSIONS:
+            # Byte-identical schema; nudge operators toward ``v1`` so the
+            # eventual ``v2`` deprecation window doesn't catch them holding
+            # an alpha alias. ``DeprecationWarning`` here is caught by
+            # pytest and visible under CLI ``-W default``; the structured
+            # boot log line is re-emitted from ``serve()`` AFTER
+            # ``configure_logging`` has wired up the JSON pipeline (see
+            # ``main.serve``), so operators reading the normal log stream
+            # see it as a regular JSON warning record.
+            import warnings
+
+            warnings.warn(
+                f"apiVersion {value!r} is deprecated; bump configs to "
+                f"{CURRENT_API_VERSION!r}. The schema is byte-identical.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         return value
 
     @field_validator("groups")
@@ -730,6 +754,7 @@ def _validate_detector_params(cfg: Config) -> None:
 
 __all__ = [
     "CURRENT_API_VERSION",
+    "DEPRECATED_API_VERSIONS",
     "SUPPORTED_API_VERSIONS",
     "AlertThresholds",
     "AuthConfig",

@@ -33,7 +33,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI
 
 from .cache import RedisQueryCache, TTLCache
-from .config import Config, load_config
+from .config import CURRENT_API_VERSION, DEPRECATED_API_VERSIONS, Config, load_config
 from .exporter import Exporter, OperationalMetrics
 from .ha import HAComponents, build_ha_components, run_follower_loop, stop_ha
 from .leader import resolve_identity
@@ -197,6 +197,17 @@ class Application:
             # changed, mirroring the boot-time first-run pattern.
             for group in new_config.groups:
                 self._spawn(self._safe_group_run(group.name))
+            if new_config.apiVersion in DEPRECATED_API_VERSIONS:
+                # Mirror the boot-time emission so a hot-reload of a
+                # legacy-aliased ConfigMap surfaces the same JSON log
+                # line in the operator's stream — silence after the
+                # first boot would hide the issue from anyone who
+                # joined the on-call rotation later.
+                logger.warning(
+                    "config.api_version_deprecated",
+                    api_version=new_config.apiVersion,
+                    replacement=CURRENT_API_VERSION,
+                )
             logger.info("reload_complete")
             return True, "ok"
 
@@ -494,6 +505,16 @@ def serve(config_path: str | Path) -> None:
         groups=[g.name for g in config.groups],
         refresh_interval_seconds=config.server.refresh_interval_seconds,
     )
+    if config.apiVersion in DEPRECATED_API_VERSIONS:
+        # Emitted here (not from the pydantic validator) so the warning
+        # lands in the JSON log stream operators are already tailing.
+        # The validator additionally fires a ``DeprecationWarning`` for
+        # CI / pytest visibility.
+        logger.warning(
+            "config.api_version_deprecated",
+            api_version=config.apiVersion,
+            replacement=CURRENT_API_VERSION,
+        )
     if config.aggressive_refresh:
         logger.warning(
             "aggressive_refresh_interval",
