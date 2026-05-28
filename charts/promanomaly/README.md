@@ -26,8 +26,11 @@ Where ``my-groups.yaml`` carries detector groups under ``groups:``.
 See ``values.yaml`` and the schema in ``values.schema.json``. The
 notable bits:
 
-- ``replicaCount`` is pinned to ``1`` — single-replica is the only
-  supported topology today. HA mode arrives in a later release.
+- ``replicaCount`` defaults to ``1``. Single-replica is the simplest
+  topology; HA mode (``highAvailability.enabled: true``) is supported
+  and adds Lease-based leader election + a Redis-backed snapshot
+  cache so multiple replicas serve the same ``/metrics`` snapshot.
+  See ``examples/configs/ha.yaml`` and ``examples/production/``.
 - ``existingConfigMap`` lets GitOps tooling (Argo CD, Flux) manage the
   detector configuration out-of-band; the chart then skips its own
   ConfigMap rendering.

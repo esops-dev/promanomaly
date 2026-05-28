@@ -15,7 +15,7 @@
 # for the pre-deploy CI gate that catches wildcard mistakes before
 # they hit production cardinality.
 
-apiVersion: promanomaly.io/v1alpha1
+apiVersion: promanomaly.io/v1
 
 datasource:
   url: http://victoriametrics:8428/

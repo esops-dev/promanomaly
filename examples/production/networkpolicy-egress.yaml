@@ -1,0 +1,81 @@
+# Explicit egress NetworkPolicy for promanomaly in production.
+#
+# The shipped chart NetworkPolicy only models ingress; this sibling
+# manifest constrains egress to the three things the detector actually
+# needs: the TSDB, Redis, and the Kubernetes API. Apply it after the
+# chart so the chart-rendered NetworkPolicy (ingress) and this one
+# (egress) coexist without one replacing the other.
+#
+# Adjust before applying:
+# - ``spec.podSelector.matchLabels`` carries
+#   ``app.kubernetes.io/instance: promanomaly``. The chart sets this
+#   to ``.Release.Name``, so if you install with a release name other
+#   than ``promanomaly`` (e.g. ``helm install obs-detector ...``)
+#   the selector misses every pod and egress falls through to the
+#   cluster default. Mirror your release name here.
+# - ``metadata.namespace`` (``observability``) must match the chart
+#   release namespace.
+# - The TSDB destination (single-node VictoriaMetrics, vmselect, Mimir).
+# - The Kubernetes API endpoint if your cluster uses a non-default
+#   apiserver service (rare; the 10.0.0.1 / kubernetes.default approach
+#   below works in most clusters).
+#
+# kubeconform-friendly: 0 CRDs, only built-in resources.
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: promanomaly-egress
+  namespace: observability
+  labels:
+    app.kubernetes.io/name: promanomaly
+    app.kubernetes.io/managed-by: gitops
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: promanomaly
+      app.kubernetes.io/instance: promanomaly
+  policyTypes:
+    - Egress
+  egress:
+    # VictoriaMetrics single-node (or vmselect on a cluster install).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: victoria-metrics-single
+      ports:
+        - port: 8428
+          protocol: TCP
+    # Redis snapshot + query cache.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redis
+      ports:
+        - port: 6379
+          protocol: TCP
+    # Kubernetes API — Lease coordination needs to reach the apiserver
+    # from every pod, not just the leader. The CIDR is the conventional
+    # in-cluster ClusterIP for the apiserver Service; replace with the
+    # actual range your cluster uses if it isn't 10.0.0.0/8.
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+      ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
+    # DNS — required so the in-cluster service names above resolve.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP

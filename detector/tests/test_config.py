@@ -58,6 +58,23 @@ def test_unknown_api_version_rejected() -> None:
         Config.model_validate(bad)
 
 
+def test_v1alpha1_api_version_still_loads_with_deprecation_warning() -> None:
+    # The v1.0 graduation keeps ``v1alpha1`` accepted as a byte-identical
+    # alias so existing GitOps repos don't CrashLoopBackOff on the image
+    # bump; the loader nudges operators with a DeprecationWarning.
+    legacy = {**MIN_CONFIG, "apiVersion": "promanomaly.io/v1alpha1"}
+    with pytest.warns(DeprecationWarning, match="apiVersion 'promanomaly.io/v1alpha1'"):
+        cfg = Config.model_validate(legacy)
+    assert cfg.apiVersion == "promanomaly.io/v1alpha1"
+
+
+def test_current_api_version_is_v1() -> None:
+    # Pin the graduation: anything other than ``promanomaly.io/v1`` here
+    # means a release accidentally regressed the schema to alpha or
+    # leapt to v2 without a deprecation cycle.
+    assert CURRENT_API_VERSION == "promanomaly.io/v1"
+
+
 @pytest.mark.parametrize("bad_id", ["with:colon", "spaces here", "1leading_digit", ""])
 def test_invalid_query_id_rejected(bad_id: str) -> None:
     from pydantic import ValidationError

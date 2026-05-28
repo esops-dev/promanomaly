@@ -2,6 +2,15 @@
 
 Most advanced use cases are solved by combining promanomaly’s plain Prometheus metrics (`anomaly_score`, `anomaly_outside_threshold`, etc.) with standard PromQL, recording rules, or Alertmanager. No new detector features required.
 
+This page is the **composition cookbook** for everything that looks
+like a missing feature but is actually a recurring pattern. If you
+catch yourself wishing for a new config knob or a new detector type,
+check here first — there's a good chance the recipe already exists.
+
+The features deliberately kept out of promanomaly core (and routed to
+composition instead) are documented at the end under
+[**Why each of these lives here, not in the detector**](#why-each-of-these-lives-here-not-in-the-detector).
+
 ## Rate-of-Change & Acceleration
 
 Detect anomalies in *how fast* a metric changes, not its absolute value.
@@ -178,4 +187,129 @@ Do NOT silence change-point alerts during deploys inside the detector — fire o
 (anomaly_outside_threshold == 1)
 ```
 
-Both tools follow the same `id` + `group` label contract.
+Both tools follow the same `id` + `group` label contract — see
+[`when-to-use.md`](when-to-use.md) for the decision tree and
+[`LABELS_CONTRACT.md`](../LABELS_CONTRACT.md) for the exact label
+guarantee. Either direction of the join is meaningful: requiring
+both means "slow capacity drift AND a fast-moving anomaly on the same
+signal right now"; an `or` rollup means "anything wrong with this
+signal".
+
+A useful production pattern is one recording rule for each:
+
+```yaml
+- record: signal_in_trouble:any
+  expr: |
+    forecast_deviation_outside_band == 1
+      or on (id, group) anomaly_outside_threshold == 1
+
+- record: signal_in_trouble:both
+  expr: |
+    forecast_deviation_outside_band == 1
+      and on (id, group) anomaly_outside_threshold == 1
+```
+
+…and an Alertmanager `inhibition_rule` so an `:both` firing
+suppresses the noisier `:any`.
+
+## Deploy-Time Silencing
+
+Anomaly scores should never be damped, masked, or paused during
+deploys, rolling restarts, or maintenance windows — real outages
+happen during those windows precisely because deploys cause them.
+Silencing belongs in Alertmanager, fired by a webhook from your
+deploy pipeline:
+
+```bash
+# In your CD pipeline, before the rollout:
+curl -X POST "$AM/api/v2/silences" -d '{
+  "matchers": [
+    {"name": "id", "value": "checkout_p95", "isRegex": false}
+  ],
+  "startsAt":  "'"$(date -u +%FT%TZ)"'",
+  "endsAt":    "'"$(date -u -d '+30 min' +%FT%TZ)"'",
+  "createdBy": "ci-bot",
+  "comment":   "checkout deploy $CI_PIPELINE_URL"
+}'
+```
+
+The detector keeps emitting `anomaly_score` and
+`anomaly_outside_threshold` exactly as before; Alertmanager just
+silently drops the resulting alert for the silence's lifetime. The
+signal stays visible on Grafana for post-incident analysis without
+firing a page. **This is the correct way to do it** — see
+[**Why each of these lives here, not in the detector**](#why-each-of-these-lives-here-not-in-the-detector)
+for the rationale.
+
+## Confidence-Gated Alerts
+
+When auto-select or stratified detectors are emitting
+`anomaly_confidence_score` and `anomaly_baseline_stability`, gate
+alerts on both signals so warm-up windows and calibration noise
+don't page:
+
+```promql
+anomaly_outside_threshold == 1
+  and on (id, group, detector) anomaly_confidence_score      > 0.7
+  and on (id, group, detector) anomaly_baseline_stability    > 0.6
+```
+
+The bundled `AnomalyConfidenceLow` PrometheusRule does the inverse
+side of the same gate (alert on low confidence on a firing detector
+so you find out the calibration is degrading before you stop
+trusting the score). See [`confidence.md`](confidence.md) for the
+underlying formulas.
+
+## Practical-Significance Floors
+
+Statistical significance ≠ operational significance. A 3-MAD move on
+a counter that went from `0.01` errors/s to `0.012` errors/s is
+real, but probably not page-worthy. Set a floor:
+
+```yaml
+defaults:
+  min_abs_delta:      0.05    # 0.05 errors/s minimum before
+                              # anomaly_outside_threshold can flip
+  min_relative_delta: 0.05    # OR 5% of baseline
+```
+
+`anomaly_score` is unaffected — dashboards still see the raw signal.
+Only the `anomaly_outside_threshold` bit is gated. Tune per-query
+where the group-level floor is wrong:
+
+```yaml
+queries:
+  - id: chatty_signal
+    promql: ...
+    min_abs_delta: 0.5        # noisier signal needs a higher floor
+    detectors:
+      - name: MAD
+```
+
+## Why each of these lives here, not in the detector
+
+A recurring pattern in design review is "this should be a feature
+flag in the detector". Most of the time, the answer is that PromQL,
+recording rules, and Alertmanager already cover it — and growing the
+detector to cover it duplicates ecosystem tooling poorly. The
+features kept out of core, with the composition recipe that replaces
+them:
+
+| Asked for | Lives instead in | Recipe |
+|---|---|---|
+| Rate-of-change / acceleration detector | PromQL `rate()` / `deriv()` wrapper on the source query | [Rate-of-Change & Acceleration](#rate-of-change--acceleration) |
+| Group / fleet rollup metrics | Recording rules over `anomaly_*` | [Group-Level Rollups](#group-level-rollups) |
+| `for:`-style hysteresis inside the detector | Alertmanager `for:` on the firing rule | [Flap Suppression](#flap-suppression) |
+| Multi-window detection as a config knob | Repeat the detector with `instance:` | [Multi-Window Detection](#multi-window-detection) |
+| Per-detector silencing windows / deploy-aware damping | Alertmanager silences, fired by webhook | [Deploy-Time Silencing](#deploy-time-silencing) |
+| Weighted / Bayesian / ML ensemble fusion | Compose `anomaly_outside_threshold` via recording rules | [Group-Level Rollups](#group-level-rollups) |
+| "Known-noisy series" mute lists | Raise the threshold per query, swap detector, or drop the series from config | (no recipe — these are tuning, not silencing) |
+| Built-in alerting policy (severity escalations, "page only on second occurrence") | Alertmanager routes + grouping | (Alertmanager docs) |
+| Per-query post-processing PromQL | Recording rules on the emitted anomaly metrics | (Prometheus recording-rule docs) |
+| Built-in UI | Grafana with the bundled dashboards | [`dashboards/grafana/`](../dashboards/grafana/) |
+
+The detector's job is **emitting the signal**. Anything that looks
+like alerting policy, silencing, severity, or rollup belongs in the
+surrounding ecosystem. Pushing those features back into composition
+recipes is how promanomaly stays small, stateless, and
+ecosystem-friendly.

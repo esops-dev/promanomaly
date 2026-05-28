@@ -2,7 +2,7 @@
 # scores are produced minutes after the stack starts (instead of after
 # an hour of warm-up). Not intended for any non-dev use.
 
-apiVersion: promanomaly.io/v1alpha1
+apiVersion: promanomaly.io/v1
 
 datasource:
   url: http://victoriametrics:8428/

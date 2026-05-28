@@ -62,11 +62,18 @@ operational guidance — including [`docs/patterns.md`](docs/patterns.md),
 the composition cookbook of how anomaly scores plug into the rest of
 the Prometheus ecosystem (rate-of-change, group rollups, multi-window
 monitoring, deploy-time silencing, cross-tool joins with promforecast).
+[`docs/when-to-use.md`](docs/when-to-use.md) walks through the
+"promforecast, promanomaly, or both?" decision tree, and
+[`docs/config-schema.md`](docs/config-schema.md) documents the v1
+schema stability commitments.
+
 A self-monitoring example config is bundled at
 [`examples/configs/self-monitoring.yaml`](examples/configs/self-monitoring.yaml),
 and a starter `PrometheusRule` at
 [`examples/alerts/promanomaly-rules.yaml`](examples/alerts/promanomaly-rules.yaml).
-Full multi-group production reference configs land in a later release.
+The full multi-group production reference deployment — values, NetworkPolicy
+egress, ArgoCD `Application`, and Flux `HelmRepository`/`HelmRelease` —
+lives at [`examples/production/`](examples/production/).
 
 ## Relationship with promforecast
 
@@ -83,9 +90,17 @@ rare events, and per-instance outliers.
 
 ## Status
 
-Early development. Output metric names are part of the public API and
-follow Prometheus conventions strictly (no colons — those are reserved
-for recording rules).
+The configuration schema is stable as of the v1.0 release:
+`apiVersion: promanomaly.io/v1` and the `values.schema.json` `$id`
+both move from alpha to v1. The previous `promanomaly.io/v1alpha1`
+alias keeps loading as a byte-identical form with a deprecation
+warning. See [`docs/config-schema.md`](docs/config-schema.md) for the
+stability commitments, including which changes are breaking and
+which are not.
+
+Output metric names and label sets are part of the public API and
+follow Prometheus conventions strictly (no colons — those are
+reserved for recording rules).
 
 ## Security
 

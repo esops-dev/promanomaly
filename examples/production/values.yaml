@@ -1,0 +1,314 @@
+# Production-shaped Helm values for promanomaly.
+#
+# This file is the operator-facing summary: the detector configuration
+# lives below under ``groups:`` and the operational knobs (replicas,
+# anti-affinity, NetworkPolicy egress) are tuned for a real cluster
+# with a sibling Redis and a long-term TSDB on a separate namespace.
+#
+# Sized for ~10k output series across four groups (error rates,
+# request counts, queue depths, and a per-node cohort fleet). Adjust
+# ``max_series_per_query`` / ``max_total_series`` if you fan out
+# wider. See examples/production/architecture.txt for the data flow.
+#
+# Image bump policy: pin a specific tag (do not float ``latest``). The
+# same applies to the VM and Redis charts referenced by the ArgoCD /
+# Flux samples in this directory.
+
+image:
+  repository: ghcr.io/esops-dev/promanomaly
+  # Pin to a specific app version. Bump in lock-step with the chart's
+  # ``appVersion`` (PR review surface) — leaving this empty falls back
+  # to ``Chart.appVersion``, which is fine if you trust chart upgrades
+  # to be the source of truth for which detector image runs. Floating
+  # ``latest`` is not supported.
+  tag: v1.0.0
+  pullPolicy: IfNotPresent
+
+replicaCount: 2                # leader + one follower; bump to 3 for
+                               # stronger availability during rolling
+                               # restarts of large clusters.
+
+strategy:
+  # Auto-flipped to RollingUpdate by the chart when HA is on, but
+  # set here too so a ``helm get values`` reflects intent.
+  type: RollingUpdate
+
+# Pod anti-affinity: spread replicas across nodes so a single node
+# drain never takes both pods at once. A topologyKey of
+# ``kubernetes.io/hostname`` is the safe default; switch to
+# ``topology.kubernetes.io/zone`` on clusters where intra-zone
+# scheduling is acceptable.
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: promanomaly
+            app.kubernetes.io/instance: promanomaly
+        topologyKey: kubernetes.io/hostname
+
+datasource:
+  # Long-term store. The detector reads recent windows only; production
+  # operators commonly point at a VictoriaMetrics single-node or
+  # Mimir/Thanos query frontend living in the observability namespace.
+  url: http://victoria-metrics-single-server.observability:8428/
+  timeout: 10s
+  auth:
+    type: none
+    existingSecret: ""
+
+server:
+  listen: ":9092"
+  refresh_interval: 1m
+  reload:
+    enabled: true
+    watch_configmap: true
+    auth:
+      type: none               # NetworkPolicy is the primary control
+      existingSecret: ""
+
+safety:
+  max_series_per_query: 1000
+  max_total_series: 20000
+  series_overflow: drop_lowest_priority
+  detect_timeout: 5s
+  query_timeout: 10s
+  on_source_failure: serve_stale
+  fail_ready_after: 3
+  query_cache:
+    enabled: true
+    backend: redis             # shared across replicas in HA
+    max_entries: 4096
+    ttl: 30s
+  redis:
+    url: redis://promanomaly-redis-master.observability:6379/0
+    key_prefix: promanomaly
+    timeout: 2s
+  discovery:
+    forget_after_runs: 1000
+
+highAvailability:
+  enabled: true
+  lease_name: promanomaly-leader
+  lease_namespace: ""          # release namespace at template time
+  lease_duration: 15s
+  renew_deadline: 10s
+  retry_period: 2s
+  snapshot_ttl: 5m
+
+defaults:
+  window: 1h
+  step: 15s
+  min_points: 60
+  warmup_policy: emit_warming_up
+  emit_baseline: true
+  emit_change_points: true
+  emit_baseline_stability: true
+  emit_duration: true
+  alert_thresholds:
+    score: 3.0
+  min_abs_delta: 0.0
+  min_relative_delta: 0.0
+
+# Output-label filtering — production clusters typically carry a
+# ``customer`` or ``tenant`` label across service metrics. Drop those
+# at the exporter boundary unless your alerting really needs them.
+exporter:
+  output_labels:
+    allow: []
+    drop: []
+
+# OpenTelemetry tracing — uncomment to wire up. The chart only renders
+# the env vars; the detector image must be the ``[otel]`` extra build.
+telemetry:
+  otlp:
+    endpoint: ""
+    insecure: true
+    service_name: promanomaly
+
+# NetworkPolicy: lock down ingress to /-/reload and debug endpoints,
+# and constrain egress to the TSDB, Redis, and Kubernetes API only.
+# The shipped chart template only models ingress; the additional egress
+# rules below ship as a sibling NetworkPolicy in
+# examples/production/networkpolicy-egress.yaml so they can be
+# managed/turned-off independently.
+networkPolicy:
+  enabled: true
+  allowedScrapeNamespaces:
+    - observability            # where Prometheus / kube-prometheus lives
+
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s
+  labels:
+    release: prometheus        # match the kube-prometheus-stack default
+  honorLabels: true
+
+# Bundled PrometheusRule.
+#
+# The chart ships this off by default because we don't carry opinionated
+# thresholds. The reference deployment flips it on as a sensible
+# starting point: every threshold below is a **default to be tuned per
+# SLO**, not a recommendation. Review them against your own paging
+# tolerance before merging — in particular ``durationSeconds`` on the
+# long-running rule and ``maxStaleSeconds`` on the staleness rule are
+# the two operators most often need to relax.
+prometheusRule:
+  enabled: true
+  labels:
+    release: prometheus
+  rules:
+    anomalyOutsideThreshold:
+      enabled: true
+      for: 5m
+      severity: warning
+    anomalyLongRunning:
+      enabled: true
+      durationSeconds: 1800
+      for: 1m
+      severity: critical
+    anomalyEnsembleAgreement:
+      enabled: true
+      for: 5m
+      severity: warning
+    anomalyChangePoint:
+      enabled: true
+      window: 10m
+      severity: info
+    anomalySignalMissing:
+      enabled: true
+      for: 10m
+      severity: critical
+    anomalyConfidenceLow:
+      enabled: true
+      threshold: 0.5
+      for: 10m
+      severity: warning
+    anomalyStale:
+      enabled: true
+      maxStaleSeconds: 600
+      for: 5m
+      severity: warning
+    anomalyDetectorFailing:
+      enabled: true
+      rateThreshold: 0.5
+      window: 15m
+      for: 5m
+      severity: warning
+    anomalySourceFailing:
+      enabled: true
+      window: 15m
+      for: 10m
+      severity: warning
+    anomalyNotReady:
+      enabled: true
+      for: 5m
+      severity: critical
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+# Multi-group detector config. Production operators typically keep the
+# detector groups in a sibling ConfigMap managed by GitOps (see
+# ``existingConfigMap`` and the ArgoCD/Flux samples). The inline form
+# below is kept self-contained so ``helm template --values values.yaml``
+# renders end-to-end without external state.
+groups:
+  # Error rates — sustained anomalies on these tend to map directly to
+  # user-facing incidents. Ensemble voting reduces single-detector
+  # noise without flap suppression in the detector itself; the
+  # remaining flap concern goes to the ``for:`` clauses on the
+  # bundled PrometheusRules.
+  - name: error_rates
+    priority: 10
+    ensemble:
+      method: voting
+      min_detectors: 2
+    queries:
+      - id: api_error_ratio
+        promql: |
+          sum(rate(http_requests_total{job="api", code=~"5.."}[5m]))
+            /
+          sum(rate(http_requests_total{job="api"}[5m]))
+        min_relative_delta: 0.05
+        detectors:
+          - name: MAD
+          - name: ZScoreEWMA
+            params:
+              alpha: 0.05
+        alert_thresholds:
+          score: 4.0
+      - id: ingest_error_ratio
+        promql: |
+          sum(rate(ingest_failures_total[5m]))
+            /
+          sum(rate(ingest_attempts_total[5m]))
+        min_relative_delta: 0.05
+        detectors:
+          - name: MAD
+          - name: Hampel
+            params:
+              t0: 5
+
+  # Request counts — bursty by design, so Hampel handles single-point
+  # spikes while a second MAD instance with a longer window keeps the
+  # baseline from absorbing a clustered anomaly.
+  - name: request_counts
+    priority: 5
+    queries:
+      - id: api_qps
+        promql: sum(rate(http_requests_total{job="api"}[1m]))
+        detectors:
+          - name: MAD
+            instance: short
+            params:
+              window: 15m
+          - name: MAD
+            instance: long
+            params:
+              window: 1h
+          - name: Hampel
+            params:
+              t0: 5
+
+  # Queue depths — typically sparse and non-Gaussian. IQR + change-point
+  # detection catches both magnitude and regime shifts.
+  - name: queue_depths
+    priority: 5
+    queries:
+      - id: worker_queue_depth
+        promql: sum by (queue) (queue_depth)
+        detectors:
+          - name: IQR
+            params:
+              k: 1.5
+          - name: BOCPD
+            params:
+              hazard: 0.01
+
+  # Per-node cohort comparison — flag the one bad node in a fleet of
+  # nominally identical workers. Sized for ~100 nodes; bump
+  # ``min_cohort_size`` if the cluster is larger.
+  - name: node_cohort
+    priority: 3
+    queries:
+      - id: cpu_busy_ratio
+        promql: 1 - rate(node_cpu_seconds_total{mode="idle"}[5m])
+        detectors:
+          - name: Cohort
+            params:
+              cohort_label: instance
+              min_cohort_size: 5
+      - id: memory_available_bytes
+        promql: node_memory_MemAvailable_bytes
+        detectors:
+          - name: Cohort
+            params:
+              cohort_label: instance
+              min_cohort_size: 5

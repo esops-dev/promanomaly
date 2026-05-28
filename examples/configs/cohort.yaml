@@ -9,7 +9,7 @@
 # This example also enables OpenTelemetry tracing — turn it on by
 # uncommenting the `telemetry:` block and installing the `[otel]` extra.
 
-apiVersion: promanomaly.io/v1alpha1
+apiVersion: promanomaly.io/v1
 
 datasource:
   url: http://victoriametrics:8428/

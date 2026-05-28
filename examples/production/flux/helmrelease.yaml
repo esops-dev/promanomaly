@@ -1,0 +1,54 @@
+# Flux HelmRelease for the promanomaly detector.
+#
+# Pairs with:
+# - ``helmrepository.yaml`` (the chart source)
+# - ``configmap.yaml``      (sibling ConfigMap referenced via
+#                            ``existingConfigMap`` so detector groups
+#                            are managed independently of chart upgrades)
+#
+# Pinning policy: ``spec.chart.spec.version`` is the only place the
+# chart version is named. Bump via PR. The ``valuesFrom`` reference
+# pulls the production values file from a ConfigMap sourced from this
+# repo so the values are diffable in PRs.
+
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: promanomaly
+  namespace: observability
+spec:
+  releaseName: promanomaly
+  targetNamespace: observability
+
+  interval: 5m
+  timeout: 5m
+
+  chart:
+    spec:
+      chart: promanomaly
+      version: 1.0.0
+      sourceRef:
+        kind: HelmRepository
+        name: promanomaly
+        namespace: flux-system
+
+  install:
+    createNamespace: true
+    remediation:
+      retries: 3
+  upgrade:
+    cleanupOnFail: true
+    remediation:
+      retries: 3
+      strategy: rollback
+
+  # Detector groups managed out-of-band via the sibling ConfigMap.
+  # The chart's own ConfigMap rendering is skipped because
+  # ``existingConfigMap`` is set on the values block below.
+  valuesFrom:
+    - kind: ConfigMap
+      name: promanomaly-values
+      valuesKey: values.yaml
+
+  values:
+    existingConfigMap: promanomaly-detector-config

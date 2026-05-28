@@ -2,7 +2,7 @@
 # metrics. This is both a smoke test (any rolling failure is itself an
 # anomaly) and a real production safeguard against silent stalls.
 
-apiVersion: promanomaly.io/v1alpha1
+apiVersion: promanomaly.io/v1
 
 datasource:
   url: http://victoriametrics:8428/

@@ -1,0 +1,80 @@
+# Argo CD Application for the promanomaly detector chart.
+#
+# Pulls the chart from the project's published Helm repository and
+# injects the ``values.yaml`` from ``examples/production/values.yaml``
+# in this repo via a single-source ``valueFiles`` reference.
+#
+# Usage:
+#   1. Fork or clone the promanomaly repo; commit your tuned
+#      ``examples/production/values.yaml`` to a path your ArgoCD repo
+#      server can reach (or vendor it in your own GitOps repo).
+#   2. Update ``repoURL`` / ``path`` below to point at that copy.
+#   3. ``kubectl apply -f application.yaml`` against the ArgoCD
+#      namespace (typically ``argocd``).
+#
+# The chart-pinning happens via ``targetRevision``; bump it via PR.
+# Auto-sync is off by default so the first install is operator-driven;
+# flip ``automated:`` on once the deployment is shaped.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: promanomaly
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  labels:
+    app.kubernetes.io/name: promanomaly
+    app.kubernetes.io/part-of: observability
+spec:
+  project: default
+
+  # Multi-source: chart from the OCI/Helm repo, values from the GitOps
+  # repo. ArgoCD merges them at render time. This keeps the chart
+  # version pinned in one place (this manifest) and the values pinned
+  # in another (the repo path) without copy-pasting either.
+  #
+  # ``repoURL`` mirrors the URL published in the top-level README
+  # quickstart and is rewritten by ``chart-releaser-action`` on tag.
+  # If you re-host the chart (private mirror, OCI registry, etc.),
+  # update both this manifest and your repo's quickstart so they
+  # don't drift.
+  sources:
+    - repoURL: https://esops-dev.github.io/promanomaly
+      chart: promanomaly
+      targetRevision: 1.0.0
+      helm:
+        releaseName: promanomaly
+        valueFiles:
+          - $values/examples/production/values.yaml
+    - repoURL: https://github.com/esops-dev/promanomaly.git
+      targetRevision: v1.0.0
+      ref: values
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: observability
+
+  syncPolicy:
+    # Start operator-driven. Flip to ``automated`` once the rollout
+    # is comfortable; ArgoCD's diff view should be clean before that.
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        maxDuration: 3m
+        factor: 2
+
+  # IgnoreDifferences: the detector reconciles its Lease at runtime,
+  # which means ``coordination.k8s.io/v1/Lease`` is going to drift from
+  # whatever ArgoCD would otherwise render. Don't render or compare it.
+  ignoreDifferences:
+    - group: coordination.k8s.io
+      kind: Lease
+      jsonPointers:
+        - /spec
+        - /metadata/managedFields

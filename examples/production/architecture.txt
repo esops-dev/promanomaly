@@ -1,0 +1,112 @@
+Production reference architecture for promanomaly
+==================================================
+
+Two-replica HA deployment in the ``observability`` namespace, reading
+recent windows from a long-term VictoriaMetrics, sharing snapshot and
+query state through Redis, and exposed to Prometheus / Grafana /
+Alertmanager via the bundled ServiceMonitor and PrometheusRule.
+
+Data flow
+---------
+
+  ┌───────────────────────────────────────────────────────────────────┐
+  │ application namespaces                                            │
+  │                                                                   │
+  │   workloads ──▶ /metrics                                          │
+  │                  │                                                │
+  └──────────────────┼────────────────────────────────────────────────┘
+                     │
+                     │ scrape
+                     ▼
+  ┌───────────────────────────────────────────────────────────────────┐
+  │ observability namespace                                           │
+  │                                                                   │
+  │   Prometheus / kube-prometheus-stack                              │
+  │        │                                                          │
+  │        │ remote_write                                             │
+  │        ▼                                                          │
+  │   VictoriaMetrics (long-term, analytics plane)                    │
+  │        ▲                                                          │
+  │        │ PromQL read (rolling window)                             │
+  │        │                                                          │
+  │   ┌────┴─────────┐    Lease         ┌──────────────┐              │
+  │   │ promanomaly  │ ◀──────────────▶ │ Kubernetes   │              │
+  │   │ (leader)     │                  │ apiserver    │              │
+  │   │              │                  └──────────────┘              │
+  │   │ scheduler ──▶│                                                │
+  │   │ detectors    │                                                │
+  │   │   │          │     snapshot + query cache                     │
+  │   │   └──────────┼─────────────────▶ ┌──────────┐                 │
+  │   │              │                   │  Redis   │                 │
+  │   │ /metrics ◀───┼─────────────────▶ │          │                 │
+  │   └────▲─────────┘                   └────▲─────┘                 │
+  │        │                                  │                       │
+  │   ┌────┴─────────┐                        │                       │
+  │   │ promanomaly  │ ◀── snapshot reads ────┘                       │
+  │   │ (follower)   │                                                │
+  │   │              │                                                │
+  │   │ /metrics ◀───┼──── (served from cache)                        │
+  │   └────▲─────────┘                                                │
+  │        │                                                          │
+  │        │ scrape                                                   │
+  │        │                                                          │
+  │   Prometheus ──▶ Grafana                                          │
+  │        │                                                          │
+  │        └─▶ Alertmanager ──▶ (PagerDuty / Slack / Opsgenie / …)    │
+  │                                                                   │
+  └───────────────────────────────────────────────────────────────────┘
+
+
+Topology notes
+--------------
+
+  - Both detector replicas race for the Lease
+    (``coordination.k8s.io/v1/Lease/promanomaly-leader``). Only the
+    elected leader runs the scheduler; the follower serves
+    ``/metrics`` from the Redis snapshot cache. Failover triggers an
+    immediate detection run on the new leader so the next scrape
+    sees fresh scores — see docs/operations.md for the worked
+    timeline.
+
+  - The query cache (also Redis) deduplicates overlapping rolling
+    windows across replicas: the leader writes, both leader and
+    follower can read. The ``key_prefix`` is shared with the
+    snapshot cache; they coexist in a single Redis database.
+
+  - Pod anti-affinity (``kubernetes.io/hostname``) keeps the two
+    replicas on different nodes so a single node drain never takes
+    both. Set ``topology.kubernetes.io/zone`` instead on
+    multi-zone clusters where intra-zone scheduling is acceptable.
+
+  - NetworkPolicy ingress (rendered by the chart) restricts
+    ``/-/reload`` and ``/debug/inspect`` to the observability
+    namespace. The sibling egress NetworkPolicy
+    (``examples/production/networkpolicy-egress.yaml``) constrains
+    egress to VictoriaMetrics, Redis, and the Kubernetes apiserver
+    only.
+
+  - The bundled PrometheusRule fires the canonical alerts
+    (``AnomalyOutsideThreshold``, ``AnomalyLongRunning``,
+    ``AnomalyStale``, ``AnomalySourceFailing``, …); see
+    ``examples/alerts/promanomaly-rules.yaml`` for the full set
+    and docs/operations.md for the tuning matrix.
+
+
+GitOps wiring
+-------------
+
+Two equivalent end-states ship in this directory:
+
+  argocd/
+    application.yaml      Argo CD ``Application`` with two-source
+                          chart+values pinning.
+
+  flux/
+    helmrepository.yaml   ``HelmRepository`` resolving the chart.
+    helmrelease.yaml      ``HelmRelease`` with ``existingConfigMap``
+                          pointing at the sibling ConfigMap.
+    configmap.yaml        Detector groups managed independently of
+                          chart upgrades.
+
+Pick one; do not mix. Both pin ``promanomaly`` chart ``1.0.0``;
+bump via PR.
