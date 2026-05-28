@@ -48,6 +48,11 @@ from .discovery import (
 from .exporter import OperationalMetrics
 from .source import PromQLSource, QueryResult, QuerySeries, SourceQueryError
 from .state import GroupSnapshot, Sample, SnapshotStore
+from .stratified import (
+    baseline_refresh_seconds_for,
+    collect_misconfigurations,
+    query_window_seconds_for,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -104,6 +109,41 @@ class _GroupInnerResult:
 
 
 @dataclass
+class _StratifiedBaseline:
+    """Cached long-history fetch for one (group, query) under the
+    sliding-window strategy.
+
+    The runner caches the heavy multi-week baseline pull and only
+    refreshes it at ``baseline_refresh_interval`` cadence; every detector
+    run still pulls the short window fresh and stitches it onto this
+    cache before scoring. Keyed by (group, rendered_id); rebuilt from
+    zero on restart and on config reload (state for removed groups is
+    dropped by :meth:`Runner.replace_config`).
+
+    ``promql`` is captured so a reload that changes the PromQL string of
+    a kept ``(group, query_id)`` invalidates the cache — otherwise the
+    runner would silently stitch the old signal's baseline onto the new
+    signal's short window.
+
+    ``template_query_id`` and ``template_promql`` carry the
+    pre-substitution form for discover-templated queries (and equal the
+    rendered form for non-discover queries). Reload identity is checked
+    against the template, not the rendered form, so reloading a
+    discover template's PromQL invalidates all its rendered descendants
+    at once — and reloading without any change preserves them.
+    """
+
+    fetched_at: float
+    promql: str
+    window_seconds: float
+    step_seconds: float
+    series_by_key: dict[tuple[tuple[str, str], ...], QuerySeries]
+    template_query_id: str = ""
+    template_promql: str = ""
+    truncated: bool = False
+
+
+@dataclass
 class GroupRunResult:
     group: str
     samples: list[Sample] = field(default_factory=list)
@@ -155,10 +195,70 @@ class Runner:
         # Per-detector compute time captured during the current run;
         # flushed onto the operational gauge at the end of the run.
         self._detect_durations: dict[str, float] = {}
+        # Stratified-detector baseline cache. Keyed by (group, query_id)
+        # — the heavy multi-week pull lives here and is reused for
+        # ``baseline_refresh_interval`` before the next fetch. The short
+        # latest-sample window is pulled every refresh and stitched in
+        # before scoring. Entries for removed groups / queries are
+        # dropped by ``replace_config`` so a reload that trims the
+        # config does not leak stale baselines.
+        self._stratified_baseline_cache: dict[tuple[str, str], _StratifiedBaseline] = {}
+        # Per (group, query.id template) -> dict mapping
+        # ``rendered_id`` -> consecutive runs absent. Used to evict
+        # stratified baseline cache entries for ``discover:``-templated
+        # queries whose rendered ids stop appearing — without this,
+        # workloads that churn through ephemeral identities (pod names,
+        # replica IDs that never recycle) grow the cache without bound.
+        # Ages out on the same ``safety.discovery.forget_after_runs``
+        # threshold the snapshot store uses for signal-missing tracking.
+        self._discovery_stratified_misses: dict[tuple[str, str], dict[str, int]] = {}
+        # Surface stratified-config issues once at boot — but only on
+        # single-replica deployments. In HA mode every follower would
+        # otherwise log the same warning, multiplying the noise by the
+        # replica count without adding information. The leader picks
+        # up the warning instead via ``surface_misconfigurations()``,
+        # called from the leader-acquisition callback in main.py.
+        if not self._config.highAvailability.enabled:
+            self.surface_misconfigurations()
 
     @property
     def config(self) -> Config:
         return self._config
+
+    # ------------------------------------------------------------------
+    # Test-friendly accessors. The underscored attributes are
+    # implementation detail; these properties exist so tests can
+    # introspect cache + discovery state without pinning to the field
+    # names (a rename would otherwise cascade into every test).
+    # Production code should not use these — read the snapshot store
+    # for live metrics or call ``surface_misconfigurations`` for the
+    # config-health check.
+    # ------------------------------------------------------------------
+    def stratified_cache_keys_for_testing(self) -> set[tuple[str, str]]:
+        """Snapshot of currently-cached ``(group, rendered_id)`` keys."""
+        return set(self._stratified_baseline_cache.keys())
+
+    def stratified_cache_size_for_testing(self) -> int:
+        """Total live stratified baseline cache entries."""
+        return len(self._stratified_baseline_cache)
+
+    def discovery_stratified_misses_for_testing(
+        self,
+    ) -> dict[tuple[str, str], dict[str, int]]:
+        """Defensive copy of the discovery-churn miss tracker."""
+        return {key: dict(inner) for key, inner in self._discovery_stratified_misses.items()}
+
+    def age_stratified_cache_entry_for_testing(
+        self, cache_key: tuple[str, str], delta_seconds: float
+    ) -> None:
+        """Backdate one cache entry's ``fetched_at`` for staleness tests.
+
+        Pure test ergonomics — avoids tests sleeping for the
+        ``baseline_refresh_interval`` to observe re-fetch behaviour.
+        Raises KeyError if the entry doesn't exist so the test fails
+        loudly rather than silently no-op'ing.
+        """
+        self._stratified_baseline_cache[cache_key].fetched_at -= delta_seconds
 
     def replace_config(self, new_config: Config) -> None:
         """Hot-replace the config without disposing the runner.
@@ -179,7 +279,28 @@ class Runner:
         for added in new_names - old_names:
             self._group_locks[added] = asyncio.Lock()
         self._store.clear_calibrations()
+        self._prune_stratified_cache_on_reload(new_config)
+        # The discovery-churn miss tracker is keyed by the *template*
+        # query id; drop entries for templates that no longer exist so a
+        # reload that removes a discover: query frees its tracker state
+        # along with its cache.
+        new_template_keys: set[tuple[str, str]] = {
+            (group.name, query.id)
+            for group in new_config.groups
+            for query in group.queries
+            if query.discover
+        }
+        for tracker_key in list(self._discovery_stratified_misses):
+            if tracker_key not in new_template_keys:
+                del self._discovery_stratified_misses[tracker_key]
         self._config = new_config
+        # Re-check stratified config after the reload — operators may
+        # have introduced a bad ``baseline_refresh_interval`` value
+        # since boot, and silent strategy-degradation would be worse
+        # than a noisy log line. Same single-replica gating as boot —
+        # the leader resurfaces on its next acquisition in HA mode.
+        if not self._config.highAvailability.enabled:
+            self.surface_misconfigurations()
 
     async def run_group(self, group_name: str) -> GroupRunResult:
         """Execute one detection pass for ``group_name``.
@@ -402,6 +523,18 @@ class Runner:
 
         self._ops.discovery_expansions.labels(group=group.name, query=query.id).set(len(variants))
 
+        # Stratified-cache bookkeeping for discovery: ages out cache
+        # entries for rendered ids that stop appearing, so a workload
+        # with churning identities (transient pods, replica IDs that
+        # never recycle) doesn't grow the cache without bound. Cheap
+        # no-op when no detector on the query opts into the
+        # sliding-window strategy.
+        self._prune_stratified_cache_for_discovery(
+            group=group,
+            query=query,
+            active_rendered_ids={v.rendered_id for v in variants},
+        )
+
         seen_keys: list[tuple[tuple[str, str], ...]] = []
         for variant in variants:
             seen_keys.append(variant.label_key)
@@ -458,6 +591,160 @@ class Runner:
                     value=1.0,
                 )
             )
+
+    def surface_misconfigurations(self) -> None:
+        """Log boot / reload / leader-acquisition warnings for stratified config.
+
+        Three categories are surfaced; all keep the runner alive because
+        the safe fallback (no stratified strategy) is strictly better
+        than refusing to start:
+
+        - ``invalid_value`` — ``baseline_refresh_interval`` resolves to
+          a non-positive number; the strategy silently degrades to the
+          per-run full-window fetch path.
+        - ``below_refresh_interval`` — value is shorter than
+          ``server.refresh_interval``, so the cache is always stale
+          and the heavy long-history query fires every refresh.
+        - ``invalid_lookback`` — ``query_window_seconds`` resolves to
+          a non-positive number; the bucket baseline collapses.
+
+        Public surface because the HA leader-acquisition callback
+        calls it directly: followers stay quiet so a cluster only sees
+        one copy of the warning per leader instead of one per replica.
+        Detector registry lookup failures are tolerated (logged as
+        ``unknown_detector`` only when the runner actually tries to
+        use that detector — we don't want to double-log here).
+        """
+
+        def _resolve(name: str) -> type[Any]:
+            return get(name)
+
+        findings = collect_misconfigurations(
+            self._config.groups,
+            _resolve,
+            self._config.server.refresh_interval_seconds,
+        )
+        for finding in findings:
+            kind = finding.get("kind")
+            if kind == "invalid_value":
+                logger.warning(
+                    "stratified_baseline_refresh_invalid",
+                    group=finding["group"],
+                    query=finding["query"],
+                    detector=finding["detector"],
+                    instance=finding["instance"],
+                    baseline_refresh_seconds=finding["baseline_refresh_seconds"],
+                    note=(
+                        "baseline_refresh_interval must be > 0; sliding-window "
+                        "strategy disabled for this detector"
+                    ),
+                )
+            elif kind == "below_refresh_interval":
+                logger.warning(
+                    "stratified_baseline_refresh_below_refresh_interval",
+                    group=finding["group"],
+                    query=finding["query"],
+                    detector=finding["detector"],
+                    instance=finding["instance"],
+                    baseline_refresh_seconds=finding["baseline_refresh_seconds"],
+                    refresh_interval_seconds=finding["refresh_interval_seconds"],
+                    note=(
+                        "baseline_refresh_interval shorter than "
+                        "server.refresh_interval: cache always stale, heavy "
+                        "fetch fires every refresh"
+                    ),
+                )
+            elif kind == "invalid_lookback":
+                logger.warning(
+                    "stratified_lookback_invalid",
+                    group=finding["group"],
+                    query=finding["query"],
+                    detector=finding["detector"],
+                    instance=finding["instance"],
+                    query_window_seconds=finding["query_window_seconds"],
+                    note=(
+                        "lookback must be > 0; sliding-window strategy "
+                        "disabled and bucket baseline will be empty"
+                    ),
+                )
+
+    def _prune_stratified_cache_on_reload(self, new_config: Config) -> None:
+        """Evict stratified cache entries the new config no longer owns.
+
+        Three eviction conditions, all checked against the *template*
+        identity (id + promql before any discover: substitution) so a
+        reload's effect on a discover query's many rendered descendants
+        is uniform:
+
+        - Template id absent from the new config (group removed or
+          query renamed / deleted).
+        - Template promql changed under the reload — would otherwise
+          stitch the old signal's baseline onto the new signal's short
+          fetch.
+        - Template still present but no longer has a stratified
+          detector — the cache entry is dead weight (``_fetch_stratified``
+          will never read it) and just consumes memory until forget-
+          after-runs trims it.
+        """
+        # Build the set of (group, template_query_id) -> template_promql
+        # for queries in the new config that still have at least one
+        # stratified detector. Anything else makes a cache entry
+        # ineligible to live through the reload.
+        live_templates: dict[tuple[str, str], str] = {}
+        for group in new_config.groups:
+            for query in group.queries:
+                has_stratified = any(
+                    _query_has_stratified_detector(entry) for entry in query.detectors
+                )
+                if has_stratified:
+                    live_templates[(group.name, query.id)] = query.promql
+
+        for cache_key in list(self._stratified_baseline_cache):
+            cached = self._stratified_baseline_cache[cache_key]
+            template_id = cached.template_query_id or cache_key[1]
+            template_promql = cached.template_promql or cached.promql
+            live_template_promql = live_templates.get((cache_key[0], template_id))
+            if live_template_promql is None or live_template_promql != template_promql:
+                del self._stratified_baseline_cache[cache_key]
+
+    def _prune_stratified_cache_for_discovery(
+        self,
+        *,
+        group: GroupConfig,
+        query: QueryConfig,
+        active_rendered_ids: set[str],
+    ) -> None:
+        """Age out stratified baseline cache entries for vanished discover ids.
+
+        Mirrors the snapshot store's ``forget_after_runs`` semantics for
+        the signal-missing tracker, so both state-bounding paths age out
+        on the same threshold. Currently-active rendered ids reset the
+        miss counter; absent ones increment it and get evicted from the
+        cache (and the tracker) once they cross
+        ``safety.discovery.forget_after_runs`` consecutive absent runs.
+
+        Cheap when the query has no stratified detectors — the tracker
+        dict stays empty and no cache lookups happen.
+        """
+        forget_after = self._config.safety.discovery.forget_after_runs
+        tracker_key = (group.name, query.id)
+        misses = self._discovery_stratified_misses.setdefault(tracker_key, {})
+
+        # Register currently-active rendered ids with miss_count=0
+        # (new arrivals enter here; returning ones reset).
+        for rid in active_rendered_ids:
+            misses[rid] = 0
+
+        # Increment misses for known-but-absent rendered ids; evict
+        # entries that cross the threshold from both the miss tracker
+        # and the stratified cache itself.
+        for rid in list(misses):
+            if rid in active_rendered_ids:
+                continue
+            misses[rid] += 1
+            if misses[rid] > forget_after:
+                del misses[rid]
+                self._stratified_baseline_cache.pop((group.name, rid), None)
 
     async def _probe_discovery_variables(
         self,
@@ -570,7 +857,10 @@ class Runner:
 
         try:
             qresult, plans = await self._fetch_and_plan(
-                group, effective_query, inflight_series_count=out.series_count
+                group,
+                effective_query,
+                inflight_series_count=out.series_count,
+                template_query=query,
             )
         except SourceQueryError as exc:
             logger.warning(
@@ -653,6 +943,7 @@ class Runner:
         query: QueryConfig,
         *,
         inflight_series_count: int = 0,
+        template_query: QueryConfig | None = None,
     ) -> tuple[QueryResult, list[_DetectorPlan]]:
         defaults = self._config.defaults
         # Validate the detector references up front so we fail loudly
@@ -665,26 +956,49 @@ class Runner:
                 _DetectorPlan(name=entry.name, instance=entry.instance, cls=cls, params=params)
             )
 
-        # Stratified detectors (HourOfDayMAD) need a longer query window
-        # than the group default. We take the max across all detectors
-        # in the query so MAD + Hampel + HourOfDayMAD can coexist
-        # without forcing the group's defaults.window upward.
-        window_seconds = defaults.window_seconds
+        # Split plans into stratified (sliding-window strategy) and
+        # plain rolling. Stratified plans expose
+        # ``baseline_refresh_interval_seconds`` AND ``query_window_seconds``;
+        # plain rolling plans either omit both or expose only the latter
+        # (e.g. v0.2 HourOfDayMAD, which fetches its full lookback every
+        # refresh).
+        short_window_seconds = defaults.window_seconds
+        stratified_meta: list[tuple[float, float]] = []  # (window_seconds, refresh_seconds)
         for plan in plans:
-            override = getattr(plan.cls, "query_window_seconds", None)
-            if callable(override):
-                value = override(plan.params)
-                if value is not None and value > window_seconds:
-                    window_seconds = float(value)
+            qw = _detector_window_for(plan)
+            refresh = _detector_baseline_refresh_for(plan)
+            if qw is not None and refresh is not None:
+                stratified_meta.append((qw, refresh))
+            elif qw is not None and qw > short_window_seconds:
+                # Non-stratified detector that nevertheless wants a
+                # longer window than the group default — the v0.2
+                # HourOfDayMAD pattern. Per-refresh fetch path.
+                short_window_seconds = qw
 
         end = time.time()
-        result = await self._source.range_query(
-            promql=query.promql,
-            end=end,
-            window_seconds=window_seconds,
-            step_seconds=defaults.step_seconds,
-            max_series=self._config.safety.max_series_per_query,
-        )
+        if stratified_meta:
+            baseline_window = max(qw for qw, _ in stratified_meta)
+            # Most-aggressive cadence wins when a query mixes detectors
+            # with different baseline refresh intervals — fresher data
+            # for everyone, at the cost of more TSDB load.
+            baseline_refresh = min(refresh for _, refresh in stratified_meta)
+            result = await self._fetch_stratified(
+                group=group,
+                query=query,
+                end=end,
+                short_window_seconds=short_window_seconds,
+                baseline_window_seconds=baseline_window,
+                baseline_refresh_seconds=baseline_refresh,
+                template_query=template_query or query,
+            )
+        else:
+            result = await self._source.range_query(
+                promql=query.promql,
+                end=end,
+                window_seconds=short_window_seconds,
+                step_seconds=defaults.step_seconds,
+                max_series=self._config.safety.max_series_per_query,
+            )
 
         # Enforce max_total_series across all groups + queries in the
         # current pass. Each group runs in its own scheduler tick, so
@@ -701,6 +1015,129 @@ class Runner:
             if len(result.series) > running_budget:
                 result = QueryResult(series=result.series[:running_budget], truncated=True)
         return result, plans
+
+    async def _fetch_stratified(
+        self,
+        *,
+        group: GroupConfig,
+        query: QueryConfig,
+        end: float,
+        short_window_seconds: float,
+        baseline_window_seconds: float,
+        baseline_refresh_seconds: float,
+        template_query: QueryConfig | None = None,
+    ) -> QueryResult:
+        """Sliding-window fetch for queries with a stratified detector.
+
+        Pulls the short window every refresh and the long baseline
+        window only when the per-(group, query) cache is stale (or the
+        baseline window has grown via a reload). The two results are
+        stitched per-series — cached baseline samples before the earliest
+        timestamp in the short window, then the fresh short window —
+        before being handed back to the scoring path.
+
+        TSDB-failure semantics: a baseline fetch raising
+        :class:`SourceQueryError` propagates so the surrounding
+        ``safety.on_source_failure`` policy applies; a stale-but-present
+        cache is not silently reused. A short-window failure likewise
+        propagates. The bookkeeping is done in the runner so detectors
+        never see partial state.
+
+        ``template_query`` (when set, i.e. for discover-templated
+        variants) carries the pre-substitution id + promql. The cache
+        records those so reload-time identity checks compare templates
+        rather than rendered ids — without that, every reload would
+        wipe every discover-derived cache entry (the template id never
+        equals the rendered id).
+        """
+        defaults = self._config.defaults
+        max_series = self._config.safety.max_series_per_query
+        cache_key = (group.name, query.id)
+        template = template_query or query
+
+        # A SourceQueryError on either fetch propagates so the
+        # surrounding ``safety.on_source_failure`` policy applies
+        # (serve_stale preserves the previous snapshot, drop_scores
+        # skips just this query). We log a structured event with the
+        # cache-present flag so operators can distinguish "TSDB blip
+        # but we have history we're refusing to silently age" from a
+        # cold-start failure. The exception still propagates; the
+        # log event is purely additional context. See
+        # docs/scaling-stratified.md (Caching & HA Behavior).
+        try:
+            short_result = await self._source.range_query(
+                promql=query.promql,
+                end=end,
+                window_seconds=short_window_seconds,
+                step_seconds=defaults.step_seconds,
+                max_series=max_series,
+            )
+        except SourceQueryError as exc:
+            logger.warning(
+                "stratified_baseline_fetch_failed",
+                group=group.name,
+                query=query.id,
+                phase="short",
+                reason=exc.reason,
+                detail=exc.message,
+                cache_present=cache_key in self._stratified_baseline_cache,
+            )
+            raise
+
+        cached = self._stratified_baseline_cache.get(cache_key)
+        baseline_stale = (
+            cached is None
+            or (end - cached.fetched_at) >= baseline_refresh_seconds
+            or cached.window_seconds != baseline_window_seconds
+            or cached.step_seconds != defaults.step_seconds
+            # Defensive: if a caller swapped the config in-place (rather
+            # than through replace_config), the cache's recorded promql
+            # may no longer match. Reload covers the common path; this
+            # guard covers anything that doesn't.
+            or cached.promql != query.promql
+        )
+        if baseline_stale:
+            try:
+                baseline_result = await self._source.range_query(
+                    promql=query.promql,
+                    end=end,
+                    window_seconds=baseline_window_seconds,
+                    step_seconds=defaults.step_seconds,
+                    max_series=max_series,
+                )
+            except SourceQueryError as exc:
+                logger.warning(
+                    "stratified_baseline_fetch_failed",
+                    group=group.name,
+                    query=query.id,
+                    phase="baseline",
+                    reason=exc.reason,
+                    detail=exc.message,
+                    cache_present=cached is not None,
+                )
+                raise
+            cached = _StratifiedBaseline(
+                fetched_at=end,
+                promql=query.promql,
+                window_seconds=baseline_window_seconds,
+                step_seconds=defaults.step_seconds,
+                series_by_key={s.label_key: s for s in baseline_result.series},
+                template_query_id=template.id,
+                template_promql=template.promql,
+                truncated=baseline_result.truncated,
+            )
+            self._stratified_baseline_cache[cache_key] = cached
+
+        assert cached is not None  # mypy: established by either branch above
+        stitched: list[QuerySeries] = []
+        for series in short_result.series:
+            base = cached.series_by_key.get(series.label_key)
+            stitched.append(_stitch_series(base, series))
+
+        return QueryResult(
+            series=stitched,
+            truncated=short_result.truncated or cached.truncated,
+        )
 
     def _merge_params(
         self,
@@ -1334,6 +1771,59 @@ class Runner:
             self._ops.detect_duration_seconds.labels(
                 group=result.group, detector=detector_name
             ).set(elapsed)
+
+
+def _detector_window_for(plan: _DetectorPlan) -> float | None:
+    """Thin wrapper around the shared stratified helper, bound to a plan."""
+    return query_window_seconds_for(plan.cls, plan.params)
+
+
+def _detector_baseline_refresh_for(plan: _DetectorPlan) -> float | None:
+    """Thin wrapper around the shared stratified helper, bound to a plan."""
+    return baseline_refresh_seconds_for(plan.cls, plan.params)
+
+
+def _query_has_stratified_detector(entry: DetectorEntry) -> bool:
+    """Best-effort: does this detector entry opt into the sliding-window strategy?
+
+    Resolves the class via the registry; an unknown name resolves to
+    False so a misconfigured detector doesn't keep a stratified cache
+    entry alive across reload. The runner's unknown-detector handling
+    surfaces the bad reference at run time anyway.
+    """
+    try:
+        cls = get(entry.name)
+    except Exception:
+        return False
+    merged: dict[str, Any] = dict(getattr(cls, "defaults", {}) or {})
+    merged.update(entry.params or {})
+    return (
+        query_window_seconds_for(cls, merged) is not None
+        and baseline_refresh_seconds_for(cls, merged) is not None
+    )
+
+
+def _stitch_series(base: QuerySeries | None, fresh: QuerySeries) -> QuerySeries:
+    """Combine a cached baseline window with the latest short window.
+
+    Cached baseline samples whose timestamp is at or after the earliest
+    timestamp in the fresh window are dropped — the fresh fetch is the
+    source of truth for the overlap. New series (no cached baseline)
+    fall back to the short window unchanged; the detector then either
+    handles the small slice or surfaces ``insufficient_data`` per its
+    own contract.
+    """
+    if base is None or base.samples.empty:
+        return fresh
+    if fresh.samples.empty:
+        return base
+    earliest_fresh_ts = float(fresh.samples["timestamp"].iloc[0])
+    base_keep = base.samples[base.samples["timestamp"] < earliest_fresh_ts]
+    if base_keep.empty:
+        combined = fresh.samples.reset_index(drop=True)
+    else:
+        combined = pd.concat([base_keep, fresh.samples], ignore_index=True)
+    return QuerySeries(labels=dict(fresh.labels), samples=combined)
 
 
 def _effective_threshold(plan: _DetectorPlan, fallback: float) -> float:

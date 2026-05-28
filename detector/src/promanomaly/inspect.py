@@ -32,6 +32,7 @@ from .detectors import UnknownDetectorError, get
 from .runner import _build_detector
 from .source import PromQLSource, QuerySeries, SourceQueryError
 from .state import SnapshotStore
+from .stratified import query_window_seconds_for
 
 
 class InspectError(Exception):
@@ -137,13 +138,17 @@ def _trim_window(series: QuerySeries) -> list[dict[str, float]]:
 
 
 def _detector_input_window_seconds(cls: Any, params: dict[str, Any], defaults: float) -> float:
-    """Mirror Runner._detector_input_window_seconds for inspect-time scoring."""
-    override = getattr(cls, "query_window_seconds", None)
-    if callable(override):
-        value = override(params)
-        if value is not None:
-            return float(value)
-    return defaults
+    """Mirror Runner._detector_input_window_seconds for inspect-time scoring.
+
+    Delegates to the shared ``query_window_seconds_for`` helper — same
+    value-gating (non-positive returns None) and exception-swallowing
+    semantics as the runner's fetch-window decision so inspect and live
+    scoring widen identically for stratified detectors. A buggy
+    detector that raises from ``query_window_seconds`` falls back to
+    the group default instead of crashing the /debug/inspect endpoint.
+    """
+    override = query_window_seconds_for(cls, params)
+    return override if override is not None else defaults
 
 
 async def inspect_series(

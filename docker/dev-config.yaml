@@ -92,6 +92,42 @@ groups:
           - name: BOCPD
           - name: CUSUM
 
+      # v0.5 stratified detectors. ``lookback`` is shrunk to fit the
+      # dev stack — VictoriaMetrics rejects range queries asking for
+      # data older than retention with HTTP 422, so a production 4w
+      # lookback would fail every refresh against a young dev TSDB.
+      # The shrunk values still exercise the sliding-window cache (the
+      # heavy query fires every 5 minutes instead of every 30 seconds)
+      # and the runner's stitch path; they are NOT the production
+      # defaults. See examples/configs/weekly-baseline.yaml for the
+      # real-world numbers.
+      #
+      # Note: this query lives in the ``node_dev`` group which sets
+      # ``auto_select: explicit_plus_best`` and leaves the default
+      # ``emit_baseline_stability: true``. Auto-select calibration is
+      # documented as best-effort for stratified detectors (the
+      # synthetic-injection patterns contaminate same-bucket baselines,
+      # biasing F1 down), so MAD will usually win the per-series
+      # comparison even on signals where the stratified detector is
+      # the right answer. The dev stack keeps the default to exercise
+      # the full calibration code path; production stratified-only
+      # groups should set ``auto_select: false`` and
+      # ``defaults.emit_baseline_stability: false`` — see
+      # docs/scaling-stratified.md.
+      - id: node_cpu_iowait_pct
+        promql: '100 * (avg by (instance) (rate(node_cpu_seconds_total{mode="iowait"}[1m])))'
+        detectors:
+          - name: HourOfDayMAD
+            params:
+              lookback: 2h
+              bucket_width: 1h
+              baseline_refresh_interval: 5m
+          - name: DayOfWeekMAD
+            params:
+              lookback: 4h
+              bucket_width: 1h
+              baseline_refresh_interval: 5m
+
   - name: cluster_discovered
     priority: 2
     # v0.4: dynamic discovery against the local Prometheus's external

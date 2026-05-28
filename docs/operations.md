@@ -194,6 +194,20 @@ Per-detector threshold is honoured in **both** the live-scoring path and the cal
 
 See [`change-points.md`](change-points.md) for the algorithm details and worked examples.
 
+## Stratified Detectors
+
+Stratified detectors (`HourOfDayMAD`, `DayOfWeekMAD`) compare the current sample against historical samples from the same time bucket and need multi-week lookbacks. promanomaly runs them through a sliding-window fetch strategy that caches the heavy long-history query and only re-pulls it at `baseline_refresh_interval` cadence (default `1h`), while the latest short window is fetched every `refresh_interval` and stitched onto the cached baseline before scoring.
+
+Operationally relevant knobs:
+
+- `baseline_refresh_interval` per detector — trade TSDB load for baseline freshness.
+- Boot-time warnings (`stratified_baseline_refresh_invalid`, `stratified_baseline_refresh_below_refresh_interval`, `stratified_lookback_invalid`) — grep for these in logs after a config change.
+- `validate --probe` reports the projected per-day TSDB query count for every stratified detector — gate CI on `--strict` to catch wildcard cost overruns.
+- HA: only the leader fetches; followers serve the leader's shared snapshot. On failover the new leader pays a one-time full baseline fetch for every stratified query.
+- Calibration / auto-select is a best-effort surface for stratified detectors — the synthetic-injection patterns contaminate same-bucket baselines, so prefer explicit detector selection and consider `defaults.emit_baseline_stability: false`.
+
+Full operational rationale, multi-instance behaviour, backtest interactions, and TSDB-cost guidance live in [`scaling-stratified.md`](scaling-stratified.md).
+
 ## Query Caching
 
 The detector ships an in-process LRU + TTL cache for PromQL responses. Two unrelated callers that issue the same query inside the TTL share one TSDB hit — useful when the same expression is configured under multiple `id`s, when an ensemble runs several detectors against the same source query, or when `refresh_interval` is shorter than the rolling `step` and consecutive ticks land in the same bucket.

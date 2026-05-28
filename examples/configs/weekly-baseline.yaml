@@ -1,0 +1,98 @@
+# Stratified-baseline example (v0.5).
+#
+# Pairs HourOfDayMAD (daily structure) with DayOfWeekMAD (weekly
+# structure) on the same signal so operators catch both the daily-shape
+# anomaly and the weekday-vs-weekend anomaly. The runner's sliding-
+# window fetch strategy keeps TSDB load bounded — the heavy multi-week
+# query runs once per ``baseline_refresh_interval`` (default ``1h``)
+# while the latest sample is still pulled every ``refresh_interval``
+# and stitched onto the cached baseline before scoring.
+#
+# Use ``promanomaly calibrate-buckets --query '...' --from -14d`` first
+# if you're not sure which stratification fits your signal. See
+# docs/scaling-stratified.md for the TSDB-cost projections.
+
+apiVersion: promanomaly.io/v1alpha1
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 30s
+
+server:
+  listen: ":9092"
+  refresh_interval: 1m
+
+safety:
+  max_series_per_query: 500
+  max_total_series: 5000
+  on_source_failure: serve_stale
+
+defaults:
+  window: 1h
+  step: 15s
+  min_points: 60
+  warmup_policy: emit_warming_up
+  emit_baseline: true
+  # Stratified detectors are a documented carve-out from the calibration
+  # cycle: ``_baseline_stability`` compares baseline values on two halves
+  # of the window, but for HourOfDayMAD / DayOfWeekMAD those halves land
+  # in different buckets with naturally different medians — stability
+  # collapses toward zero on a perfectly clean signal and the gauge is
+  # actively misleading. Turning it off for stratified-heavy groups
+  # avoids noisy dashboards. See docs/scaling-stratified.md (Calibration,
+  # Confidence, and Auto-select Caveats).
+  emit_baseline_stability: false
+  emit_duration: true
+  alert_thresholds:
+    score: 3.0
+
+groups:
+  - name: weekly_business_traffic
+    priority: 10
+    # B2B traffic is the canonical case: weekdays heavy, weekends quiet,
+    # business hours peak. A flat MAD smears the daily shape; an
+    # HourOfDayMAD smears the weekday/weekend split; both stratified
+    # detectors together cover the matrix.
+    ensemble:
+      method: voting
+      min_detectors: 2
+    queries:
+      - id: request_rate
+        promql: sum by (service) (rate(http_requests_total[5m]))
+        detectors:
+          # Hour-of-day stratification — the lighter lookback catches
+          # "this 3am looks unlike prior 3am samples". Opts into the
+          # sliding-window strategy by default.
+          - name: HourOfDayMAD
+            params:
+              lookback: 7d
+              bucket_width: 1h
+              baseline_refresh_interval: 1h
+
+          # Day-of-week stratification — catches "this Saturday looks
+          # unlike prior Saturdays". Heavier 4w lookback; same
+          # sliding-window strategy keeps the TSDB cost bounded.
+          - name: DayOfWeekMAD
+            params:
+              lookback: 4w
+              bucket_width: 1h
+              baseline_refresh_interval: 1h
+
+          # Plain MAD on the rolling window — fast outlier catch for
+          # the within-hour anomalies the stratified detectors can't
+          # resolve.
+          - name: MAD
+
+  - name: batch_job_runtimes
+    priority: 5
+    # Batch jobs that only run on Mondays (or specific weekdays) need
+    # the day-of-week dimension; the hour-of-day signal alone would
+    # treat every Tuesday-3am as an anomaly if the baseline includes
+    # Monday-3am runtimes.
+    queries:
+      - id: batch_runtime_seconds
+        promql: max by (job) (rate(batch_job_runtime_seconds_total[10m]))
+        detectors:
+          - name: DayOfWeekMAD
+            params:
+              lookback: 4w

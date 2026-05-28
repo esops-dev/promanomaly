@@ -145,8 +145,53 @@ Bucket every sample in the lookback window by its UTC hour-of-day (24 buckets by
 - `lookback` (default `7d`) — how far back to fetch baseline samples.
 - `bucket_width` (default `1h`) — must divide 24h evenly (e.g. `30m`, `1h`, `2h`, `4h`).
 
+**Time zone caveat**
+Buckets are computed against **UTC** wall-clock time because Prometheus stores UTC. If your operations team thinks in a non-UTC timezone (e.g. JST = UTC+9), "9 AM local" buckets line up with UTC midnight bucket; bucket boundaries don't align with local "hour of day". This is fine for periodic anomaly detection but can confuse on-call ("the alert says hour 0 was anomalous; it's 9 AM here"). A local-timezone option is deferred until enough operators ask for it — for now, document the offset alongside your runbook or use a `bucket_width` that's a divisor of your timezone offset to keep buckets aligned.
+
 **Resource note**
-A long lookback against a large query can pull a lot of data; respect `safety.max_series_per_query` and `safety.max_total_series`. The full day-of-week / multi-week version (with bounded sliding-window query strategy) lands in a later milestone.
+A long lookback against a large query can pull a lot of data; respect `safety.max_series_per_query` and `safety.max_total_series`. The full day-of-week / multi-week version is `DayOfWeekMAD` (below) and uses the runner's sliding-window fetch strategy to keep TSDB load bounded.
+
+## DayOfWeekMAD — Stratified by (Day-of-Week, Hour-of-Day)
+
+```yaml
+detectors:
+  - name: DayOfWeekMAD
+    params:
+      lookback: 4w                    # default
+      bucket_width: 1h                # default
+      baseline_refresh_interval: 1h   # default
+```
+
+**Best for**
+Weekly-periodic signals where weekend traffic behaves nothing like weekday traffic — B2B request rates that go quiet on Saturdays, batch jobs that only run on Mondays, business-hours error rates that differ from overnight. A single `HourOfDayMAD` median-collapses weekday + weekend samples and either smears the baseline or false-positives every weekend afternoon; `DayOfWeekMAD` keeps them separate via a 7x24 grid.
+
+**This is still baseline detection, not forecasting.**
+Same carve-out as `HourOfDayMAD`. The detector scores the present against historical observations from the same `(day-of-week, hour-of-day)` bucket — it never predicts future values.
+
+**How it works**
+Bucket every sample in the lookback window by `(weekday(), hour-of-day)` (default 7x24 grid, all in UTC). For the latest sample, find its bucket, compute median + MAD over the same-bucket history, and score `|y - bucket_median| / bucket_MAD`. The `weekday()` value follows Python's `datetime.weekday()` convention (Monday=0).
+
+**Parameters**
+- `lookback` (default `4w`) — multi-week window. Sized in weeks so every bucket has several observations to median over. Accepts `w` (weeks), `d` (days), `h` (hours), `m` (minutes).
+- `bucket_width` (default `1h`) — within-day bucket width; must divide 24h evenly.
+- `baseline_refresh_interval` (default `1h`) — opts the detector into the runner's sliding-window fetch strategy: the heavy multi-week query runs at this cadence rather than every `server.refresh_interval`. See [`scaling-stratified.md`](scaling-stratified.md) for the operational rationale.
+
+**Time zone caveat**
+Both `weekday()` and the within-day bucket are computed in **UTC**. For operators in non-UTC timezones the weekday boundary lands at local times other than midnight: in JST (UTC+9), the UTC "Sunday" bucket covers Sunday 09:00 → Monday 09:00 local. That's fine for weekly periodicity detection but operators reading dashboards should remember that "weekday 5 (Saturday)" in a metric label refers to UTC Saturday, not local Saturday. Same deferred-timezone-option rationale as `HourOfDayMAD`.
+
+**When to choose**
+- Use `DayOfWeekMAD` when weekday vs. weekend (or Monday-vs-rest) behaviour materially differs.
+- Use `HourOfDayMAD` when the daily shape is consistent across the week and a one-week lookback is enough.
+- Use plain `MAD` when neither dimension is informative — the rolling window already captures the relevant context.
+
+**Example**
+[`examples/configs/weekly-baseline.yaml`](../examples/configs/weekly-baseline.yaml) ships a production-shaped reference combining `HourOfDayMAD` + `DayOfWeekMAD` + `MAD` with a voting ensemble — a useful starting point if your signal has both daily and weekly structure.
+
+**Resource note**
+The sliding-window strategy keeps TSDB load bounded even at a 4w lookback: the long query fires once per `baseline_refresh_interval` (default `1h`) while the latest sample is still fetched every refresh and stitched onto the cached baseline before scoring. `validate --probe` reports the projected per-day query count for each stratified detector — see [`scaling-stratified.md`](scaling-stratified.md).
+
+**Calibration caveat**
+The `auto_select` cycle and the `anomaly_confidence_score` / `anomaly_baseline_stability` gauges were designed for rolling-window detectors and are imperfect for stratified ones — the synthetic-injection patterns partially contaminate same-bucket baselines, and the stability proxy compares bucket medians that legitimately differ on a clean signal. For stratified-only configs, prefer explicit detector selection (`auto_select: false`) and consider `defaults.emit_baseline_stability: false`. Full rationale + a future-fix note in [`scaling-stratified.md`](scaling-stratified.md#calibration-confidence-and-auto-select-caveats).
 
 ## BOCPD — Bayesian Online Change-Point Detection
 

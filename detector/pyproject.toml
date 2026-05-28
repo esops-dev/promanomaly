@@ -71,6 +71,7 @@ Hampel = "promanomaly.detectors.hampel:Hampel"
 ZScoreEWMA = "promanomaly.detectors.zscore_ewma:ZScoreEWMA"
 IQR = "promanomaly.detectors.iqr:IQR"
 HourOfDayMAD = "promanomaly.detectors.hour_of_day_mad:HourOfDayMAD"
+DayOfWeekMAD = "promanomaly.detectors.day_of_week_mad:DayOfWeekMAD"
 BOCPD = "promanomaly.detectors.bocpd:BOCPD"
 CUSUM = "promanomaly.detectors.cusum:CUSUM"
 

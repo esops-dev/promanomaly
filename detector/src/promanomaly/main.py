@@ -405,6 +405,12 @@ class Application:
         self._ops.leader_elected.labels(instance=self._identity).set(1.0)
         self._ops.leader_transitions_total.labels(instance=self._identity).inc()
         logger.info("started_leading", identity=self._identity)
+        # In HA mode the Runner skips boot-time stratified-config
+        # warnings so every follower doesn't log the same line. The
+        # leader surfaces them on each acquisition — re-fires on
+        # failover so the new leader still gets a one-time surface
+        # without N-replicas-worth of noise.
+        self._runner.surface_misconfigurations()
         for group in self._config.groups:
             self._spawn(self._safe_group_run(group.name))
 
