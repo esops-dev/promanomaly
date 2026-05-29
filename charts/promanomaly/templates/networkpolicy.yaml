@@ -11,9 +11,10 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Allow /metrics scraping. The detector serves /-/reload and the
-    # debug endpoints from the same pod & port, so this rule
-    # deliberately allows the *namespace*, not the world.
+    # Allow /metrics scraping. The detector serves /-/reload, the debug
+    # endpoints, and the opt-in /warmup endpoint from the same pod &
+    # port, so this rule deliberately allows the *namespace*, not the
+    # world.
     - from:
         - podSelector: {}
         {{- range .Values.networkPolicy.allowedScrapeNamespaces }}

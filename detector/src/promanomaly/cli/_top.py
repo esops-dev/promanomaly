@@ -24,7 +24,19 @@ def _format_duration(seconds: float) -> str:
     return "".join(parts) or "0s"
 
 
+def _print_lint_hints(payload: dict[str, Any]) -> None:
+    hints = payload.get("metadata_lint") or []
+    if not hints:
+        return
+    click.echo("metadata lint:")
+    for hint in hints:
+        target = f"{hint.get('group', '')}/{hint.get('query', '')}"
+        click.echo(f"  ! {target}: {hint.get('message', '')}")
+    click.echo("")
+
+
 def _print_top_text(payload: dict[str, Any]) -> None:
+    _print_lint_hints(payload)
     anomalies = payload.get("anomalies", [])
     if not anomalies:
         click.echo("no firing anomalies")

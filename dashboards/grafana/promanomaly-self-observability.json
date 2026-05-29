@@ -1,0 +1,120 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "schemaVersion": 38,
+  "title": "promanomaly self-observability",
+  "description": "Is the detector itself healthy? Per-detector compute success ratio, per-group CPU/memory attribution, and per-series/snapshot freshness. Pairs with the AnomalyDetectorDegraded and AnomalySnapshotStale alerts.",
+  "tags": ["promanomaly", "anomaly-detection", "self-observability"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "label": "Datasource",
+        "query": "prometheus",
+        "current": {"text": "VictoriaMetrics", "value": "victoriametrics"}
+      },
+      {
+        "name": "group",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "query": "label_values(anomaly_snapshot_age_seconds, group)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Detector compute success ratio (1h)",
+      "description": "Fraction of attempted detector computations that completed without raising, over the rolling 1h window. A drop below ~0.9 means the detector is timing out or erroring on a growing fraction of series — its scores are silently missing.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+      "targets": [
+        {
+          "expr": "anomaly_detect_success_ratio{group=~\"$group\", window=\"1h\"}",
+          "legendFormat": "{{group}}/{{detector}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Detector compute success ratio (1d)",
+      "description": "The slower 24h trend of the same signal — distinguishes a transient blip from a sustained regression.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+      "targets": [
+        {
+          "expr": "anomaly_detect_success_ratio{group=~\"$group\", window=\"1d\"}",
+          "legendFormat": "{{group}}/{{detector}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Snapshot age by group",
+      "description": "Age of each group's most recent successful snapshot. Climbs between runs and resets on each successful run; a monotonic climb past refresh_interval means the group has stopped producing fresh snapshots (drives AnomalySnapshotStale).",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {
+          "expr": "anomaly_snapshot_age_seconds{group=~\"$group\"}",
+          "legendFormat": "{{group}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Series staleness by group",
+      "description": "Age of the freshest per-series score in each group. Diverges from snapshot age when a group keeps writing snapshots that carry no scores (all series warming up, or scores dropped under drop_scores).",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {
+          "expr": "anomaly_series_staleness_seconds{group=~\"$group\"}",
+          "legendFormat": "{{group}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Per-group CPU rate",
+      "description": "Detector compute time attributed to each group, as a per-second rate of the cumulative counter. Surfaces which group dominates the detection compute budget.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {
+          "expr": "rate(anomaly_group_cpu_seconds_total{group=~\"$group\"}[5m])",
+          "legendFormat": "{{group}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Per-group snapshot memory",
+      "description": "Best-effort size of each group's output snapshot held by the exporter. Answers 'which group's snapshot is dominant' — not an exact process RSS breakdown.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "bytes"}},
+      "targets": [
+        {
+          "expr": "anomaly_group_memory_bytes{group=~\"$group\"}",
+          "legendFormat": "{{group}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+    }
+  ]
+}

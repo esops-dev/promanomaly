@@ -22,6 +22,15 @@ data:
     server:
       listen: {{ .Values.server.listen | quote }}
       refresh_interval: {{ .Values.server.refresh_interval | quote }}
+      {{- with .Values.server.expose_warmup_endpoint }}
+      expose_warmup_endpoint: {{ . }}
+      {{- end }}
+      {{- if .Values.server.selftest.enabled }}
+      selftest:
+        enabled: true
+        detector: {{ .Values.server.selftest.detector | quote }}
+        threshold: {{ .Values.server.selftest.threshold }}
+      {{- end }}
       reload:
         enabled: {{ .Values.server.reload.enabled }}
         watch_configmap: {{ .Values.server.reload.watch_configmap }}

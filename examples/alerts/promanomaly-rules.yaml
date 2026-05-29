@@ -217,3 +217,63 @@ spec:
               No promanomaly group has completed a successful run in
               the last 5 minutes. The pod will fail readiness if the
               fail_ready policy is configured.
+
+        - alert: AnomalyDetectorDegraded
+          # Self-observability: a detector's compute success ratio has
+          # dropped — it is timing out or raising on a growing fraction
+          # of series, so its scores are silently missing before any
+          # downstream anomaly alert can fire. The 1h window catches a
+          # fresh regression; switch to window="1d" for the slower trend.
+          expr: anomaly_detect_success_ratio{window="1h"} < 0.9
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Detector {{ $labels.detector }} degraded in {{ $labels.group }}"
+            description: |
+              anomaly_detect_success_ratio for detector
+              {{ $labels.detector }} in group {{ $labels.group }} has been
+              below 0.9 over the last hour — the detector is failing or
+              timing out on too many series and its scores are missing.
+              Check anomaly_failures_total and anomaly_detect_duration_seconds.
+
+        - alert: AnomalySnapshotStale
+          # The /metrics snapshot a group is serving has aged past the
+          # threshold. Distinct from AnomalyStale (which keys off the
+          # last *successful run* timestamp): under serve_stale the run
+          # timestamp can stop advancing while /metrics keeps returning an
+          # ever-older snapshot — this rule catches that the served data
+          # itself is stale. Tune 600s relative to refresh_interval.
+          expr: anomaly_snapshot_age_seconds > 600
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "promanomaly snapshot stale for {{ $labels.group }}"
+            description: |
+              The most recent snapshot for group {{ $labels.group }} is
+              over 10 minutes old. /metrics is serving stale scores;
+              cross-check AnomalySourceFailing and AnomalyStale.
+
+        - alert: AnomalyPipelineDead
+          # Dead-man's-switch: the opt-in end-to-end self-test
+          # (server.selftest.enabled) drives a synthetic series with a
+          # known injected anomaly through the real detect/threshold/
+          # export path each run. When anomaly_selftest_ok flips to 0 the
+          # whole detection pipeline is silently emitting nothing — a
+          # global misconfig, an exporter regression, a threshold mistake.
+          # The series only exists when the self-test is enabled, so this
+          # rule is dormant on opted-out deployments.
+          expr: anomaly_selftest_ok == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "promanomaly detection pipeline is dead (self-test failing)"
+            description: |
+              The end-to-end self-test for detector
+              {{ $labels.detector }} has failed to catch its injected
+              synthetic anomaly for over 5 minutes. The detect → threshold
+              → export pipeline is not surfacing anomalies even though the
+              process is up — check for a config/threshold mistake or an
+              exporter regression. See anomaly_selftest_failures_total.

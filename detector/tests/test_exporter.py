@@ -74,15 +74,15 @@ def test_exporter_caches_rendered_snapshot_bytes() -> None:
     ]
     store.write(GroupSnapshot(group="g", timestamp=100.0, samples=samples))
 
-    body1, _ = exporter.render()
+    exporter.render()
     cached_bytes = exporter._snapshot_render_bytes  # type: ignore[reportPrivateUsage]
-    body2, _ = exporter.render()
-    # Second render reuses the cached bytes (no re-render, no new alloc).
+    exporter.render()
+    # Second render reuses the cached *snapshot* bytes (no re-render, no
+    # new alloc). The cache-bytes identity is the real assertion — the
+    # full body legitimately differs scrape-to-scrape now that the
+    # time-relative self-observability gauges (snapshot_age) re-render
+    # per scrape.
     assert exporter._snapshot_render_bytes is cached_bytes  # type: ignore[reportPrivateUsage]
-    # Operational metrics still re-render per scrape, so the full body
-    # is not guaranteed to be identical (it is, but only because nothing
-    # changed). The cache-bytes identity is the real assertion.
-    assert body1 == body2
 
     # New snapshot at a new timestamp busts the cache and the bytes
     # object differs.

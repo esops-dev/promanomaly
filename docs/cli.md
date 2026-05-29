@@ -15,16 +15,20 @@ promanomaly ships with a small, focused set of CLI commands for validation, test
 | `detectors list`    | List registered detectors |
 | `inspect`           | Inspect one running detector's state for an (id, label) series |
 | `top`               | List the currently-firing series, ranked by severity |
+| `warmup`            | Report which series are still warming up, with an ETA to readiness |
+| `diagnose`          | Flag mis-tuned detectors (never-fires, fires-often, stuck warming, empty) |
 
 All commands accept `--log-level`. `--config` is required only for server, `validate`, and `dry-run`.
 
 ## `validate`
 
-Validates the YAML configuration against the schema. With `--probe` it also executes the queries against the live datasource.
+Validates the YAML configuration against the schema. With `--probe` it also executes the queries against the live datasource; with `--estimate-cost` it statically projects the config's cardinality and query/compute cost without touching the datasource; with `--lint-metadata` it checks each query's metric type against `/api/v1/metadata`. All three compose — pass them together to check that the queries return data, fit the caps, *and* aren't feeding a raw counter to a detector.
 
 ```bash
 promanomaly validate --config config.yaml
 promanomaly validate --config config.yaml --probe --strict
+promanomaly validate --config config.yaml --estimate-cost --strict
+promanomaly validate --config config.yaml --lint-metadata --strict
 ```
 
 **Flags**
@@ -33,8 +37,18 @@ promanomaly validate --config config.yaml --probe --strict
 |---------------------|--------------|-------------|
 | `--config <path>`   | required     | Path to YAML config |
 | `--probe`           | off          | Execute queries against datasource |
-| `--strict`          | off          | Exit non-zero if any query returns no data or errors |
+| `--estimate-cost`   | off          | Statically project cardinality, TSDB query load, and a coarse CPU/memory estimate (no datasource access) |
+| `--lint-metadata`   | off          | Query `/api/v1/metadata` and warn when a query feeds a raw counter to a detector without `rate()`/`increase()` |
+| `--strict`          | off          | With `--probe`: exit non-zero if any query returns no data or errors. With `--estimate-cost`: exit non-zero if projected series exceed `safety.max_total_series`. With `--lint-metadata`: exit non-zero if any mismatch is found |
 | `--datasource-url`  | from config  | Override datasource URL |
+
+### `--lint-metadata` output
+
+One `{"status": "lint", ...}` JSON line per finding (`group`, `query`, `metric`, `metric_type`, `issue`, `detectors`, `message`) plus a `{"summary": ...}` line with `metrics_with_metadata` and `findings` counts. The only check today is `counter_not_rated`: a metric the TSDB reports as a `counter` that appears in a query without a rate-like wrapper (`rate`, `irate`, `increase`, `delta`, `idelta`, `deriv`, `resets`). A counter used only inside a series-identity aggregation (`count`, `count_values`, `group`, `absent`, …) is *not* flagged — e.g. `node_load1 / count(node_cpu_seconds_total)` counts cores and never scores the raw counter. **Lint only** — it never rewrites the query. Absent metadata is treated as "no opinion", so a metric the TSDB carries no metadata for never produces a false positive (handles VictoriaMetrics/Mimir/Thanos endpoint quirks). The same finding is surfaced live by `inspect` and `top --lint`. Flag-name parity with promforecast.
+
+### `--estimate-cost` output
+
+One JSON line per group plus a summary line. Per group: `projected_series` (worst case at `safety.max_series_per_query`), `short_queries_per_refresh`, `discovery_probe_queries_per_refresh`, `stratified_baseline_queries_per_day`, `estimated_memory_bytes`, and `estimated_cpu_cores`. The summary aggregates the totals and flags `over_budget` against `safety.max_total_series`. The CPU figure is anchored to the documented "~10k series at a 1-minute refresh on one 1-CPU replica" model — an order-of-magnitude sizing aid, not a benchmark. Pairs with `--probe` (which confirms the queries actually return data); see [production-checklist.md](production-checklist.md).
 
 ## `dry-run`
 
@@ -155,7 +169,61 @@ Answers "what is anomalous right now, ranked?" without opening Grafana — like 
 ```bash
 promanomaly top --target http://localhost:9092
 promanomaly top --target http://localhost:9092 --group node_cpu --min-severity 0.5
+promanomaly top --target http://localhost:9092 --no-lint   # skip the extra metadata query
 promanomaly top --target http://localhost:9092 --output json
 ```
 
-Pairs with `inspect` as a two-step triage flow: `top` to find the worst series, `inspect` to understand *why* it scored. The `/debug/anomalies` endpoint is part of the `/debug/*` family the bundled NetworkPolicy denies by default. See [triage.md](triage.md) for the full surface.
+By default `top` also prints metadata-lint hints (the same counter-not-rated warning `validate --lint-metadata` reports), which costs one extra `/api/v1/metadata` query against the TSDB; pass `--no-lint` to skip it. Pairs with `inspect` as a two-step triage flow: `top` to find the worst series, `inspect` to understand *why* it scored. The `/debug/anomalies` endpoint is part of the `/debug/*` family the bundled NetworkPolicy denies by default. See [triage.md](triage.md) for the full surface.
+
+## `warmup`
+
+Answers "the dashboard is empty after `helm install` — do I wait or debug?" Queries a running detector's opt-in `/warmup` endpoint (enable it with `server.expose_warmup_endpoint: true`) and reports, per group and query, how many rolling-window samples are available versus `min_points`, an ETA to readiness at the current step, and the blocker.
+
+```bash
+promanomaly warmup --target http://localhost:9092
+promanomaly warmup --target http://localhost:9092 --output json
+```
+
+**Flags**
+
+| Flag              | Default | Description |
+|-------------------|---------|-------------|
+| `--target <url>`  | required | Running detector base URL |
+| `--output`        | text    | `text` (aligned table) or `json` (raw `/warmup` response) |
+| `--timeout`       | 30      | HTTP timeout in seconds |
+
+**`blocked_by` values**: `none` (ready), `min_points` (some samples, below the threshold), `lookback` (no samples yet), `baseline` (a stratified detector still filling its multi-week lookback), `discovery` (a templated query that can't be probed until discovery resolves).
+
+The exit code is **0** when every query in every group is `ready` (or there are no queries to warm up) and **1** when at least one is still warming or errored — so a CI pre-flight can gate "is the install done?" on `until promanomaly warmup --target ...`. Network failures exit **2**. The endpoint is in-namespace only (the bundled NetworkPolicy denies external ingress alongside `/debug/*`). Mirrors `promforecast warmup`.
+
+## `diagnose`
+
+Answers "which of my detectors are mis-tuned?" from evidence, not guesswork. Two modes share one report shape:
+
+- **TSDB lookback** (`--datasource-url`) — aggregates the detector's own scraped metrics over `--window` to flag the firing-rate bands (**never fires** = dead config; **fires often** = threshold too low / wrong detector), **chronically-warming** series, and **empty queries**. With `--config` it also flags **silent detectors** — a configured detector that emitted no score over the window, which includes a cohort detector dropping every cohort below `min_cohort_size`.
+- **live snapshot** (`--target`) — one `/metrics` scrape for a current-state read (firing now, warming now, empty now). A single snapshot can't establish a rate over time, so it never reports `never_fires` — use the TSDB mode for that.
+
+Pass exactly one of `--target` / `--datasource-url`.
+
+```bash
+# Over a 24h lookback against the TSDB scraping the detector:
+promanomaly diagnose --datasource-url http://victoriametrics:8428 --window 24h
+promanomaly diagnose --datasource-url http://victoriametrics:8428 --config config.yaml --output json
+
+# Quick current-state read straight off a running detector:
+promanomaly diagnose --target http://localhost:9092
+```
+
+**Flags**
+
+| Flag                | Default | Description |
+|---------------------|---------|-------------|
+| `--target <url>`    | —       | Running detector base URL (snapshot mode) |
+| `--datasource-url`  | —       | TSDB holding the detector's scraped metrics (lookback mode) |
+| `--window <dur>`    | 24h     | Lookback for the TSDB analysis (Prometheus duration) |
+| `--config <path>`   | none    | With `--datasource-url`, cross-check configured detectors for silent ones |
+| `--fire-high <f>`   | 0.5     | Firing-rate fraction at/above which a detector is flagged too noisy |
+| `--output`          | text    | `text` (grouped by category) or `json` (for CI) |
+| `--timeout <s>`     | 30      | HTTP timeout |
+
+Pure analysis, no persisted state. Pairs with `backtest` (precision/recall on injected anomalies) and `calibrate-buckets` (stratified bucketing) to close the tuning loop. Parity with `promforecast diagnose`.

@@ -323,7 +323,7 @@ The same `AnomalySignalMissing` reference alert covers both the static `expect:`
 
 **Probe failure under serve_stale.** A probe that hits a TSDB error (timeout, server_error, …) honours `safety.on_source_failure` the same way a regular query failure does — under the default `serve_stale` the previous snapshot is preserved instead of being overwritten with empty data. The original TSDB reason flows into `anomaly_source_failure_total{reason}` so it shares a bucket with regular-query failures; the discovery-specific `anomaly_discovery_failures_total{reason="probe_query_failed"}` counter is bumped separately for the discovery dashboard.
 
-**HA-mode caveat.** The discovery tracker is in-memory on the leader; on Lease failover, the new leader rebuilds it from zero. Series that disappeared right before the handover only get an `anomaly_signal_missing` from the new leader once they have missed `expect_grace_runs` more runs after takeover. For most workloads this is invisible; for workloads with a high churn rate close to failover, treat the first `(grace_runs × refresh_interval)` after a leader transition as a soft window.
+**HA mode.** When `highAvailability.enabled: true`, the discovery miss-counter tracker lives in the shared Redis cache (under `{key_prefix}:discovery:<group>:<query>`) instead of leader-local memory, so a Lease failover no longer resets it: the newly-elected leader inherits each series' consecutive-miss count and a series that disappeared right before the handover still trips `anomaly_signal_missing` on schedule rather than restarting its `expect_grace_runs` window from zero. Single-replica deployments keep the in-memory tracker unchanged. The Redis state is bounded by the same `safety.discovery.forget_after_runs` cap as the in-memory tracker, and the entries carry a TTL (refreshed every run) so a fully-removed deployment's keys expire rather than leaking. A transient Redis outage degrades gracefully — that run records no new observations and emits no missing signal — rather than crashing the detection run.
 
 ## Validating Configs Before Deploy
 
@@ -437,3 +437,69 @@ defaults:
 ```
 
 Each listed label adds one series per distinct value seen in the run, so partition by **low-cardinality** dimensions (namespace, job, region) — never by `instance` or `pod` on a large fleet. Partitioning by a canonical detector label (`id`, `group`, `detector`, `detector_instance`) is rejected at config-load time. As a backstop against a high-cardinality mistake, a dimension that produces more than 200 distinct slice values in a run is **skipped for that run** and logged as `density_by_cardinality_capped` (the group rollup and per-detector partition are unaffected) — point the dimension at a lower-cardinality label and the slices return. Cohort divergence rolls up for free: `anomaly_density{group, detector="Cohort"}` is "members currently diverging ÷ cohort members scored".
+## Self-Observability
+
+The detector emits telemetry about its **own** health so a silently degrading component is caught before it stops catching anomalies. All four families are bounded by the configured group / detector cardinality — none touch the per-series budget.
+
+| Metric | Labels | Meaning |
+|--------|--------|---------|
+| `anomaly_detect_success_ratio` | `group, detector, window` | Fraction of attempted detector computations that completed without raising (timeout / exception), over a rolling window. Two windows are emitted: `1h` (spots a fresh regression) and `1d` (the slower trend). |
+| `anomaly_group_cpu_seconds_total` | `group` | Cumulative detector compute time attributed to a group (sum of per-detector wall-clock). Use `rate()` to see which group dominates the compute budget. |
+| `anomaly_group_memory_bytes` | `group` | Best-effort size of the per-group output snapshot held by the exporter — answers "which group's snapshot is dominant", not an exact RSS breakdown. |
+| `anomaly_snapshot_age_seconds` | `group` | Age of the group's most recent successful snapshot. Recomputed on every scrape, so it keeps climbing between runs and resets on each successful run. |
+| `anomaly_series_staleness_seconds` | `group` | Age of the *freshest per-series score* in a group. Diverges from snapshot age when a group keeps writing snapshots that carry no scores (all series warming up, or scores dropped under `drop_scores`); absent until the group has produced at least one score. |
+
+The success ratio is recorded once per group-run per detector (aggregating the run's per-series attempts), so the rolling ledger stays bounded at runs-per-window regardless of fleet size. CPU is the per-run sum of detector durations; memory is sampled at the end of each successful run. Snapshot-age and series-staleness are derived at scrape time from the snapshot-store timestamps.
+
+Two reference alerts ship for this surface in `examples/alerts/promanomaly-rules.yaml` (and the bundled Helm `PrometheusRule`):
+
+- **`AnomalyDetectorDegraded`** — `anomaly_detect_success_ratio{window="1h"} < 0.9 for 10m`. A detector is failing or timing out on too many series; its scores are silently missing before any per-series anomaly alert can fire.
+- **`AnomalySnapshotStale`** — `anomaly_snapshot_age_seconds > 600 for 5m`. The served `/metrics` snapshot has aged out. Distinct from `AnomalyStale`, which keys off the last *successful-run* timestamp — under `serve_stale` the run timestamp can stop advancing while `/metrics` keeps returning an ever-older snapshot.
+
+The `dashboards/grafana/promanomaly-self-observability.json` dashboard graphs all five families. See the [degraded-mode playbook](operations/degraded-modes.md) for the full failure-mode matrix.
+
+## Warm-Up Status Endpoint
+
+On a fresh install or after a restart, `/metrics` is empty until each series fills its rolling window (`min_points`). The opt-in `GET /warmup` endpoint (enable with `server.expose_warmup_endpoint: true`) makes that self-explaining: per group and query it reports points available versus needed, an ETA at the current `refresh_interval`, and the blocker (`min_points`, `lookback`, a stratified `baseline` still filling its multi-week lookback, or `discovery`).
+
+```bash
+promanomaly warmup --target http://localhost:9092
+```
+
+Each call issues one cheap probe per query — off by default because that cost is wasted once past the first install. The endpoint is in-namespace only (the bundled NetworkPolicy denies external ingress alongside `/debug/*`). The `promanomaly warmup` CLI exits non-zero while anything is still warming, so `until promanomaly warmup --target ...` is a valid post-install gate. See [`cli.md`](cli.md) for the command reference.
+
+## End-to-End Detection Self-Test (dead-man's-switch)
+
+The self-observability success ratios prove each detector *runs*; they do not prove the pipeline actually *catches* anomalies. A global misconfiguration — an absurd `alert_thresholds.score`, an exporter regression, a threshold mistake — can leave the process up and emitting nothing while every success ratio still reads 1.0. Enable the self-test to guard against exactly that:
+
+```yaml
+server:
+  selftest:
+    enabled: true       # off by default
+    detector: MAD       # detector run through the synthetic path
+    threshold: 3.0      # threshold the synthetic score is checked against
+```
+
+Each scheduled run drives one synthetic series carrying a known injected point-spike anomaly through the **real** detect → threshold → export path (the sample is even re-rendered through the exporter, so an exporter regression that rejects it also trips the test) and asserts it is caught. It publishes:
+
+| Metric | Labels | Meaning |
+|--------|--------|---------|
+| `anomaly_selftest_ok` | `detector` | 1 when the injected anomaly was caught on the last run, 0 when the detect/threshold/export path failed to surface it. |
+| `anomaly_selftest_failures_total` | `detector` | Cumulative failed self-test runs. |
+
+Both metrics carry a `detector` label, so the series is **absent** (and the `AnomalyPipelineDead` alert dormant) on a deployment that hasn't opted in — a disabled self-test never looks like a dead pipeline. Stateless and bounded to one synthetic series; leader-gated in HA mode so the gauge is published once per cluster. The `AnomalyPipelineDead` reference alert (`anomaly_selftest_ok == 0 for 5m`, critical) ships in `examples/alerts/promanomaly-rules.yaml` and the Helm `PrometheusRule`. Distinct from the self-monitoring example config, which watches the detector's *operational* metrics rather than re-driving the detection path. See the [degraded-mode playbook](operations/degraded-modes.md).
+
+## Config Health and Tuning Diagnostics
+
+`promanomaly diagnose` answers "which of my detectors are mis-tuned?" from evidence. Against the TSDB scraping the detector's own metrics it flags, over a lookback: detectors that **never fire** (dead config), detectors that **fire too often** (threshold too low / wrong detector), **chronically-warming** series, **empty queries**, and — with `--config` — **silent detectors** (a configured detector emitting nothing, which includes a cohort below `min_cohort_size`). A lighter `--target` mode reads one `/metrics` scrape for a current-state view.
+
+```bash
+promanomaly diagnose --datasource-url http://victoriametrics:8428 --window 24h
+promanomaly diagnose --target http://localhost:9092
+```
+
+Pure analysis, no persisted state; pairs with `backtest` and `calibrate-buckets` to close the tuning loop. See [`cli.md`](cli.md) for the full flag reference.
+
+## Metadata-Aware Validation Lint
+
+`promanomaly validate --lint-metadata` queries the datasource's `/api/v1/metadata` and warns when a query feeds a raw counter to a detector without a `rate()` / `increase()` wrapper — a monotonic counter scored directly produces nonsense. Lint only (it never rewrites the query); under `--strict` any finding fails CI, and it composes with `--probe` / `--estimate-cost`. The same hint surfaces live in `inspect` and `promanomaly top --lint`. Absent metadata is treated as "no opinion", so the lint never manufactures a false positive from a metric the TSDB carries no type for. See [`cli.md`](cli.md).

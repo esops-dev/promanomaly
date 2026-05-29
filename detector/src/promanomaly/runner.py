@@ -64,6 +64,7 @@ from .plan import (
     merge_params,
 )
 from .selector import select_winner
+from .self_observability import estimate_samples_bytes
 from .severity import compute_severity
 from .source import PromQLSource, QueryResult, QuerySeries, SourceQueryError
 from .state import GroupSnapshot, Sample, SnapshotStore
@@ -174,6 +175,34 @@ def _current_detect_durations() -> dict[str, float]:
         return durations
 
 
+# Per-detector (attempts, successes) accumulator for one group run,
+# flushed onto the rolling ``anomaly_detect_success_ratio`` ledger at the
+# end of that run. Task-local for the same reason as ``_DETECT_DURATIONS``
+# — concurrent group runs share one Runner and an instance dict would
+# cross-attribute outcomes between groups. Recorded once per run rather
+# than per series so the rolling ledger stays bounded at runs-per-window.
+_DETECT_OUTCOMES: contextvars.ContextVar[dict[str, list[int]]] = contextvars.ContextVar(
+    "promanomaly_detect_outcomes"
+)
+
+
+def _record_detector_attempt(detector_name: str, *, success: bool) -> None:
+    """Tally one detector attempt for the current group run.
+
+    No-op outside a seeded run context (the isolated-``_run_detector``
+    tests) so unit tests of a single detector don't need to set up the
+    ContextVar. ``[attempts, successes]`` per detector name.
+    """
+    try:
+        outcomes = _DETECT_OUTCOMES.get()
+    except LookupError:
+        return
+    tally = outcomes.setdefault(detector_name, [0, 0])
+    tally[0] += 1
+    if success:
+        tally[1] += 1
+
+
 class Runner:
     """Owns the detection pipeline shared across all groups.
 
@@ -279,6 +308,11 @@ class Runner:
             self._group_locks.pop(removed, None)
         for added in new_names - old_names:
             self._group_locks[added] = asyncio.Lock()
+        # Bound the rolling detector-success ledger to live groups so a
+        # group removed by a reload stops accumulating in-memory history
+        # (its gauge row lingers until restart, consistent with the other
+        # per-group operational gauges).
+        self._ops.detect_outcomes.retain_groups(new_names)
         self._store.clear_calibrations()
         # StratifiedFetcher owns its cache + discovery-churn tracker;
         # ``replace_config`` here both updates its config snapshot and
@@ -319,6 +353,7 @@ class Runner:
             # Isolated per group because each group runs in its own
             # concurrent scheduler task (see ``_DETECT_DURATIONS`` note).
             _DETECT_DURATIONS.set({})
+            _DETECT_OUTCOMES.set({})
             result = GroupRunResult(group=group_name)
             source_failed = False
             try:
@@ -558,18 +593,37 @@ class Runner:
         # (transient pods, replicas) can't grow the dict without end.
         grace = query.expect_grace_runs
         forget_after = self._config.safety.discovery.forget_after_runs
-        transitioned = self._store.record_discovery_observation(
-            group.name,
-            query.id,
-            seen_keys,
-            grace,
-            forget_after_runs=forget_after,
-        )
+        # In HA mode the tracker is Redis-backed (blocking socket I/O), so
+        # offload the read-modify-write off the event loop. Single-replica
+        # uses the in-memory tracker and runs inline.
+        if self._store.discovery_blocking_io:
+            transitioned = await asyncio.to_thread(
+                self._store.record_discovery_observation,
+                group.name,
+                query.id,
+                seen_keys,
+                grace,
+                forget_after_runs=forget_after,
+            )
+        else:
+            transitioned = self._store.record_discovery_observation(
+                group.name,
+                query.id,
+                seen_keys,
+                grace,
+                forget_after_runs=forget_after,
+            )
         for _series_key in transitioned:
             self._ops.signal_missing_total.labels(
                 group=group.name, reason="missing_grace_exhausted"
             ).inc()
-        for series_key in self._store.discovery_known_missing(group.name, query.id, grace):
+        if self._store.discovery_blocking_io:
+            known_missing = await asyncio.to_thread(
+                self._store.discovery_known_missing, group.name, query.id, grace
+            )
+        else:
+            known_missing = self._store.discovery_known_missing(group.name, query.id, grace)
+        for series_key in known_missing:
             # Render the id using the discovered labels so a missing
             # series carries the same ``id`` label value it carried
             # when it was present. Without this, an operator alerting
@@ -1127,6 +1181,7 @@ class Runner:
                 self._ops.failures_total.labels(
                     group=group.name, detector=plan.name, reason=REASON_TIMEOUT
                 ).inc()
+                _record_detector_attempt(plan.name, success=False)
                 continue
             except Exception as exc:
                 logger.exception(
@@ -1142,7 +1197,9 @@ class Runner:
                     detector=plan.name,
                     reason=REASON_DETECTOR_EXCEPTION,
                 ).inc()
+                _record_detector_attempt(plan.name, success=False)
                 continue
+            _record_detector_attempt(plan.name, success=True)
 
             score, outside, samples = self._format_detector_samples(
                 group=group,
@@ -1840,10 +1897,30 @@ class Runner:
         # Read the task-local accumulator seeded at the top of this run;
         # ``_update_operational_metrics`` runs in the same task as
         # ``run_group`` so the ContextVar resolves to this group's dict.
-        for detector_name, elapsed in _DETECT_DURATIONS.get({}).items():
+        durations = _DETECT_DURATIONS.get({})
+        for detector_name, elapsed in durations.items():
             self._ops.detect_duration_seconds.labels(
                 group=result.group, detector=detector_name
             ).set(elapsed)
+        # Self-observability: attribute this run's detector compute
+        # time to the group's cumulative CPU counter, record the
+        # per-detector success ledger, and snapshot the group's output
+        # memory footprint. CPU is summed across detectors so the counter
+        # is a true per-group total regardless of detector count.
+        cpu_seconds = sum(durations.values())
+        if cpu_seconds > 0:
+            self._ops.group_cpu_seconds_total.labels(group=result.group).inc(cpu_seconds)
+        for detector_name, (attempts, successes) in _DETECT_OUTCOMES.get({}).items():
+            self._ops.detect_outcomes.record(
+                group=result.group,
+                detector=detector_name,
+                attempts=attempts,
+                successes=successes,
+            )
+        if result.succeeded:
+            self._ops.group_memory_bytes.labels(group=result.group).set(
+                estimate_samples_bytes(result.samples)
+            )
 
 
 # Per-kind log emitters for stratified misconfigurations. Each

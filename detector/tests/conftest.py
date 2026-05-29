@@ -25,6 +25,9 @@ class StubSource(PromQLSource):
         super().__init__(base_url="http://stub", timeout=1.0)
         self.queries: list[dict[str, Any]] = []
         self._responder: Callable[[str], StubResponse] = lambda _: StubResponse()
+        # {metric_name: type} served by ``metric_metadata`` (metadata-lint).
+        # Empty by default so the lint reports nothing unless a test opts in.
+        self.metadata: dict[str, str] = {}
 
     def respond(self, fn: Callable[[str], StubResponse]) -> None:
         self._responder = fn
@@ -34,6 +37,9 @@ class StubSource(PromQLSource):
 
     async def close(self) -> None:
         return None
+
+    async def metric_metadata(self) -> dict[str, str]:  # type: ignore[override]
+        return dict(self.metadata)
 
     async def range_query(  # type: ignore[override]
         self,

@@ -261,6 +261,102 @@ class PromQLSource:
             await self._cache_put(cache_key, query_result)
         return query_result
 
+    async def instant_query(self, promql: str) -> list[tuple[dict[str, str], float]]:
+        """Run an instant PromQL query and return ``(labels, value)`` rows.
+
+        Used by ``promanomaly diagnose`` to aggregate the detector's own
+        metrics over a lookback (e.g. ``avg_over_time(...[24h])``). Returns
+        one row per result-vector series; scalar / non-finite values are
+        dropped. Raises :class:`SourceQueryError` on a TSDB-side failure so
+        the caller can report it.
+        """
+        if self._client is None:
+            await self.start()
+        assert self._client is not None
+        try:
+            response = await self._client.get("/api/v1/query", params={"query": promql})
+        except httpx.TimeoutException as exc:
+            raise SourceQueryError("timeout", _exc_detail(exc)) from exc
+        except httpx.HTTPError as exc:
+            raise SourceQueryError("transport_error", _exc_detail(exc)) from exc
+        if response.status_code >= 500:
+            raise SourceQueryError("server_error", f"HTTP {response.status_code}")
+        if response.status_code >= 400:
+            raise SourceQueryError(
+                "client_error", f"HTTP {response.status_code}: {response.text[:200]}"
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise SourceQueryError("invalid_response", str(exc)) from exc
+        if payload.get("status") != "success":
+            raise SourceQueryError("query_error", str(payload.get("error") or "unknown"))
+        data = payload.get("data") or {}
+        result = data.get("result") or []
+        rows: list[tuple[dict[str, str], float]] = []
+        for entry in result:
+            labels = dict(entry.get("metric") or {})
+            value_pair = entry.get("value")
+            if not isinstance(value_pair, list) or len(value_pair) != 2:
+                continue
+            try:
+                value = float(value_pair[1])
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(value):
+                continue
+            rows.append((labels, value))
+        return rows
+
+    async def metric_metadata(self) -> dict[str, str]:
+        """Fetch ``/api/v1/metadata`` and return ``{metric_name: type}``.
+
+        Powers the metadata-aware validation lint: the TSDB already knows
+        each metric's type (``counter`` / ``gauge`` / ``histogram`` /
+        ``summary``), so the lint can warn when a query feeds a raw
+        counter to a detector without wrapping it in ``rate()`` /
+        ``increase()``.
+
+        Returns one type per metric (the first entry when a metric reports
+        several). Raises :class:`SourceQueryError` on a transport / HTTP
+        failure so the caller can report "metadata unavailable"; an
+        endpoint that simply has no metadata returns ``{}`` ("no opinion"),
+        not an error. Metadata-endpoint quirks across VictoriaMetrics /
+        Mimir / Thanos are absorbed: a malformed envelope yields ``{}``
+        rather than crashing the lint.
+        """
+        if self._client is None:
+            await self.start()
+        assert self._client is not None
+        try:
+            response = await self._client.get("/api/v1/metadata")
+        except httpx.TimeoutException as exc:
+            raise SourceQueryError("timeout", _exc_detail(exc)) from exc
+        except httpx.HTTPError as exc:
+            raise SourceQueryError("transport_error", _exc_detail(exc)) from exc
+        if response.status_code >= 500:
+            raise SourceQueryError("server_error", f"HTTP {response.status_code}")
+        if response.status_code >= 400:
+            raise SourceQueryError(
+                "client_error", f"HTTP {response.status_code}: {response.text[:200]}"
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise SourceQueryError("invalid_response", str(exc)) from exc
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return {}
+        out: dict[str, str] = {}
+        for metric, entries in data.items():
+            if not isinstance(metric, str) or not isinstance(entries, list) or not entries:
+                continue
+            first = entries[0]
+            metric_type = first.get("type") if isinstance(first, dict) else None
+            if isinstance(metric_type, str) and metric_type:
+                out[metric] = metric_type
+        return out
+
     async def _cache_get(self, cache_key: tuple[str, float, float, int, int]) -> QueryResult | None:
         """Read from the cache without blocking the event loop.
 

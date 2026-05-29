@@ -19,6 +19,9 @@ from .anomalies import collect_firing
 from .config import Config, ReloadAuthConfig
 from .detectors import list_meta
 from .inspect import InspectError, inspect_series
+from .metadata_lint import lint_config_metadata
+from .source import SourceQueryError
+from .warmup import compute_warmup
 
 if TYPE_CHECKING:
     from .main import Application
@@ -88,6 +91,7 @@ def build_app(application: Application) -> FastAPI:
         group: str | None = None,
         min_severity: float = 0.0,
         limit: int = 50,
+        lint: bool = False,
     ) -> JSONResponse:
         # Live triage: the currently-firing series across all groups,
         # ranked by severity, read straight from the snapshot store (no
@@ -100,14 +104,40 @@ def build_app(application: Application) -> FastAPI:
             min_severity=min_severity,
             limit=max(0, limit),
         )
-        return JSONResponse(
-            {
-                "count": len(firing),
-                "min_severity": min_severity,
-                "group": group,
-                "anomalies": [f.as_dict() for f in firing],
-            }
-        )
+        body: dict[str, Any] = {
+            "count": len(firing),
+            "min_severity": min_severity,
+            "group": group,
+            "anomalies": [f.as_dict() for f in firing],
+        }
+        # Opt-in metadata lint (off by default so the no-extra-TSDB-query
+        # contract holds for the common scrape path). ``promanomaly top``
+        # requests it so an operator triaging an anomaly is reminded when
+        # the offending query is feeding a raw counter to a detector.
+        if lint:
+            body["metadata_lint"] = await _metadata_lint_hints(application)
+        return JSONResponse(body)
+
+    @app.get("/warmup")
+    async def warmup_endpoint() -> Response:
+        # Opt-in per server.expose_warmup_endpoint. Reports per-(group,
+        # query) warm-up status by issuing one cheap probe per query —
+        # the operator's answer to "the dashboard is empty, do I wait or
+        # debug?" on a fresh install. The shipped NetworkPolicy denies
+        # external ingress here alongside /debug/*.
+        if not application._config.server.expose_warmup_endpoint:
+            return PlainTextResponse("warmup endpoint disabled", status_code=404)
+        try:
+            report = await compute_warmup(
+                config=application._config,
+                source=application._source,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            return JSONResponse(
+                {"error": "internal", "message": str(exc)},
+                status_code=500,
+            )
+        return JSONResponse(report.to_dict())
 
     @app.get("/debug/inspect")
     async def debug_inspect(
@@ -135,6 +165,22 @@ def build_app(application: Application) -> FastAPI:
         return JSONResponse(payload)
 
     return app
+
+
+async def _metadata_lint_hints(application: Application) -> list[dict[str, Any]]:
+    """Best-effort metadata-lint findings for the live config.
+
+    Used by ``/debug/anomalies?lint=true`` (and thus ``promanomaly top
+    --lint``). A TSDB without a metadata endpoint, or a transient query
+    failure, yields no hints rather than failing triage.
+    """
+    try:
+        metadata = await application._source.metric_metadata()
+    except SourceQueryError:
+        return []
+    except Exception:  # pragma: no cover - defensive
+        return []
+    return [f.to_dict() for f in lint_config_metadata(application._config, metadata)]
 
 
 def authorise_reload(auth: ReloadAuthConfig, request: Request) -> None:
