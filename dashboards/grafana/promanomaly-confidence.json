@@ -7,9 +7,16 @@
   "templating": {
     "list": [
       {
+        "name": "datasource",
+        "type": "datasource",
+        "label": "Datasource",
+        "query": "prometheus",
+        "current": {"text": "VictoriaMetrics", "value": "victoriametrics"}
+      },
+      {
         "name": "group",
         "type": "query",
-        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
         "query": "label_values(anomaly_confidence_score, group)",
         "refresh": 2,
         "multi": true,
@@ -18,7 +25,7 @@
       {
         "name": "id",
         "type": "query",
-        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
         "query": "label_values(anomaly_confidence_score{group=~\"$group\"}, id)",
         "refresh": 2,
         "multi": true,
@@ -31,7 +38,7 @@
       "id": 1,
       "type": "timeseries",
       "title": "Confidence score per detector",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "anomaly_confidence_score{group=~\"$group\", id=~\"$id\"}",
@@ -58,7 +65,7 @@
       "id": 2,
       "type": "timeseries",
       "title": "Baseline stability per detector",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "anomaly_baseline_stability{group=~\"$group\", id=~\"$id\"}",
@@ -85,7 +92,7 @@
       "id": 3,
       "type": "table",
       "title": "Low-confidence firing right now",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "topk(20, anomaly_confidence_score{group=~\"$group\"} < 0.5 and on (id, group, detector) anomaly_outside_threshold == 1)",
@@ -99,7 +106,7 @@
       "id": 4,
       "type": "stat",
       "title": "High-confidence anomalies",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "count(anomaly_outside_threshold{group=~\"$group\"} == 1 and on (id, group, detector) anomaly_confidence_score >= 0.7)",
@@ -112,7 +119,7 @@
       "id": 5,
       "type": "stat",
       "title": "Low-confidence anomalies",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "count(anomaly_outside_threshold{group=~\"$group\"} == 1 and on (id, group, detector) anomaly_confidence_score < 0.5)",
@@ -125,7 +132,7 @@
       "id": 6,
       "type": "stat",
       "title": "Series with no calibration yet",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "count(anomaly_score{group=~\"$group\"}) - count(anomaly_confidence_score{group=~\"$group\"})",

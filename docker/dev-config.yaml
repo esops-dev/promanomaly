@@ -24,8 +24,17 @@ safety:
   query_timeout: 10s
   on_source_failure: serve_stale
   # v0.4: drive the query cache through the dev Redis so the
-  # anomaly_query_cache_* metrics reflect the real backend rather than
-  # only the in-process LRU.
+  # anomaly_query_cache_* metrics reflect the real backend (entries,
+  # misses, expirations, SCAN-based size) rather than only the in-process
+  # LRU. Expect anomaly_query_cache_hits_total to sit at ~0 here: the
+  # cache only collapses two fetches of the *same* PromQL within one step
+  # bucket, but the runner already fetches each query once per tick and
+  # shares it across that query's detectors, and refresh_interval (30s) >
+  # step (15s) so consecutive ticks land in different buckets. Hits would
+  # appear if two query ids shared an identical PromQL. The 0% hit rate is
+  # the workload, not a fault — the Redis backend itself is covered by
+  # tests/test_redis_cache.py. Redis I/O is offloaded off the event loop
+  # (see source.PromQLSource._cache_get), so it stays cheap even at 0%.
   query_cache:
     enabled: true
     backend: redis
@@ -151,3 +160,122 @@ groups:
             label: cluster
         detectors:
           - name: MAD
+
+  - name: http_demo
+    priority: 3
+    # Only populated when the docker-compose ``load`` profile is up
+    # (``make dev-up-load``) — the http-demo app and its loadgen are
+    # behind that profile. With the minimum dev stack these queries
+    # return empty and the detector emits ``anomaly_signal_missing``
+    # once ``expect_grace_runs`` is exceeded, which is the intended
+    # behaviour: it demonstrates the absence-detection path.
+    #
+    # That absence demo only fires for queries that set ``expect: true``
+    # — ``anomaly_signal_missing`` is gated on it (see runner.py). The
+    # reliably-populated queries below opt in; ``http_errors_rate`` does
+    # NOT, because it is a deliberately sparse signal (errors are ~7% of
+    # ``/api/flaky`` traffic) and would false-fire ``signal_missing``
+    # during quiet error windows even while the load profile is up.
+    #
+    # The loadgen modulates request rate on a 10-minute sine
+    # (PERIOD_SECONDS=600 in docker/http-demo/loadgen.py). MAD and
+    # Hampel rolling windows are sized at 15m to span more than one
+    # full period so the baseline tracks the cycle instead of being
+    # offset by it.
+    ensemble:
+      method: voting
+      min_detectors: 2
+    queries:
+      # Per-endpoint request rate. The bursty, sinusoidal shape from
+      # the loadgen produces clear "score moves with the cycle" signal
+      # in /metrics, useful for eyeballing detector calibration.
+      - id: http_requests_rate
+        promql: |
+          sum by (endpoint) (
+            rate(http_requests_total{endpoint=~"/api/.*|/healthz"}[2m])
+          )
+        expect: true
+        expect_grace_runs: 6
+        detectors:
+          - name: MAD
+            params:
+              window: 15m
+          - name: Hampel
+            params:
+              window: 15m
+              t0: 3
+          - name: ZScoreEWMA
+            params:
+              alpha: 0.1
+
+      # Error rate. ``/api/flaky`` returns 500 ~7% of the time so this
+      # is a sparse intermittent signal — exactly the shape MAD handles
+      # well and Gaussian assumptions break on.
+      - id: http_errors_rate
+        promql: |
+          sum by (endpoint) (
+            rate(http_requests_total{status=~"5..",endpoint=~"/api/.*|/healthz"}[2m])
+          )
+        expect_grace_runs: 6
+        detectors:
+          - name: MAD
+            params:
+              window: 15m
+          - name: IQR
+            params:
+              k: 1.5
+
+      # p95 latency derived from the histogram. Latency is noisy and
+      # tied to load, so a change-point detector earns its keep here.
+      #
+      # min_abs_delta is the practical-significance floor that makes this
+      # query usable. p95 from histogram_quantile snaps to bucket edges
+      # (0.005, 0.01, 0.025, 0.05, …), so a fast, stable endpoint like
+      # /api/users or /healthz sits on a near-constant ~25ms baseline with
+      # a tiny MAD/Hampel spread — a one-bucket quantization wobble then
+      # scores 10-100 "MADs" and fires outside_threshold on a
+      # sub-millisecond move (it flapped ~40% of runs without this floor).
+      # The 50ms floor suppresses those practically-irrelevant wobbles
+      # while still letting a real regression (25ms -> 100ms, or the slow
+      # endpoint's larger swings) fire. The raw anomaly_score is
+      # unaffected — only the alerting bit is gated — so dashboards still
+      # see the statistical signal.
+      - id: http_request_p95_seconds
+        promql: |
+          histogram_quantile(
+            0.95,
+            sum by (endpoint, le) (
+              rate(http_request_duration_seconds_bucket{endpoint=~"/api/.*|/healthz"}[2m])
+            )
+          )
+        expect: true
+        expect_grace_runs: 6
+        min_abs_delta: 0.05
+        detectors:
+          - name: MAD
+            params:
+              window: 15m
+          - name: Hampel
+            params:
+              window: 15m
+              t0: 3
+          - name: CUSUM
+
+      # In-flight concurrency. Gauge, not derived from a counter, so
+      # a different shape of series than the rate-based ones above.
+      # Two detectors so the group's voting ensemble (min_detectors: 2)
+      # can actually fire for this query — a single-detector query under
+      # voting yields a composite that can never light up. ZScoreEWMA
+      # tracks the level of a smooth concurrency gauge, complementing
+      # MAD's robust spread estimate.
+      - id: http_in_flight
+        promql: max by (job) (http_requests_in_flight)
+        expect: true
+        expect_grace_runs: 6
+        detectors:
+          - name: MAD
+            params:
+              window: 15m
+          - name: ZScoreEWMA
+            params:
+              alpha: 0.1

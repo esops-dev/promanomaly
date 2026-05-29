@@ -7,9 +7,16 @@
   "templating": {
     "list": [
       {
+        "name": "datasource",
+        "type": "datasource",
+        "label": "Datasource",
+        "query": "prometheus",
+        "current": {"text": "VictoriaMetrics", "value": "victoriametrics"}
+      },
+      {
         "name": "group",
         "type": "query",
-        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
         "query": "label_values(anomaly_score, group)",
         "refresh": 2,
         "multi": true,
@@ -18,7 +25,7 @@
       {
         "name": "id",
         "type": "query",
-        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
         "query": "label_values(anomaly_score{group=~\"$group\"}, id)",
         "refresh": 2,
         "multi": true,
@@ -31,7 +38,7 @@
       "id": 1,
       "type": "timeseries",
       "title": "anomaly_score",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "anomaly_score{group=~\"$group\", id=~\"$id\"}",
@@ -44,7 +51,7 @@
       "id": 2,
       "type": "timeseries",
       "title": "anomaly_baseline vs. actual",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "anomaly_baseline{group=~\"$group\", id=~\"$id\"}",
@@ -57,7 +64,7 @@
       "id": 3,
       "type": "table",
       "title": "Top-N current anomalies",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "topk(10, anomaly_score{group=~\"$group\"})",

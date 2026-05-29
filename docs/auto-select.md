@@ -33,8 +33,8 @@ groups:
 | Option                        | Behaviour |
 |-------------------------------|-----------|
 | `false` (default)             | Every detector emits its own score |
-| `true`                        | Only the winner emits; carries `best_detector=<name>` |
-| `"explicit_plus_best"`        | All detectors emit + winner is tagged (great for tuning) |
+| `true`                        | Only the winner emits; the winner is named by `anomaly_best_detector` |
+| `"explicit_plus_best"`        | All detectors emit + winner named by `anomaly_best_detector` (great for tuning) |
 
 ## How It Works
 
@@ -48,13 +48,29 @@ Highest F1 wins. Ties broken by precision, then by order in the config.
 
 ## Output
 
-When `auto_select: true`, only the winner’s metrics appear:
+When `auto_select: true`, only the winner’s metrics appear, and a separate
+`anomaly_best_detector` info gauge names the winner:
 
 ```
-anomaly_score{..., detector="MAD", best_detector="MAD", ...} 4.7
+anomaly_score{..., detector="MAD", ...} 4.7
+anomaly_best_detector{..., detector="MAD", ...} 1
 ```
 
-The `best_detector` label is only present when auto-select is enabled.
+`anomaly_best_detector=1` is emitted only for the winner, only when
+auto-select is enabled. It is a standalone series rather than a label on
+`anomaly_score`/`anomaly_outside_threshold`/`anomaly_change_point_total`
+**on purpose**: the winner can change between calibration cycles, and a
+label that appears and disappears would churn those series' identity —
+breaking `rate()`/`increase()` on the change-point counter and resetting
+`for:` timers on `outside_threshold` alerts. Keeping the marker on its own
+series leaves every per-detector metric with a stable label set.
+
+To filter the per-detector metrics down to the winner, join on the shared
+labels, e.g.:
+
+```promql
+anomaly_score * on (id, group, detector, instance) group_left anomaly_best_detector
+```
 
 ## Inspect Before Switching
 

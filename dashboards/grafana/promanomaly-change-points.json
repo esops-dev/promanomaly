@@ -2,8 +2,15 @@
   "annotations": {
     "list": [
       {
+        "name": "datasource",
+        "type": "datasource",
+        "label": "Datasource",
+        "query": "prometheus",
+        "current": {"text": "VictoriaMetrics", "value": "victoriametrics"}
+      },
+      {
         "name": "change-points",
-        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
         "enable": true,
         "iconColor": "red",
         "expr": "changes(anomaly_change_point_total{group=~\"$group\", id=~\"$id\"}[5m]) > 0",
@@ -21,7 +28,7 @@
       {
         "name": "group",
         "type": "query",
-        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
         "query": "label_values(anomaly_change_point_total, group)",
         "refresh": 2,
         "multi": true,
@@ -30,7 +37,7 @@
       {
         "name": "id",
         "type": "query",
-        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
         "query": "label_values(anomaly_change_point_total{group=~\"$group\"}, id)",
         "refresh": 2,
         "multi": true,
@@ -39,7 +46,7 @@
       {
         "name": "detector",
         "type": "query",
-        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
         "query": "label_values(anomaly_change_point_total{group=~\"$group\", id=~\"$id\"}, detector)",
         "refresh": 2,
         "multi": true,
@@ -52,7 +59,7 @@
       "id": 1,
       "type": "stat",
       "title": "Change-points in the last 24h",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "sum(increase(anomaly_change_point_total{group=~\"$group\", id=~\"$id\", detector=~\"$detector\"}[24h]))",
@@ -66,7 +73,7 @@
       "id": 2,
       "type": "stat",
       "title": "Series with recent change-points",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "count(increase(anomaly_change_point_total{group=~\"$group\", id=~\"$id\", detector=~\"$detector\"}[1h]) > 0)",
@@ -80,7 +87,7 @@
       "id": 3,
       "type": "stat",
       "title": "Active change-point detectors",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "count(count by (detector) (anomaly_change_point_total{group=~\"$group\", detector=~\"$detector\"}))",
@@ -93,7 +100,7 @@
       "id": 4,
       "type": "stat",
       "title": "Change-points last 5m",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "sum(increase(anomaly_change_point_total{group=~\"$group\", id=~\"$id\", detector=~\"$detector\"}[5m]))",
@@ -108,7 +115,7 @@
       "type": "timeseries",
       "title": "Change-point rate by detector",
       "description": "Rate of change-point firings per detector. Each spike is a regime shift the detector flagged.",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "sum by (detector) (rate(anomaly_change_point_total{group=~\"$group\", id=~\"$id\", detector=~\"$detector\"}[5m]))",
@@ -122,7 +129,7 @@
       "type": "timeseries",
       "title": "anomaly_score (change-point detectors)",
       "description": "Underlying score driving change-point counters. For BOCPD the score is a posterior probability; for CUSUM it is a sigma multiplier.",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "anomaly_score{group=~\"$group\", id=~\"$id\", detector=~\"BOCPD|CUSUM\"}",
@@ -136,7 +143,7 @@
       "type": "table",
       "title": "Top-N change-points (last 1h)",
       "description": "Series with the most change-point firings in the last hour. Click through to drill down into the underlying signal.",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "topk(20, increase(anomaly_change_point_total{group=~\"$group\", id=~\"$id\", detector=~\"$detector\"}[1h]))",
@@ -151,7 +158,7 @@
       "type": "timeseries",
       "title": "Source signal with change-point overlay",
       "description": "Underlying baseline overlaid for context. Annotations (top of dashboard) mark change-point firings.",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "anomaly_baseline{group=~\"$group\", id=~\"$id\", detector=~\"$detector\"}",
