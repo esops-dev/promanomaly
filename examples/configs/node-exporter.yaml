@@ -1,0 +1,188 @@
+# Node-exporter golden-signals reference config.
+#
+# A ready-made, day-one config that watches the standard host golden
+# signals with detectors already matched to each signal's shape, so you
+# get useful anomaly coverage without hand-authoring PromQL for CPU,
+# memory, disk, filesystem, network, and load.
+#
+# Fleet scale without per-host YAML
+# ---------------------------------
+# Every query below returns one series PER HOST already — the `instance`
+# label flows straight through onto the output metrics, so a single
+# query entry covers a fleet of hundreds of nodes. You do NOT need a
+# `discover:` block for this: discovery exists to fan a *templated query*
+# out across label values, which is only necessary when the PromQL
+# itself has to differ per value. For node-exporter, label-based
+# fan-out via `by (instance)` is simpler, cheaper, and avoids the
+# discovery foot-gun where a rendered id like `cpu_{{ instance }}`
+# would contain the `:`/`.` from `instance="host:9100"` (invalid in a
+# Prometheus metric name). See examples/configs/discovery.yaml for the
+# genuinely-templated case.
+#
+# What each group catches and misses
+# -----------------------------------
+#   group            detector(s)        catches                      misses
+#   ---------------  -----------------  ---------------------------  -----------------------
+#   cpu              MAD + Cohort       per-host CPU spikes;         slow fleet-wide creep
+#                                       one hot node vs. the fleet
+#   memory           MAD                available-memory dips        gradual leak (use drift)
+#   filesystem       MAD + CUSUM        fill spikes; step jumps      slow organic growth
+#   filesystem_rate  Hampel             fill-rate bursts             —
+#   disk_io          MAD                I/O saturation spikes        —
+#   network          MAD (abs floor)    error/drop bursts            rare single packets
+#   load             HourOfDayMAD       diurnal load anomalies       —
+#
+# Wired into the README quickstart: `helm install` + this config is a
+# complete starter deployment. Tune thresholds per your SLOs.
+
+apiVersion: promanomaly.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 10s
+
+server:
+  listen: ":9092"
+  refresh_interval: 1m
+  reload:
+    enabled: true
+  ready_endpoint: true
+
+safety:
+  # Cardinality caps pre-set for a fleet. Each per-host query produces
+  # one series per node; the cohort query produces one per member too.
+  # Sized so a few hundred nodes across the groups stay well under the
+  # global cap. Raise both for larger fleets after a `validate --probe`.
+  max_series_per_query: 2000
+  max_total_series: 20000
+  on_source_failure: serve_stale
+
+defaults:
+  window: 1h
+  step: 15s
+  min_points: 60
+  warmup_policy: emit_warming_up
+  emit_baseline: true
+  emit_duration: true
+  # Operator-experience signals. Severity ranks firings across the
+  # disparate detectors below (MADs vs. cohort-MADs vs. CUSUM sigma) on
+  # one 0-1 scale; emit_anomaly_type surfaces what *kind* of anomaly is
+  # firing for routing/filtering. Type is opt-in because the `type`
+  # label multiplies firing-series cardinality.
+  emit_severity: true
+  emit_anomaly_type: true
+  alert_thresholds:
+    score: 3.0
+
+groups:
+  # ---- CPU saturation -------------------------------------------------
+  # Busy fraction per host (1 - idle). MAD catches a single host
+  # spiking against its own recent baseline; Cohort catches "node 17 is
+  # hot while the other 99 are fine" — an anomaly invisible to a
+  # per-series detector because the bad node's own window looks normal.
+  - name: node_cpu
+    priority: 5
+    queries:
+      - id: node_cpu_busy
+        promql: 1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))
+        detectors:
+          - name: MAD
+          - name: Cohort
+            instance: fleet
+            params:
+              cohort_label: instance
+              min_cohort_size: 5
+        alert_thresholds:
+          score: 4.0   # CPU is busy by nature — tighten the bar
+
+  # ---- Available memory ----------------------------------------------
+  - name: node_memory
+    priority: 5
+    queries:
+      - id: node_memory_available_fraction
+        promql: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes
+        detectors:
+          - name: MAD
+
+  # ---- Filesystem fill ------------------------------------------------
+  # Used fraction per mount. MAD flags sudden jumps; CUSUM catches a
+  # step change (a log explosion that lifts the baseline and stays
+  # there) that a rolling MAD would slowly absorb.
+  - name: node_filesystem
+    priority: 6
+    queries:
+      - id: node_filesystem_used_fraction
+        promql: |
+          1 - (
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}
+          )
+        detectors:
+          - name: MAD
+          - name: CUSUM
+
+  # ---- Filesystem fill *rate* ----------------------------------------
+  # deriv() over the source query turns "how full" into "how fast it is
+  # filling" — the rate-of-change pattern from docs/patterns.md, fed to
+  # a detector rather than baked in as a detector type. Hampel handles
+  # the drifting baseline of a fill rate better than a fixed MAD.
+  - name: node_filesystem_rate
+    priority: 6
+    queries:
+      - id: node_filesystem_fill_rate
+        promql: |
+          deriv(
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}[15m]
+          )
+        detectors:
+          - name: Hampel
+            params:
+              window: 30m
+              t0: 5
+
+  # ---- Disk I/O saturation -------------------------------------------
+  - name: node_disk_io
+    priority: 4
+    queries:
+      - id: node_disk_io_saturation
+        promql: rate(node_disk_io_time_seconds_total[5m])
+        detectors:
+          - name: MAD
+
+  # ---- Network errors / drops ----------------------------------------
+  # Sparse, bursty counters. The practical-significance floor suppresses
+  # statistically-significant-but-operationally-trivial moves (a single
+  # dropped packet on an otherwise-quiet interface).
+  - name: node_network
+    priority: 4
+    queries:
+      - id: node_network_errs_drops
+        promql: |
+          rate(node_network_receive_errs_total[5m])
+          + rate(node_network_receive_drop_total[5m])
+          + rate(node_network_transmit_errs_total[5m])
+          + rate(node_network_transmit_drop_total[5m])
+        min_abs_delta: 1.0   # ignore < 1 err+drop/s moves
+        detectors:
+          - name: MAD
+
+  # ---- Load per core --------------------------------------------------
+  # Load normalised by core count is strongly diurnal on most fleets —
+  # quiet at 3am, busy at midday. HourOfDayMAD scores each sample
+  # against prior same-hour samples so off-peak hours aren't flagged
+  # every night and a genuine 3am anomaly still stands out. This is
+  # still baseline detection (scoring the present against history), not
+  # forecasting.
+  - name: node_load
+    priority: 3
+    queries:
+      - id: node_load1_per_core
+        promql: |
+          node_load1
+          / on (instance) count by (instance) (node_cpu_seconds_total{mode="idle"})
+        detectors:
+          - name: HourOfDayMAD
+          - name: MAD
+            instance: short
+            params:
+              window: 30m

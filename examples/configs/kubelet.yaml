@@ -1,0 +1,88 @@
+# kubelet golden-signals reference config.
+#
+# Sibling starter for the kubelet's own operational signals: runtime
+# operation error rate, pod start duration, and PLEG relist latency.
+# Fan-out is label-based over the `instance` (node) label; Cohort
+# catches one kubelet misbehaving against the rest of the fleet.
+
+apiVersion: promanomaly.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 10s
+
+server:
+  listen: ":9092"
+  refresh_interval: 1m
+  ready_endpoint: true
+
+safety:
+  max_series_per_query: 2000
+  max_total_series: 20000
+  on_source_failure: serve_stale
+
+defaults:
+  window: 1h
+  step: 30s
+  min_points: 30
+  warmup_policy: emit_warming_up
+  emit_duration: true
+  emit_severity: true
+  emit_anomaly_type: true
+  alert_thresholds:
+    score: 3.0
+
+groups:
+  # ---- Runtime operation errors --------------------------------------
+  - name: kubelet_runtime_errors
+    priority: 6
+    queries:
+      - id: kubelet_runtime_operations_error_rate
+        promql: |
+          sum by (instance) (rate(kubelet_runtime_operations_errors_total[5m]))
+        min_abs_delta: 0.01
+        detectors:
+          - name: MAD
+          - name: Cohort
+            instance: fleet
+            params:
+              cohort_label: instance
+              min_cohort_size: 5
+
+  # ---- Pod start duration (p99) --------------------------------------
+  # histogram_quantile() on the source query — the p99 pattern from
+  # docs/patterns.md. A rising p99 is slow pod startup.
+  - name: kubelet_pod_start
+    priority: 5
+    queries:
+      - id: kubelet_pod_start_duration_p99
+        promql: |
+          histogram_quantile(
+            0.99,
+            sum by (instance, le) (
+              rate(kubelet_pod_start_duration_seconds_bucket[10m])
+            )
+          )
+        detectors:
+          - name: Hampel
+            params:
+              window: 30m
+              t0: 5
+
+  # ---- PLEG relist latency (p99) -------------------------------------
+  # A classic kubelet-health signal; a spike often precedes node
+  # NotReady. CUSUM catches the sustained step.
+  - name: kubelet_pleg_relist
+    priority: 5
+    queries:
+      - id: kubelet_pleg_relist_p99
+        promql: |
+          histogram_quantile(
+            0.99,
+            sum by (instance, le) (
+              rate(kubelet_pleg_relist_duration_seconds_bucket[10m])
+            )
+          )
+        detectors:
+          - name: MAD
+          - name: CUSUM

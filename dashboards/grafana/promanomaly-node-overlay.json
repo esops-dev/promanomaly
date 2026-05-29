@@ -1,0 +1,160 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "name": "change-points",
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "enable": true,
+        "iconColor": "red",
+        "expr": "increase(anomaly_change_point_total{group=~\"node_.*\", instance=~\"$instance\"}[5m]) > 0",
+        "titleFormat": "change-point {{id}}",
+        "tagKeys": "detector,id"
+      }
+    ]
+  },
+  "editable": true,
+  "schemaVersion": 38,
+  "title": "promanomaly node overlay",
+  "tags": ["promanomaly", "anomaly-detection", "node-exporter"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "label": "Datasource",
+        "query": "prometheus",
+        "current": {"text": "VictoriaMetrics", "value": "victoriametrics"}
+      },
+      {
+        "name": "group",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "query": "label_values(anomaly_score{group=~\"node_.*\"}, group)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true
+      },
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "query": "label_values(anomaly_score{group=~\"$group\"}, instance)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "Most anomalous hosts right now",
+      "description": "Top hosts ranked by the normalised 0-1 severity signal. The same ranking promanomaly top surfaces from the CLI.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "topk(10, max by (instance, id, group, detector) (anomaly_severity{group=~\"$group\", instance=~\"$instance\"}))",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0}
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "CPU busy — actual + baseline (firing shaded)",
+      "description": "Raw signal overlaid with anomaly_baseline; anomaly_outside_threshold==1 regions and change-point annotations mark where the detector flagged the host.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\", instance=~\"$instance\"}[5m]))",
+          "legendFormat": "actual {{instance}}"
+        },
+        {
+          "expr": "anomaly_baseline{group=\"node_cpu\", id=\"node_cpu_busy\", detector=\"MAD\", instance=~\"$instance\"}",
+          "legendFormat": "baseline {{instance}}"
+        },
+        {
+          "expr": "anomaly_outside_threshold{group=\"node_cpu\", id=\"node_cpu_busy\", instance=~\"$instance\"}",
+          "legendFormat": "firing {{instance}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Memory available fraction — actual + baseline",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "node_memory_MemAvailable_bytes{instance=~\"$instance\"} / node_memory_MemTotal_bytes{instance=~\"$instance\"}",
+          "legendFormat": "actual {{instance}}"
+        },
+        {
+          "expr": "anomaly_baseline{group=\"node_memory\", id=\"node_memory_available_fraction\", instance=~\"$instance\"}",
+          "legendFormat": "baseline {{instance}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Filesystem used fraction — actual + baseline (firing shaded)",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "anomaly_baseline{group=\"node_filesystem\", id=\"node_filesystem_used_fraction\", detector=\"MAD\", instance=~\"$instance\"}",
+          "legendFormat": "baseline {{instance}}"
+        },
+        {
+          "expr": "anomaly_outside_threshold{group=\"node_filesystem\", id=\"node_filesystem_used_fraction\", instance=~\"$instance\"}",
+          "legendFormat": "firing {{instance}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16}
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Disk I/O saturation — score",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "anomaly_score{group=\"node_disk_io\", id=\"node_disk_io_saturation\", instance=~\"$instance\"}",
+          "legendFormat": "score {{instance}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Network errors/drops — score",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "anomaly_score{group=\"node_network\", id=\"node_network_errs_drops\", instance=~\"$instance\"}",
+          "legendFormat": "score {{instance}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24}
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Load per core — score (HourOfDayMAD)",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "anomaly_score{group=\"node_load\", id=\"node_load1_per_core\", detector=\"HourOfDayMAD\", instance=~\"$instance\"}",
+          "legendFormat": "score {{instance}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24}
+    }
+  ]
+}

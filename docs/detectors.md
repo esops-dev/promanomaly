@@ -719,6 +719,45 @@ detectors:
 
 Built-ins consume params via `fit_score`. Community detectors that prefer to stash overrides at construction time get the same surface — no fork required. The `instance:` field is required when the same `name:` appears more than once in a query; the schema rejects duplicate names without it.
 
+## Anomaly typing (`anomaly_type_score`)
+
+When a series fires, `anomaly_type_score{id, group, detector, type, ...}`
+surfaces *what kind* of anomaly it is, so on-call can route, runbook, and
+filter without first opening the signal. It is a **new metric** emitted
+only for firing series and only when `defaults.emit_anomaly_type: true`
+(opt-in, because the `type` dimension multiplies firing-series
+cardinality). It is **never** a label silently added to `anomaly_score` /
+`anomaly_outside_threshold` / `anomaly_severity` — that would break the
+breaking-change policy. The metric value is the firing's `anomaly_score`.
+
+The `type` value-set is **public API** — like a metric name, adding a
+value is non-breaking, renaming or removing one is breaking:
+
+| `type` | Meaning | Primarily produced by |
+|---|---|---|
+| `point_spike` | A lone deviating latest sample | MAD / Hampel / IQR / ZScoreEWMA |
+| `step_up` | Abrupt sustained shift upward | CUSUM / BOCPD; window heuristic |
+| `step_down` | Abrupt sustained shift downward | CUSUM / BOCPD; window heuristic |
+| `level_drift` | Slow monotonic level change | window heuristic |
+| `variance_shift` | Stable level, widened recent spread | window heuristic |
+| `cohort_divergence` | Member diverges from its peers | Cohort |
+| `shape_discord` | Reserved for future shape detectors | — (not emitted yet) |
+
+Classification is deterministic and reads the rolling window the detector
+already scored against — no extra TSDB load, no per-detector protocol
+change. Cohort firings are always `cohort_divergence`; a change-point
+detector's fire is a directional step; everything else is classified from
+the window shape (a sustained half-to-half level shift → step or, if
+monotonic, `level_drift`; a widened recent spread → `variance_shift`;
+otherwise `point_spike`). A detector may override the heuristic by
+returning an `anomaly_type` column in its score row (validated against the
+frozen set; an unrecognised value falls back to the heuristic).
+
+The type is also returned by `/debug/anomalies` and `promanomaly top`
+(see [`docs/triage.md`](triage.md)) and feeds Alertmanager routing and
+Grafana filtering directly. It makes no alerting decision — pure
+enrichment.
+
 ## Adding a New Detector (for contributors)
 
 1. Implement the `Detector` protocol in `detector/src/promanomaly/detectors/<name>.py`.  

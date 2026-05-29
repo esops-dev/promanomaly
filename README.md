@@ -47,6 +47,20 @@ helm install promanomaly promanomaly/promanomaly-stack
 This installs VictoriaMetrics, the detector, and example dashboards.
 For an existing TSDB, install only `promanomaly/promanomaly`.
 
+For a complete day-one starter next to node-exporter, point the detector
+at [`examples/configs/node-exporter.yaml`](examples/configs/node-exporter.yaml) —
+a ready-made multi-group config watching the host golden signals (CPU,
+memory, filesystem fill + fill-rate, disk I/O, network errors, load) with
+detectors already matched to each signal's shape. Sibling starters cover
+[kube-state-metrics](examples/configs/kube-state-metrics.yaml),
+[cAdvisor](examples/configs/cadvisor.yaml),
+[kubelet](examples/configs/kubelet.yaml), and
+[application/middleware](examples/configs/applications.yaml) signals, and
+the [`docs/cookbook/`](docs/cookbook/) recipes explain which detector fits
+which signal. Once running, `promanomaly top --target <url>` ranks what is
+anomalous right now by a normalised severity signal — see
+[`docs/triage.md`](docs/triage.md).
+
 Editing the YAML config does **not** require a pod restart: the detector
 watches the mounted ConfigMap, validates the new config in-place, and
 rolls back on validation failure (`kubectl apply` to the ConfigMap is
@@ -90,7 +104,7 @@ rare events, and per-instance outliers.
 
 ## Status
 
-The configuration schema is stable as of the v1.0 release:
+The configuration schema is stable as of the first stable release:
 `apiVersion: promanomaly.io/v1` and the `values.schema.json` `$id`
 both move from alpha to v1. The previous `promanomaly.io/v1alpha1`
 alias keeps loading as a byte-identical form with a deprecation

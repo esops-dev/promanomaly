@@ -98,7 +98,9 @@ async def test_drop_scores_keeps_other_queries_in_snapshot(stub_source: StubSour
 
     # The run as a whole succeeds even though one query failed.
     assert result.succeeded
-    ids = {dict(s.labels).get("id") for s in result.samples}
+    # Group-level fleet-density samples carry no id; restrict to the
+    # per-series samples when asserting which queries survived.
+    ids = {dict(s.labels).get("id") for s in result.samples if "id" in dict(s.labels)}
     assert ids == {"m_ok"}, ids
     # The source-failure counter still bumped.
     counter = ops.registry.get_sample_value(
@@ -108,7 +110,7 @@ async def test_drop_scores_keeps_other_queries_in_snapshot(stub_source: StubSour
     # Snapshot has been overwritten with the fresh, partial data.
     snap = store.get("g1")
     assert snap is not None
-    assert {dict(s.labels).get("id") for s in snap.samples} == {"m_ok"}
+    assert {dict(s.labels).get("id") for s in snap.samples if "id" in dict(s.labels)} == {"m_ok"}
 
 
 @pytest.mark.asyncio
@@ -181,7 +183,10 @@ async def test_drop_scores_partial_failure_writes_partial_snapshot(
     assert result.succeeded
     snap = store.get("g1")
     assert snap is not None
-    assert {dict(s.labels).get("id") for s in snap.samples} == {"m_ok"}
+    # Group-level fleet-density samples carry no id; consider only the
+    # per-series samples when asserting which queries survived.
+    per_series_ids = {dict(s.labels).get("id") for s in snap.samples if "id" in dict(s.labels)}
+    assert per_series_ids == {"m_ok"}
     # Partial success resets the streak — drop_scores degraded but
     # didn't fail wholesale.
     assert store.source_failure_streak("g1") == 0

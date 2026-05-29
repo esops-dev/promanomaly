@@ -1,0 +1,95 @@
+# cAdvisor / container-metrics golden-signals reference config.
+#
+# Sibling to the node-exporter and kube-state-metrics starters for the
+# per-container signals cAdvisor exposes: CPU throttling, OOM kills,
+# eviction pressure, and requests-vs-usage drift. Fan-out is label-based
+# over (namespace, pod); the fleet density rollup partitions by
+# namespace.
+#
+# Cardinality note: container metrics are high-cardinality by nature.
+# The aggregations below roll up to (namespace, pod) — keep the
+# `max_series_per_query` cap honest and run `validate --probe` before
+# deploying against a large cluster.
+
+apiVersion: promanomaly.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 10s
+
+server:
+  listen: ":9092"
+  refresh_interval: 1m
+  ready_endpoint: true
+
+safety:
+  max_series_per_query: 3000
+  max_total_series: 30000
+  on_source_failure: serve_stale
+
+defaults:
+  window: 1h
+  step: 30s
+  min_points: 30
+  warmup_policy: emit_warming_up
+  emit_duration: true
+  emit_severity: true
+  emit_anomaly_type: true
+  density_by:
+    - namespace
+  alert_thresholds:
+    score: 3.0
+
+groups:
+  # ---- Container CPU throttling --------------------------------------
+  # Fraction of CFS periods throttled. A workload hitting its CPU limit
+  # throttles; a sudden rise is the signature. Cohort catches one
+  # replica throttling while its peers don't (a bad node placement).
+  - name: container_cpu_throttling
+    priority: 6
+    queries:
+      - id: container_cpu_throttled_fraction
+        promql: |
+          sum by (namespace, pod) (rate(container_cpu_cfs_throttled_periods_total[5m]))
+          / clamp_min(sum by (namespace, pod) (rate(container_cpu_cfs_periods_total[5m])), 1)
+        min_abs_delta: 0.01
+        detectors:
+          - name: MAD
+          - name: Cohort
+            instance: fleet
+            params:
+              cohort_label: pod
+              min_cohort_size: 5
+
+  # ---- OOM kills ------------------------------------------------------
+  # Counter of OOM kills. Any sustained increase is worth a page; CUSUM
+  # catches the step from "never" to "repeatedly".
+  - name: container_oom_kills
+    priority: 7
+    queries:
+      - id: container_oom_kill_rate
+        promql: |
+          sum by (namespace, pod) (rate(container_oom_events_total[15m]))
+        min_abs_delta: 0.001
+        detectors:
+          - name: MAD
+          - name: CUSUM
+
+  # ---- Memory usage vs. requests drift -------------------------------
+  # Working-set as a fraction of the request. Creeping toward (and past)
+  # the request is a slow drift — Hampel handles the drifting baseline.
+  - name: container_memory_request_drift
+    priority: 5
+    queries:
+      - id: container_memory_request_fraction
+        promql: |
+          sum by (namespace, pod) (container_memory_working_set_bytes)
+          / clamp_min(
+              sum by (namespace, pod) (
+                kube_pod_container_resource_requests{resource="memory"}
+              ), 1)
+        detectors:
+          - name: Hampel
+            params:
+              window: 1h
+              t0: 5
