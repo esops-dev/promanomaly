@@ -184,6 +184,57 @@ async def test_emit_change_points_false_suppresses_counter(stub_source: StubSour
     assert "anomaly_change_point_total" not in metrics
 
 
+@pytest.mark.asyncio
+async def test_no_metric_carries_best_detector_label(stub_source: StubSource) -> None:
+    """Regression: the auto-select winner marker ``best_detector`` must NOT
+    ride any per-detector metric — not the gauges, and especially not the
+    ``anomaly_change_point_total`` counter.
+
+    The marker flips between detectors every ``auto_select_interval``. As a
+    label it churns series identity: on the counter that breaks
+    rate()/increase() and group-level sums; on outside_threshold it resets
+    ``for:`` alert timers. The winner is instead published as a standalone
+    ``anomaly_best_detector=1`` info gauge, so every per-detector series
+    keeps a stable label set."""
+    df = step_change(n=120, step=5.0, noise=0.1, change_at=119)
+    stub_source.respond(lambda _: StubResponse(series=[make_series({"instance": "host-a"}, df)]))
+
+    raw = {
+        "apiVersion": CURRENT_API_VERSION,
+        "datasource": {"url": "http://stub"},
+        "defaults": {
+            "window": "15m",
+            "step": "15s",
+            "min_points": 30,
+            "warmup_policy": "emit_warming_up",
+            "emit_change_points": True,
+            "alert_thresholds": {"score": 3.0},
+        },
+        "groups": [
+            {
+                "name": "g1",
+                # auto_select marks the single detector as the winner.
+                "auto_select": True,
+                "queries": [{"id": "m", "promql": "up", "detectors": [{"name": "BOCPD"}]}],
+            }
+        ],
+    }
+    cfg = Config.model_validate(raw)
+    runner = Runner(cfg, stub_source, SnapshotStore(), OperationalMetrics())
+    result = await runner.run_group("g1")
+
+    # No per-detector metric carries best_detector as a label...
+    for s in result.samples:
+        if s.metric != "anomaly_best_detector":
+            assert "best_detector" not in s.label_dict, s.metric
+    cp = next(s for s in result.samples if s.metric == "anomaly_change_point_total")
+    assert cp.label_dict["detector"] == "BOCPD"
+    # ...the winner is named by a single anomaly_best_detector info gauge.
+    best = next(s for s in result.samples if s.metric == "anomaly_best_detector")
+    assert best.value == 1.0
+    assert best.label_dict["detector"] == "BOCPD"
+
+
 def test_exporter_renders_counter_type_declaration() -> None:
     """The exposition format must declare TYPE counter for the metric so
     Prometheus client libraries handle counter-reset detection correctly."""

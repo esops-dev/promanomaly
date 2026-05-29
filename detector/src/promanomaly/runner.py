@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 import os
 import time
 from dataclasses import dataclass, field
@@ -125,6 +126,34 @@ class GroupRunResult:
     queries_succeeded: int = 0
 
 
+# Per-detector compute time captured during a single group run, flushed
+# onto the operational gauge at the end of that run. A ContextVar rather
+# than an instance attribute because the scheduler fires every group as
+# its own concurrent asyncio task against one shared Runner; an instance
+# dict would be reset and mutated by all groups at once, cross-attributing
+# detector durations to groups that never ran them (e.g. a MAD-only group
+# reporting a Hampel duration). Each group run gets a fresh task-local dict
+# via ``_DETECT_DURATIONS.set`` so the timings stay scoped to their group.
+_DETECT_DURATIONS: contextvars.ContextVar[dict[str, float]] = contextvars.ContextVar(
+    "promanomaly_detect_durations"
+)
+
+
+def _current_detect_durations() -> dict[str, float]:
+    """Return the current run's duration accumulator, creating one if unset.
+
+    The real pipeline always calls :meth:`Runner.run_group`, which seeds the
+    accumulator before any detector runs; the fallback only matters for tests
+    that exercise :meth:`Runner._run_detector` in isolation.
+    """
+    try:
+        return _DETECT_DURATIONS.get()
+    except LookupError:
+        durations: dict[str, float] = {}
+        _DETECT_DURATIONS.set(durations)
+        return durations
+
+
 class Runner:
     """Owns the detection pipeline shared across all groups.
 
@@ -163,9 +192,9 @@ class Runner:
         # reset would defeat the cross-group cap. Updated when a group
         # finishes (success path); failures leave the old count in place.
         self._last_series_count: dict[str, int] = {}
-        # Per-detector compute time captured during the current run;
-        # flushed onto the operational gauge at the end of the run.
-        self._detect_durations: dict[str, float] = {}
+        # Per-detector compute time is tracked in the ``_DETECT_DURATIONS``
+        # ContextVar (task-local per group run), not on the instance — see
+        # the module-level note for why a shared dict races across groups.
         # Stratified baseline cache + sliding-window fetch live behind
         # this facade; the runner delegates to it rather than owning
         # the heavy cache state directly.
@@ -266,7 +295,10 @@ class Runner:
         async with self._group_locks[group_name]:
             self._store.mark_attempted(group_name)
             run_start = time.monotonic()
-            self._detect_durations = {}
+            # Seed a fresh, task-local duration accumulator for this run.
+            # Isolated per group because each group runs in its own
+            # concurrent scheduler task (see ``_DETECT_DURATIONS`` note).
+            _DETECT_DURATIONS.set({})
             result = GroupRunResult(group=group_name)
             source_failed = False
             try:
@@ -1133,17 +1165,14 @@ class Runner:
                 plan.params,
             )
             started = time.monotonic()
+            durations = _current_detect_durations()
             try:
                 df = await asyncio.wait_for(future, timeout=timeout)
             except TimeoutError as exc:
                 future.cancel()
-                self._detect_durations[plan.name] = self._detect_durations.get(plan.name, 0.0) + (
-                    time.monotonic() - started
-                )
+                durations[plan.name] = durations.get(plan.name, 0.0) + (time.monotonic() - started)
                 raise concurrent.futures.TimeoutError("detector timeout") from exc
-            self._detect_durations[plan.name] = self._detect_durations.get(plan.name, 0.0) + (
-                time.monotonic() - started
-            )
+            durations[plan.name] = durations.get(plan.name, 0.0) + (time.monotonic() - started)
             if df.empty:
                 raise RuntimeError(f"detector {plan.name} returned no rows")
             return df.iloc[-1]
@@ -1222,11 +1251,15 @@ class Runner:
         emitted Sample list.
         """
         extras: dict[str, str] = {}
-        if mark_as_winner:
-            # Opt-in label: only emitted when this detector is the
-            # auto-select winner for this series. Opt-in labels are
-            # non-breaking per the project's API contract.
-            extras["best_detector"] = plan.name
+        # The auto-select winner is NOT marked by adding a ``best_detector``
+        # label to this detector's samples: the winner can flip every
+        # ``auto_select_interval``, and a label that appears/disappears
+        # churns the series identity of anomaly_score / outside_threshold /
+        # the change-point counter — breaking rate()/increase() on the
+        # counter and resetting ``for:`` timers on the outside_threshold
+        # alert. Instead the winner is published as a standalone
+        # ``anomaly_best_detector{...} = 1`` info gauge below, so the
+        # existing per-detector series keep a stable label set.
         if cohort_label_extra is not None:
             # Opt-in label emitted by the Cohort detector exclusively
             # (set by the runner when a cohort-aware plan scored this
@@ -1274,6 +1307,14 @@ class Runner:
                 value=1.0 if outside else 0.0,
             ),
         ]
+        if mark_as_winner:
+            # Standalone info gauge naming the auto-select winner. Shares
+            # the per-detector label set (id, group, detector,
+            # detector_instance, source labels) so a PromQL join filters
+            # the other metrics down to the winner, while keeping the
+            # winner marker off those metrics' own label sets (see the
+            # note where ``extras`` is built).
+            samples.append(Sample(metric="anomaly_best_detector", labels=labels, value=1.0))
         if defaults.emit_baseline:
             samples.append(Sample(metric="anomaly_baseline", labels=labels, value=baseline))
         if defaults.emit_duration:
@@ -1299,6 +1340,11 @@ class Runner:
                 detector_instance=plan.instance,
                 fired=fired,
             )
+            # ``labels`` is now a stable set for this (id, group, detector)
+            # series — the auto-select winner marker lives on the separate
+            # ``anomaly_best_detector`` gauge rather than as a label here,
+            # so this monotonic counter no longer splits across winner /
+            # non-winner variants and rate()/increase() stay continuous.
             samples.append(
                 Sample(
                     metric="anomaly_change_point_total",
@@ -1555,7 +1601,10 @@ class Runner:
         self._ops.source_failure_streak.labels(group=result.group).set(
             float(self._store.source_failure_streak(result.group))
         )
-        for detector_name, elapsed in self._detect_durations.items():
+        # Read the task-local accumulator seeded at the top of this run;
+        # ``_update_operational_metrics`` runs in the same task as
+        # ``run_group`` so the ContextVar resolves to this group's dict.
+        for detector_name, elapsed in _DETECT_DURATIONS.get({}).items():
             self._ops.detect_duration_seconds.labels(
                 group=result.group, detector=detector_name
             ).set(elapsed)

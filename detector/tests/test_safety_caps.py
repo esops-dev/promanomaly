@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from promanomaly.config import CURRENT_API_VERSION, Config
@@ -112,3 +114,62 @@ async def test_detect_duration_seconds_gauge_populated(stub_source: StubSource) 
     )
     assert elapsed is not None
     assert elapsed >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_detect_duration_not_cross_attributed_across_concurrent_groups(
+    stub_source: StubSource,
+) -> None:
+    """Regression: detect-duration timings must stay scoped to the group
+    that ran the detector.
+
+    The scheduler fires every group as its own concurrent asyncio task
+    against one shared Runner. A previous implementation accumulated
+    durations in a single instance dict, so concurrent runs cross-
+    attributed each other's detectors — a MAD-only group would publish an
+    IQR duration and vice versa. The accumulator is now task-local
+    (``_DETECT_DURATIONS``), so each group emits only its own detectors.
+    """
+    cfg = Config.model_validate(
+        {
+            "apiVersion": CURRENT_API_VERSION,
+            "datasource": {"url": "http://stub"},
+            "defaults": {
+                "window": "5m",
+                "step": "15s",
+                "min_points": 5,
+                "warmup_policy": "emit_warming_up",
+                "alert_thresholds": {"score": 3.0},
+            },
+            "groups": [
+                {
+                    "name": "ga",
+                    "queries": [{"id": "ma", "promql": "up_a", "detectors": [{"name": "MAD"}]}],
+                },
+                {
+                    "name": "gb",
+                    "queries": [{"id": "mb", "promql": "up_b", "detectors": [{"name": "IQR"}]}],
+                },
+            ],
+        }
+    )
+    stub_source.respond(lambda _: StubResponse(series=[make_series({}, clean_baseline(n=120))]))
+
+    ops = OperationalMetrics()
+    runner = Runner(cfg, stub_source, SnapshotStore(), ops)
+
+    # Run both groups concurrently, as the scheduler does.
+    await asyncio.gather(runner.run_group("ga"), runner.run_group("gb"))
+
+    def sample(group: str, detector: str) -> float | None:
+        return ops.registry.get_sample_value(
+            "anomaly_detect_duration_seconds",
+            {"group": group, "detector": detector},
+        )
+
+    # Each group reports its own detector...
+    assert sample("ga", "MAD") is not None
+    assert sample("gb", "IQR") is not None
+    # ...and never the other group's.
+    assert sample("ga", "IQR") is None
+    assert sample("gb", "MAD") is None

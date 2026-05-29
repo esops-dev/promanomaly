@@ -9,6 +9,7 @@ a short TTL window — see ``cache.py`` for the rationale.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -180,7 +181,7 @@ class PromQLSource:
                 int(max_series or 0),
                 bucket,
             )
-            cached = self._cache.get(cache_key, time.monotonic())
+            cached = await self._cache_get(cache_key)
             if cached is not None:
                 return cached
 
@@ -195,12 +196,30 @@ class PromQLSource:
             "end": f"{end:.3f}",
             "step": f"{step_seconds:.3f}",
         }
-        try:
-            response = await self._client.get("/api/v1/query_range", params=params)
-        except httpx.TimeoutException as exc:
-            raise SourceQueryError("timeout", str(exc)) from exc
-        except httpx.HTTPError as exc:
-            raise SourceQueryError("transport_error", str(exc)) from exc
+        # One transparent retry on a transient transport error. The common
+        # case is a keepalive connection the TSDB (or an intermediary)
+        # closed while idle between scrapes: the next request on that pooled
+        # connection fails immediately and a fresh connection succeeds. A
+        # single retry absorbs that blip instead of degrading the whole
+        # group to serve_stale and tripping AnomalySourceFailing on a
+        # harmless hiccup. Timeouts are NOT retried — under a slow TSDB a
+        # retry only compounds load, and the per-query timeout already
+        # bounds the wait. HTTP error envelopes (4xx/5xx) are real server
+        # responses handled below, not transport failures, so they never
+        # reach this retry.
+        response: httpx.Response | None = None
+        transport_exc: httpx.HTTPError | None = None
+        for _attempt in range(2):
+            try:
+                response = await self._client.get("/api/v1/query_range", params=params)
+                break
+            except httpx.TimeoutException as exc:
+                raise SourceQueryError("timeout", _exc_detail(exc)) from exc
+            except httpx.HTTPError as exc:
+                transport_exc = exc
+        if response is None:
+            assert transport_exc is not None
+            raise SourceQueryError("transport_error", _exc_detail(transport_exc)) from transport_exc
 
         if response.status_code >= 500:
             raise SourceQueryError("server_error", f"HTTP {response.status_code}")
@@ -239,8 +258,46 @@ class PromQLSource:
 
         query_result = QueryResult(series=series_list, truncated=truncated)
         if self._cache is not None and cache_key is not None:
-            self._cache.put(cache_key, query_result, time.monotonic())
+            await self._cache_put(cache_key, query_result)
         return query_result
+
+    async def _cache_get(
+        self, cache_key: tuple[str, float, float, int, int]
+    ) -> QueryResult | None:
+        """Read from the cache without blocking the event loop.
+
+        The in-process :class:`TTLCache` is a lock-guarded memory lookup and
+        runs inline; the Redis backend (``is_blocking_io=True``) does socket
+        I/O, so it is offloaded to a worker thread to keep the loop free for
+        other groups' detection runs.
+        """
+        assert self._cache is not None
+        if getattr(self._cache, "is_blocking_io", False):
+            return await asyncio.to_thread(self._cache.get, cache_key, time.monotonic())
+        return self._cache.get(cache_key, time.monotonic())
+
+    async def _cache_put(
+        self, cache_key: tuple[str, float, float, int, int], value: QueryResult
+    ) -> None:
+        """Write to the cache without blocking the event loop (see ``_cache_get``)."""
+        assert self._cache is not None
+        if getattr(self._cache, "is_blocking_io", False):
+            await asyncio.to_thread(self._cache.put, cache_key, value, time.monotonic())
+            return
+        self._cache.put(cache_key, value, time.monotonic())
+
+
+def _exc_detail(exc: Exception) -> str:
+    """Human-readable detail for a transport exception.
+
+    httpx transport errors (``RemoteProtocolError`` for a server-closed
+    connection, bare ``ConnectError``/``ReadError``) frequently stringify to
+    an empty message, which left the ``source_query_failed`` log line and the
+    ``anomaly_source_failure_total`` counter with no indication of *what*
+    failed. Fall back to the exception class name so the failure is always
+    diagnosable.
+    """
+    return str(exc) or type(exc).__name__
 
 
 def _build_samples_frame(samples: list[list[Any]]) -> pd.DataFrame:

@@ -27,6 +27,13 @@ scrape_configs:
     static_configs:
       - targets: ["node-exporter:9100"]
 
+  - job_name: http-demo
+    # Started only under the docker-compose ``load`` profile (see
+    # docker-compose.dev.yml). Targets resolve to nothing on the minimum
+    # dev stack, which Prometheus tolerates by leaving the scrape pool empty.
+    static_configs:
+      - targets: ["http-demo:8000"]
+
   - job_name: promanomaly
     # honor_labels: anomaly metrics carry the source ``instance`` label
     # (e.g. ``dev-host-a:9100``) from the underlying time-series. Without

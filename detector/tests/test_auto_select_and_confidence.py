@@ -111,8 +111,15 @@ async def test_auto_select_emits_only_winner_by_default(stub_source: StubSource)
     # only one winner per series.
     assert len(score_samples) == 1
     labels = dict(score_samples[0].labels)
-    assert labels["best_detector"] == labels["detector"]
+    # The winner marker is no longer a label on anomaly_score — that would
+    # churn the series identity each time the winner flips. It is published
+    # as a standalone anomaly_best_detector=1 info gauge instead.
+    assert "best_detector" not in labels
     assert labels["detector"] in {"MAD", "Hampel"}
+    best = [s for s in result.samples if s.metric == "anomaly_best_detector"]
+    assert len(best) == 1
+    assert best[0].value == 1.0
+    assert dict(best[0].labels)["detector"] == labels["detector"]
 
 
 @pytest.mark.asyncio
@@ -128,13 +135,17 @@ async def test_auto_select_explicit_plus_best_keeps_all(stub_source: StubSource)
 
     result = await runner.run_group("g1")
     score_samples = [s for s in result.samples if s.metric == "anomaly_score"]
-    # explicit_plus_best emits both detectors, tags the winner with
-    # best_detector= but does not tag the loser.
+    # explicit_plus_best emits both detectors' scores...
     assert len(score_samples) == 2
-    winners = [s for s in score_samples if "best_detector" in dict(s.labels)]
-    losers = [s for s in score_samples if "best_detector" not in dict(s.labels)]
-    assert len(winners) == 1
-    assert len(losers) == 1
+    # ...with NO best_detector label on either — the winner marker lives on
+    # a standalone anomaly_best_detector info gauge so the score series keep
+    # a stable identity across winner flips.
+    assert all("best_detector" not in dict(s.labels) for s in score_samples)
+    best = [s for s in result.samples if s.metric == "anomaly_best_detector"]
+    assert len(best) == 1
+    winner_detector = dict(best[0].labels)["detector"]
+    assert winner_detector in {"MAD", "Hampel"}
+    assert winner_detector in {dict(s.labels)["detector"] for s in score_samples}
 
 
 @pytest.mark.asyncio

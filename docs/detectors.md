@@ -639,7 +639,7 @@ groups:
           - name: IQR
 ```
 
-When `auto_select: true`, the runner periodically injects three canonical synthetic anomalies (point spike, step change, level drift) into each series's rolling window and measures every configured detector's F1. The winner's score samples are emitted with an extra `best_detector=<name>` label; the losers are suppressed. `auto_select: "explicit_plus_best"` keeps every detector's output and only tags the winner — useful while tuning.
+When `auto_select: true`, the runner periodically injects three canonical synthetic anomalies (point spike, step change, level drift) into each series's rolling window and measures every configured detector's F1. The winner's score samples are emitted and a standalone `anomaly_best_detector{...,detector=<name>} = 1` info gauge names the winner; the losers are suppressed. `auto_select: "explicit_plus_best"` keeps every detector's output and still names the winner via `anomaly_best_detector` — useful while tuning. The marker is a separate series rather than a label on the per-detector metrics, so the winner can flip between cycles without churning the identity of `anomaly_score`/`anomaly_outside_threshold`/`anomaly_change_point_total`.
 
 The full algorithm and tuning knobs live in [`auto-select.md`](auto-select.md).
 

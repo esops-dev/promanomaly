@@ -139,6 +139,18 @@ _HELP: dict[str, tuple[str, str]] = {
             "handling absorbs that."
         ),
     ),
+    "anomaly_best_detector": (
+        "gauge",
+        (
+            "1 for the detector auto-select picked as best for a series; "
+            "emitted only for the winner under auto_select. An info-style "
+            "marker on its own series, so the winner can flip between "
+            "auto_select_interval cycles without churning the label set of "
+            "anomaly_score/anomaly_outside_threshold/etc. Join with "
+            "`* on (id, group, detector, ...) group_left` to filter the "
+            "per-detector metrics down to the winner."
+        ),
+    ),
 }
 
 

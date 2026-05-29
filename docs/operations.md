@@ -386,7 +386,7 @@ exporter:
 Semantics:
 
 - The canonical detector labels — `id`, `group`, `detector`, `detector_instance` — are added **after** the filter and cannot be stripped. Listing one of them in `drop` is rejected at config-load time so a configuration mistake fails at validate-time rather than silently leaving the label in production.
-- `allow` and `drop` operate on **source** labels (everything copied from the PromQL response). The canonical labels and any opt-in feature labels (`best_detector`, `warming_up`) bypass the filter.
+- `allow` and `drop` operate on **source** labels (everything copied from the PromQL response). The canonical labels and any opt-in feature labels (`cohort_label`, `warming_up`) bypass the filter. (The auto-select winner is no longer a label — it is the standalone `anomaly_best_detector` info gauge.)
 - `drop` takes precedence over `allow` — if a label appears in both, it is stripped. Useful when the allow-list is an inherited template and a downstream config layer needs to subtract.
 - The filter applies uniformly to `anomaly_score`, `anomaly_baseline`, `anomaly_duration_seconds`, `anomaly_change_point_total`, `anomaly_confidence_score`, `anomaly_baseline_stability`, and the composite `anomaly_composite_*` metrics — anywhere source labels could otherwise reach the wire.
 

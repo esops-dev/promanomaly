@@ -60,6 +60,12 @@ class TTLCache[K, V]:
     interface.
     """
 
+    # In-process: ``get``/``put`` are lock-protected memory ops with no
+    # network round-trip, so the source layer calls them inline on the
+    # event loop. The Redis backend overrides this to True so the source
+    # offloads its blocking socket I/O to a worker thread.
+    is_blocking_io: bool = False
+
     def __init__(self, *, max_entries: int, ttl_seconds: float) -> None:
         if max_entries < 1:
             raise ValueError("max_entries must be >= 1")
@@ -132,6 +138,12 @@ class RedisQueryCache[K, V]:
     who want a hard bound configure Redis itself; the cache only owns
     the TTL.
     """
+
+    # ``get``/``put`` do blocking Redis socket I/O, so the source layer
+    # must offload them to a worker thread rather than running them on the
+    # asyncio event loop (where a slow Redis would stall every group's
+    # detection run and the /metrics handler).
+    is_blocking_io: bool = True
 
     # Size lookup is throttled to once per this many seconds. Without
     # the throttle, ``__len__`` issues a SCAN over every cache key on

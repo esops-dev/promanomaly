@@ -7,9 +7,16 @@
   "templating": {
     "list": [
       {
+        "name": "datasource",
+        "type": "datasource",
+        "label": "Datasource",
+        "query": "prometheus",
+        "current": {"text": "VictoriaMetrics", "value": "victoriametrics"}
+      },
+      {
         "name": "group",
         "type": "query",
-        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
         "query": "label_values(anomaly_score, group)",
         "refresh": 2,
         "multi": false,
@@ -18,7 +25,7 @@
       {
         "name": "id",
         "type": "query",
-        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
         "query": "label_values(anomaly_score{group=~\"$group\"}, id)",
         "refresh": 2,
         "multi": false,
@@ -31,7 +38,7 @@
       "id": 1,
       "type": "timeseries",
       "title": "anomaly_score by detector",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "anomaly_score{group=~\"$group\", id=~\"$id\"}",
@@ -44,7 +51,7 @@
       "id": 2,
       "type": "timeseries",
       "title": "anomaly_outside_threshold by detector",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "anomaly_outside_threshold{group=~\"$group\", id=~\"$id\"}",
@@ -60,7 +67,7 @@
       "id": 3,
       "type": "timeseries",
       "title": "Composite (ensemble) verdict",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "anomaly_composite_score{group=~\"$group\", id=~\"$id\"}",
@@ -77,7 +84,7 @@
       "id": 4,
       "type": "timeseries",
       "title": "anomaly_duration_seconds by detector",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "anomaly_duration_seconds{group=~\"$group\", id=~\"$id\"}",
@@ -90,7 +97,7 @@
       "id": 5,
       "type": "timeseries",
       "title": "anomaly_confidence_score by detector",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "anomaly_confidence_score{group=~\"$group\", id=~\"$id\"}",
@@ -106,7 +113,7 @@
       "id": 6,
       "type": "table",
       "title": "Current per-detector verdict",
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [
         {
           "expr": "anomaly_score{group=~\"$group\", id=~\"$id\"}",

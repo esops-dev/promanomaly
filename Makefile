@@ -132,9 +132,13 @@ labels-contract-check: ## Diff LABELS_CONTRACT.md against promforecast's copy.
 dev-up: ## Start the minimum dev stack: VM, Prometheus, Redis, node-exporter, detector.
 	docker compose -f docker-compose.dev.yml up -d --build
 
+.PHONY: dev-up-load
+dev-up-load: ## Start the full demo stack: minimum + http-demo + loadgen + Grafana.
+	docker compose -f docker-compose.dev.yml --profile load up -d --build
+
 .PHONY: dev-down
-dev-down: ## Stop the local dev stack.
-	docker compose -f docker-compose.dev.yml down -v
+dev-down: ## Stop the local dev stack (any profile).
+	docker compose -f docker-compose.dev.yml --profile load down -v
 
 .PHONY: load-test
 load-test: ## Synthetic high-cardinality run for safety-control validation.
