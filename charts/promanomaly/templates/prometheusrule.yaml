@@ -98,6 +98,21 @@ spec:
               series for at least the configured grace runs.
         {{- end }}
         {{- end }}
+        {{- with $rules.anomalyHighSeverity }}
+        {{- if .enabled }}
+        - alert: AnomalyHighSeverity
+          expr: anomaly_severity >= {{ .threshold }}
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "High-severity anomaly on {{ "{{" }} $labels.id {{ "}}" }} ({{ "{{" }} $labels.group {{ "}}" }})"
+            description: |
+              Detector {{ "{{" }} $labels.detector {{ "}}" }} reports
+              anomaly_severity >= {{ .threshold }} for at least {{ .for }}.
+              Use `promanomaly top` to rank against other current firings.
+        {{- end }}
+        {{- end }}
         {{- with $rules.anomalyConfidenceLow }}
         {{- if .enabled }}
         - alert: AnomalyConfidenceLow
@@ -163,6 +178,22 @@ spec:
               Source-query failures are non-zero over {{ .window }}. With the
               default serve_stale policy /metrics is still serving the
               last good snapshot — scores are stale, not fresh.
+        {{- end }}
+        {{- end }}
+        {{- with $rules.fleetAnomalyDensityHigh }}
+        {{- if .enabled }}
+        - alert: FleetAnomalyDensityHigh
+          expr: anomaly_density{detector="", by=""} > {{ .threshold }}
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "High anomaly density in group {{ "{{" }} $labels.group {{ "}}" }}"
+            description: |
+              More than {{ .threshold }} (fraction) of series in group
+              {{ "{{" }} $labels.group {{ "}}" }} are currently anomalous. Use
+              `promanomaly top --group {{ "{{" }} $labels.group {{ "}}" }}` to see
+              the worst series ranked by severity.
         {{- end }}
         {{- end }}
         {{- with $rules.anomalyNotReady }}

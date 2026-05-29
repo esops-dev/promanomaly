@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from .anomalies import collect_firing
 from .config import Config, ReloadAuthConfig
 from .detectors import list_meta
 from .inspect import InspectError, inspect_series
@@ -81,6 +82,32 @@ def build_app(application: Application) -> FastAPI:
         # backwards compatibility, ``params`` is the canonical richer
         # form with per-parameter type and doc.
         return JSONResponse([m.as_dict() for m in list_meta()])
+
+    @app.get("/debug/anomalies")
+    async def debug_anomalies(
+        group: str | None = None,
+        min_severity: float = 0.0,
+        limit: int = 50,
+    ) -> JSONResponse:
+        # Live triage: the currently-firing series across all groups,
+        # ranked by severity, read straight from the snapshot store (no
+        # extra TSDB queries). Pairs with /debug/inspect — top to find
+        # the worst series, inspect to understand why it scored. The
+        # NetworkPolicy denies ingress to /debug/* by default.
+        firing = collect_firing(
+            application._store,
+            group=group,
+            min_severity=min_severity,
+            limit=max(0, limit),
+        )
+        return JSONResponse(
+            {
+                "count": len(firing),
+                "min_severity": min_severity,
+                "group": group,
+                "anomalies": [f.as_dict() for f in firing],
+            }
+        )
 
     @app.get("/debug/inspect")
     async def debug_inspect(

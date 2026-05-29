@@ -25,7 +25,7 @@ from pydantic import (
     model_validator,
 )
 
-# Graduated from ``v1alpha1`` to ``v1`` in the v1.0 release. The previous
+# Graduated from ``v1alpha1`` to ``v1`` in the stable release. The previous
 # alpha alias remains valid (byte-identical schema) but loads with a
 # ``DeprecationWarning`` so operators get a nudge to bump their configs
 # without their pods CrashLoopBackOff'ing on the next image pull. A future
@@ -207,7 +207,7 @@ class QueryCacheConfig(_ModelBase):
     LRU. ``backend: redis`` plugs into the same call site but stores
     entries in the configured Redis (set ``safety.redis.url``) so a
     leader and its followers share a single TSDB hit per (promql,
-    window) bucket — the HA-mode variant from v0.4.
+    window) bucket — the HA-mode variant.
     """
 
     enabled: bool = True
@@ -322,6 +322,49 @@ class DefaultsConfig(_ModelBase):
     emit_change_points: bool = True
     emit_baseline_stability: bool = True
     emit_duration: bool = True
+    # Operator-experience signals.
+    #
+    # ``emit_severity`` (default ``true``) emits the normalised 0-1
+    # ``anomaly_severity`` gauge per detector series — a single
+    # operator-facing "how much should I care" number that folds
+    # statistical strength, calibration confidence, baseline stability,
+    # sustained duration, and practical-significance into one ranked
+    # value. The formula and fixed weights live in docs/severity.md and
+    # are deliberately not user-tunable (operators who want a different
+    # weighting compose via recording rules).
+    emit_severity: bool = True
+    # ``emit_anomaly_type`` (default ``false`` — opt-in to cardinality)
+    # emits ``anomaly_type_score{...,type}`` for firing series, exposing
+    # the detector's classification of the current anomaly (point spike,
+    # step up/down, level drift, variance shift, change-point, cohort
+    # divergence). A brand-new metric with a frozen ``type`` value-set;
+    # never a new label silently added to the existing per-detector
+    # series. Off by default because the ``type`` dimension multiplies
+    # the firing-series cardinality.
+    emit_anomaly_type: bool = False
+    # ``density_by`` lists the source labels the fleet anomaly-density
+    # rollup partitions by (e.g. ``["namespace"]``) so operators can
+    # answer "which slice of the fleet is unhealthy" without per-series
+    # cardinality. Empty (default) emits only the group-level rollup.
+    # Each listed label adds one ``anomaly_density{group, by=<label>,
+    # <label>=<value>}`` series per distinct value seen in the run, so
+    # operators choose low-cardinality dimensions deliberately.
+    density_by: list[str] = Field(default_factory=list)
+
+    @field_validator("density_by")
+    @classmethod
+    def _reject_canonical_density_by(cls, value: list[str]) -> list[str]:
+        # Partitioning by a canonical detector label is meaningless (the
+        # rollup is already per-group) and would collide with the labels
+        # the rollup itself stamps. Reject at load so the footgun is
+        # caught before deploy.
+        offending = sorted(set(value) & _CANONICAL_OUTPUT_LABELS)
+        if offending:
+            raise ValueError(
+                f"defaults.density_by cannot partition by canonical detector "
+                f"labels {offending}; they are stamped by the rollup itself"
+            )
+        return value
 
     @property
     def window_seconds(self) -> float:
@@ -500,7 +543,7 @@ class QueryConfig(_ModelBase):
     min_abs_delta: float | None = None
     min_relative_delta: float | None = None
     alert_thresholds: AlertThresholds | None = None
-    # Dynamic series discovery (v0.4). Each entry probes the TSDB for
+    # Dynamic series discovery. Each entry probes the TSDB for
     # the distinct values of one label; the query's ``promql`` and ``id``
     # are expanded once per Cartesian combination across all variables.
     discover: list[DiscoverVariable] = Field(default_factory=list)

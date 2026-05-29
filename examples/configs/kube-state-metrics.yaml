@@ -1,0 +1,109 @@
+# kube-state-metrics golden-signals reference config.
+#
+# Sibling to examples/configs/node-exporter.yaml for the cluster-state
+# signals kube-state-metrics exposes: pod restart rates, replica /
+# desired mismatches, rollout stalls, and condition flapping. Like the
+# node-exporter config, every query fans out over its identity label
+# (namespace / deployment) via PromQL aggregation — no per-workload
+# YAML, no `discover:` foot-guns.
+#
+# Fleet triage by namespace
+# -------------------------
+# `defaults.density_by: [namespace]` partitions the fleet anomaly-density
+# rollup per namespace, so the fleet-health dashboard and the
+# FleetAnomalyDensityHigh alert can answer "which namespace is unhealthy"
+# without adding per-series cardinality. Keep partition labels
+# low-cardinality (namespace, not pod).
+
+apiVersion: promanomaly.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 10s
+
+server:
+  listen: ":9092"
+  refresh_interval: 1m
+  ready_endpoint: true
+
+safety:
+  max_series_per_query: 2000
+  max_total_series: 20000
+  on_source_failure: serve_stale
+
+defaults:
+  window: 1h
+  step: 30s
+  min_points: 30
+  warmup_policy: emit_warming_up
+  emit_duration: true
+  emit_severity: true
+  emit_anomaly_type: true
+  density_by:
+    - namespace
+  alert_thresholds:
+    score: 3.0
+
+groups:
+  # ---- Pod restart rate ----------------------------------------------
+  # Restarts are bursty step-like events; CUSUM catches a workload that
+  # starts crash-looping (a sustained jump), MAD catches a one-off spike.
+  - name: kube_pod_restarts
+    priority: 6
+    queries:
+      - id: kube_pod_restart_rate
+        promql: |
+          sum by (namespace, pod) (
+            rate(kube_pod_container_status_restarts_total[15m])
+          )
+        min_abs_delta: 0.001   # ignore noise on never-restarting pods
+        detectors:
+          - name: MAD
+          - name: CUSUM
+
+  # ---- Replica availability gap --------------------------------------
+  # desired - available. Non-zero for long means a rollout is stuck or
+  # pods can't schedule. A step change (BOCPD) is the rollout-stall
+  # signature.
+  - name: kube_replica_gap
+    priority: 6
+    queries:
+      - id: kube_deployment_replica_gap
+        promql: |
+          kube_deployment_spec_replicas
+          - kube_deployment_status_replicas_available
+        detectors:
+          - name: MAD
+          - name: BOCPD
+
+  # ---- Unavailable replicas across the deployment fleet --------------
+  # Cohort across deployments in a namespace: one deployment with
+  # unavailable replicas while its peers are healthy stands out.
+  - name: kube_unavailable_replicas
+    priority: 5
+    queries:
+      - id: kube_deployment_unavailable
+        promql: kube_deployment_status_replicas_unavailable
+        detectors:
+          - name: MAD
+          - name: Cohort
+            instance: fleet
+            params:
+              cohort_label: deployment
+              min_cohort_size: 5
+
+  # ---- Condition flapping --------------------------------------------
+  # Pods toggling Ready on/off. A rising rate of transitions is the
+  # flap signature.
+  - name: kube_pod_ready_flapping
+    priority: 4
+    queries:
+      - id: kube_pod_not_ready
+        promql: |
+          sum by (namespace) (
+            kube_pod_status_ready{condition="false"}
+          )
+        detectors:
+          - name: ZScoreEWMA
+            params:
+              alpha: 0.1

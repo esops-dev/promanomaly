@@ -139,6 +139,53 @@ _HELP: dict[str, tuple[str, str]] = {
             "handling absorbs that."
         ),
     ),
+    "anomaly_severity": (
+        "gauge",
+        (
+            "Operator-facing severity (0-1) ranking how much to care about a "
+            "firing across detectors with incomparable raw-score units. A "
+            "documented, fixed-weight combination of statistical strength, "
+            "calibration confidence, baseline stability, sustained duration, "
+            "and the practical-significance gate. See docs/severity.md. "
+            "0 when the series is not firing."
+        ),
+    ),
+    "anomaly_type_score": (
+        "gauge",
+        (
+            "Detector's classification of a current firing, carried on the "
+            "frozen 'type' label (point_spike, step_up, step_down, "
+            "level_drift, variance_shift, cohort_divergence, shape_discord). "
+            "A new metric, emitted only for firing series and only when "
+            "defaults.emit_anomaly_type is set; never a label on "
+            "anomaly_score / anomaly_outside_threshold / anomaly_severity."
+        ),
+    ),
+    "anomaly_active_series": (
+        "gauge",
+        (
+            "Number of series in the group currently outside threshold (any "
+            "detector firing). Bounded-cardinality fleet-density rollup — no "
+            "new per-series cardinality."
+        ),
+    ),
+    "anomaly_density": (
+        "gauge",
+        (
+            "Fraction of the group currently anomalous (active / total, 0-1). "
+            "The group-level series carries only 'group'; the per-detector "
+            "partition adds 'detector'; the per-slice partition adds 'by' "
+            "plus the partitioned label (defaults.density_by)."
+        ),
+    ),
+    "anomaly_severity_density": (
+        "gauge",
+        (
+            "Severity-weighted fleet density (sum of per-series max severity / "
+            "total series). Ranks slices by how *bad* the anomalies are, not "
+            "just how many. Same label shapes as anomaly_density."
+        ),
+    ),
     "anomaly_best_detector": (
         "gauge",
         (
@@ -301,7 +348,7 @@ class OperationalMetrics:
 
     # ------------------------------------------------------------------
     # Cache-owned metrics. Cardinality is bounded — one set of series per
-    # cache (single instance per process today; the v0.4 Redis variant
+    # cache (single instance per process today; the Redis variant
     # publishes the same metric family without changing dashboards).
     # ------------------------------------------------------------------
     def _declare_cache_metrics(self) -> None:
@@ -350,7 +397,7 @@ class OperationalMetrics:
         )
 
     # ------------------------------------------------------------------
-    # Discovery metrics (v0.4). Per-run fan-out gauges and the per-
+    # Discovery metrics. Per-run fan-out gauges and the per-
     # variable failure counter; cardinality is bounded by the number of
     # configured (group, query, variable) tuples.
     # ------------------------------------------------------------------

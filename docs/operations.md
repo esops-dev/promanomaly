@@ -313,9 +313,9 @@ How it works:
 promanomaly validate --config promanomaly.yaml --probe --strict
 ```
 
-**Signal-absence for discovered series.** Once the detector has seen a discovery key (e.g. `instance=node-17`) the absence of that key in a later run is itself an anomaly — the dynamic counterpart of the v0.1 `expect:` flag. After `expect_grace_runs` consecutive runs without the key, `anomaly_signal_missing{id, group, <discovered_labels>}=1` is emitted (with the **rendered** id, so the label value matches the one the series carried when present) and `anomaly_signal_missing_total{group, reason="missing_grace_exhausted"}` bumps once on the transition. The metric clears the next time the series reappears.
+**Signal-absence for discovered series.** Once the detector has seen a discovery key (e.g. `instance=node-17`) the absence of that key in a later run is itself an anomaly — the dynamic counterpart of the static `expect:` flag. After `expect_grace_runs` consecutive runs without the key, `anomaly_signal_missing{id, group, <discovered_labels>}=1` is emitted (with the **rendered** id, so the label value matches the one the series carried when present) and `anomaly_signal_missing_total{group, reason="missing_grace_exhausted"}` bumps once on the transition. The metric clears the next time the series reappears.
 
-The same `AnomalySignalMissing` reference alert covers both the v0.1 static `expect:` and the v0.4 dynamic-discovery case.
+The same `AnomalySignalMissing` reference alert covers both the static `expect:` and the dynamic-discovery case.
 
 **Bounding the tracker.** Workloads that churn through ephemeral identities (transient pod names, replica IDs that never recycle) would otherwise grow the discovery tracker without end. `safety.discovery.forget_after_runs` (default `1000`) drops a series from the tracker after that many consecutive missing runs; the next time it reappears it counts as a fresh discovery. The schema validates `forget_after_runs >= max(query.expect_grace_runs)` at boot — setting it lower would silently hide `anomaly_signal_missing` from operators.
 
@@ -388,7 +388,7 @@ Semantics:
 - The canonical detector labels — `id`, `group`, `detector`, `detector_instance` — are added **after** the filter and cannot be stripped. Listing one of them in `drop` is rejected at config-load time so a configuration mistake fails at validate-time rather than silently leaving the label in production.
 - `allow` and `drop` operate on **source** labels (everything copied from the PromQL response). The canonical labels and any opt-in feature labels (`cohort_label`, `warming_up`) bypass the filter. (The auto-select winner is no longer a label — it is the standalone `anomaly_best_detector` info gauge.)
 - `drop` takes precedence over `allow` — if a label appears in both, it is stripped. Useful when the allow-list is an inherited template and a downstream config layer needs to subtract.
-- The filter applies uniformly to `anomaly_score`, `anomaly_baseline`, `anomaly_duration_seconds`, `anomaly_change_point_total`, `anomaly_confidence_score`, `anomaly_baseline_stability`, and the composite `anomaly_composite_*` metrics — anywhere source labels could otherwise reach the wire.
+- The filter applies uniformly to `anomaly_score`, `anomaly_baseline`, `anomaly_duration_seconds`, `anomaly_change_point_total`, `anomaly_confidence_score`, `anomaly_baseline_stability`, `anomaly_severity`, `anomaly_type_score`, and the composite `anomaly_composite_*` metrics — anywhere source labels could otherwise reach the wire.
 
 **GDPR worked example.** A PromQL query like `rate(api_requests_total{customer_id=~".+"}[5m])` carries `customer_id` on each emitted series. Without filtering, every `anomaly_score` line includes the customer id; for a regulated workload that is itself a compliance event. Add:
 
@@ -400,3 +400,40 @@ exporter:
 ```
 
 and the output collapses to `anomaly_score{id="api_request_rate", group="...", instance="...", region="..."}` — Prometheus and Grafana still see useful labels, but the customer id never leaves the detector pod.
+
+## Fleet Anomaly-Density Rollup
+
+"Is anything weird right now?" is the on-call's first question, and you don't want to scan hundreds of per-series gauges to answer it. After every group run the runner emits a **bounded-cardinality** rollup computed from that run's own samples — no extra TSDB queries, **no new per-series cardinality**:
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `anomaly_active_series` | `group` | count of series currently outside threshold (any detector firing) |
+| `anomaly_density` | `group` | active ÷ total, `0–1` |
+| `anomaly_density` | `group, detector` | per-detector firing fraction |
+| `anomaly_density` | `group, by, <label>` | per-slice fraction (one per `density_by` label value) |
+| `anomaly_severity_density` | `group` | Σ per-series max severity ÷ total — ranks slices by *how bad*, not just *how many* |
+| `anomaly_severity_density` | `group, by, <label>` | severity-weighted per-slice |
+
+A *series* here is one `(id, group, source-labels)` identity — the per-detector `detector` / `detector_instance` labels are stripped so a series counts once regardless of how many detectors scored it. Warming-up series and fully-suppressed groups contribute nothing (no settled verdict), so the rollup appears as soon as any series produces a verdict.
+
+The group-level rollup carries **only** `group`; the partitions add `detector` or `by`. To select just the group rollup in PromQL and avoid double-counting the partitions, match the absent partition labels:
+
+```promql
+# Group rollup only (exclude detector / by partitions).
+anomaly_density{detector="", by=""}
+
+# Which namespace is the unhealthiest right now?
+topk(1, anomaly_density{by="namespace"})
+```
+
+`FleetAnomalyDensityHigh` (`anomaly_density{detector="", by=""} > 0.1 for 5m`) ships in `examples/alerts/promanomaly-rules.yaml` and the bundled Helm `PrometheusRule`. The `dashboards/grafana/promanomaly-fleet-density.json` dashboard is the single pane that makes promanomaly a triage source of truth.
+
+### Choosing partition dimensions
+
+```yaml
+defaults:
+  density_by:
+    - namespace   # one anomaly_density{by="namespace", namespace=<v>} series per distinct value
+```
+
+Each listed label adds one series per distinct value seen in the run, so partition by **low-cardinality** dimensions (namespace, job, region) — never by `instance` or `pod` on a large fleet. Partitioning by a canonical detector label (`id`, `group`, `detector`, `detector_instance`) is rejected at config-load time. As a backstop against a high-cardinality mistake, a dimension that produces more than 200 distinct slice values in a run is **skipped for that run** and logged as `density_by_cardinality_capped` (the group rollup and per-detector partition are unaffected) — point the dimension at a lower-cardinality label and the slices return. Cohort divergence rolls up for free: `anomaly_density{group, detector="Cohort"}` is "members currently diverging ÷ cohort members scored".

@@ -1,0 +1,118 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "schemaVersion": 38,
+  "title": "promanomaly fleet density",
+  "description": "Is anything weird right now? Bounded-cardinality fleet rollups driven by anomaly_density / anomaly_active_series / anomaly_severity_density.",
+  "tags": ["promanomaly", "anomaly-detection", "triage"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "label": "Datasource",
+        "query": "prometheus",
+        "current": {"text": "VictoriaMetrics", "value": "victoriametrics"}
+      },
+      {
+        "name": "group",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "query": "label_values(anomaly_density, group)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Anomaly density by group",
+      "description": "Fraction of each group currently outside threshold (group rollup only; detector/by partitions excluded).",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+      "targets": [
+        {
+          "expr": "anomaly_density{group=~\"$group\", detector=\"\", by=\"\"}",
+          "legendFormat": "{{group}}",
+          "instant": true
+        }
+      ],
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 0}
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Active (firing) series by group",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "anomaly_active_series{group=~\"$group\"}",
+          "legendFormat": "{{group}}",
+          "instant": true
+        }
+      ],
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 0}
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Anomaly density over time",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+      "targets": [
+        {
+          "expr": "anomaly_density{group=~\"$group\", detector=\"\", by=\"\"}",
+          "legendFormat": "{{group}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 6}
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Severity-weighted density (how bad, not just how many)",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+      "targets": [
+        {
+          "expr": "anomaly_severity_density{group=~\"$group\", by=\"\"}",
+          "legendFormat": "{{group}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14}
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Density by slice (defaults.density_by)",
+      "description": "Per-slice partition — e.g. by namespace. Only present when defaults.density_by is configured.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}},
+      "targets": [
+        {
+          "expr": "anomaly_density{group=~\"$group\", by!=\"\"}",
+          "legendFormat": "{{group}} {{by}}={{namespace}}"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14}
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "Most severe firings right now",
+      "description": "Mirrors `promanomaly top` — the currently-firing series ranked by severity.",
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "topk(20, anomaly_severity{group=~\"$group\"} > 0)",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 22}
+    }
+  ]
+}

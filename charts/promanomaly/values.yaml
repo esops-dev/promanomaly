@@ -75,7 +75,7 @@ safety:
     key_prefix: promanomaly
     timeout: 2s
 
-  # Dynamic series discovery (v0.4). Bounds the in-memory tracker so
+  # Dynamic series discovery. Bounds the in-memory tracker so
   # workloads with ephemeral identities (transient pod names, replica
   # IDs that never recycle) don't grow the discovery dict without end.
   # Default of 1000 runs is ~16 hours at the 1m refresh — plenty of
@@ -261,6 +261,13 @@ prometheusRule:
       threshold: 0.5
       for: 10m
       severity: warning
+    # Normalised 0-1 severity gate. Pure signal enrichment ranked across
+    # detectors with incomparable raw-score units. See docs/severity.md.
+    anomalyHighSeverity:
+      enabled: true
+      threshold: 0.7
+      for: 5m
+      severity: warning
     anomalyStale:
       enabled: true
       maxStaleSeconds: 600
@@ -281,3 +288,11 @@ prometheusRule:
       enabled: true
       for: 5m
       severity: critical
+    # Fleet anomaly-density rollup gate ("is anything weird right now").
+    # Bounded-cardinality — fires once per group, not per series. Tune
+    # the threshold (fraction outside) per fleet size and SLO.
+    fleetAnomalyDensityHigh:
+      enabled: true
+      threshold: 0.1
+      for: 5m
+      severity: warning

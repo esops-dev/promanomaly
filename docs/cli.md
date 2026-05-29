@@ -14,6 +14,7 @@ promanomaly ships with a small, focused set of CLI commands for validation, test
 | `calibrate-buckets` | Suggest the right stratified-baseline bucketing for a signal |
 | `detectors list`    | List registered detectors |
 | `inspect`           | Inspect one running detector's state for an (id, label) series |
+| `top`               | List the currently-firing series, ranked by severity |
 
 All commands accept `--log-level`. `--config` is required only for server, `validate`, and `dry-run`.
 
@@ -146,3 +147,15 @@ promanomaly inspect --target http://localhost:9092 --id error_rate --output json
 The `/debug/inspect` endpoint is part of the same `/debug/*` family covered by the bundled NetworkPolicy — by default only same-namespace pods can reach it.
 
 **Note on dynamic discovery.** `inspect` matches against the configured `query.id`. For queries with a `discover:` block, the templated form (`cpu_busy_{{ instance }}`) is the configured id, so the endpoint can't currently resolve a rendered id like `cpu_busy_node_17`. Use `detect-once` for ad-hoc inspection of discovery-expanded series.
+
+## `top`
+
+Answers "what is anomalous right now, ranked?" without opening Grafana — like `top` on a host, but for the fleet. Queries a running detector's `/debug/anomalies` endpoint (read from the in-memory snapshot, so no extra TSDB queries) and prints the currently-firing series ranked by severity.
+
+```bash
+promanomaly top --target http://localhost:9092
+promanomaly top --target http://localhost:9092 --group node_cpu --min-severity 0.5
+promanomaly top --target http://localhost:9092 --output json
+```
+
+Pairs with `inspect` as a two-step triage flow: `top` to find the worst series, `inspect` to understand *why* it scored. The `/debug/anomalies` endpoint is part of the `/debug/*` family the bundled NetworkPolicy denies by default. See [triage.md](triage.md) for the full surface.

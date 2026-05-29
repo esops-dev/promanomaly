@@ -12,6 +12,8 @@ Subcommands
   stratified detector + bucket width for a given signal.
 - ``inspect`` — query a running detector's /debug/inspect for one
   (id, label) series.
+- ``top`` — query a running detector's /debug/anomalies for the
+  currently-firing series, ranked by severity.
 - ``detectors list`` — dump the entry-point registry.
 
 Running without a subcommand boots the server (used by the container's
@@ -72,6 +74,7 @@ from ._probe import (
 from ._probe import (
     stratified_summary_for_query as _stratified_summary_for_query,
 )
+from ._top import _print_top_text
 
 
 @click.group(invoke_without_command=True, context_settings={"help_option_names": ["-h", "--help"]})
@@ -669,6 +672,88 @@ def inspect_cmd(
     _print_inspect_text(payload)
 
 
+@cli.command(name="top")
+@click.option(
+    "--target",
+    "target_url",
+    required=True,
+    help="Running detector base URL (e.g. http://localhost:9092).",
+)
+@click.option(
+    "--group",
+    "group",
+    default=None,
+    help="Restrict to one group.",
+)
+@click.option(
+    "--min-severity",
+    "min_severity",
+    default=0.0,
+    show_default=True,
+    type=float,
+    help="Drop firings below this severity (0-1).",
+)
+@click.option(
+    "--limit",
+    "limit",
+    default=20,
+    show_default=True,
+    type=int,
+    help="Show at most this many series (ranked by severity).",
+)
+@click.option(
+    "--output",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    show_default=True,
+    help="Output format. 'json' is the raw /debug/anomalies response.",
+)
+@click.option(
+    "--timeout",
+    default=10.0,
+    show_default=True,
+    help="HTTP timeout.",
+)
+def top_cmd(
+    target_url: str,
+    group: str | None,
+    min_severity: float,
+    limit: int,
+    output: str,
+    timeout: float,
+) -> None:
+    """List what is anomalous right now, ranked by severity.
+
+    Wraps a running detector's /debug/anomalies endpoint — like ``top``
+    on a host, but for the fleet. Pairs with ``inspect`` as a two-step
+    triage flow: ``top`` to find the worst series, ``inspect`` to
+    understand *why* it scored.
+    """
+    import httpx
+
+    params: dict[str, str] = {"min_severity": str(min_severity), "limit": str(limit)}
+    if group:
+        params["group"] = group
+    url = target_url.rstrip("/") + "/debug/anomalies"
+    try:
+        resp = httpx.get(url, params=params, timeout=timeout)
+    except httpx.HTTPError as exc:
+        click.echo(f"could not reach {target_url}: {exc}", err=True)
+        sys.exit(2)
+    try:
+        payload = resp.json()
+    except ValueError:
+        click.echo(f"non-JSON response from {url}: {resp.text[:200]}", err=True)
+        sys.exit(2)
+    if resp.status_code >= 400:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True), err=True)
+        sys.exit(1)
+    if output == "json":
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    _print_top_text(payload)
+
+
 # Register the backtest command imported from promanomaly.backtest so
 # operators can invoke it as ``promanomaly backtest`` rather than the
 # longer ``python -m promanomaly.backtest`` (which still works because
@@ -724,6 +809,7 @@ __all__ = [
     "_print_analyze_text",
     "_print_calibrate_text",
     "_print_inspect_text",
+    "_print_top_text",
     "_probe_discover_query",
     "_recommend_detector",
     "_round_to_dividing_bucket",

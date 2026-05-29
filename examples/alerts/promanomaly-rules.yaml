@@ -101,6 +101,26 @@ spec:
               A query configured with expect:true has returned no
               series for at least the configured grace runs.
 
+        - alert: AnomalyHighSeverity
+          # Normalised 0-1 severity folds statistical strength,
+          # calibration confidence, baseline stability, sustained
+          # duration, and the practical-significance gate into one
+          # operator-facing number that ranks across detectors with
+          # incomparable raw-score units. Pure signal enrichment — this
+          # rule is the alerting decision, not the metric. See
+          # docs/severity.md for the formula.
+          expr: anomaly_severity >= 0.7
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High-severity anomaly on {{ $labels.id }} ({{ $labels.group }})"
+            description: |
+              Detector {{ $labels.detector }} reports anomaly_severity
+              >= 0.7 for at least 5m on id={{ $labels.id }}
+              group={{ $labels.group }}. Use `promanomaly top` to rank
+              against other current firings.
+
         - alert: AnomalyConfidenceLow
           # Calibration confidence has dropped on a detector that is
           # currently firing. Useful as a gating signal — operators who
@@ -164,6 +184,27 @@ spec:
               Source-query failures are non-zero over 15m. With the
               default serve_stale policy /metrics is still serving the
               last good snapshot — scores are stale, not fresh.
+
+        - alert: FleetAnomalyDensityHigh
+          # Bounded-cardinality fleet rollup: the fraction of a group
+          # currently outside threshold. Alerts on "the fleet is
+          # unhealthy" without a per-series alert storm. The group-level
+          # series carries only the `group` label; the
+          # `anomaly_density{group, detector=""}` matcher excludes the
+          # per-detector and per-slice partitions so the rule fires once
+          # per group rather than once per partition. Tune the 0.1 (10%)
+          # threshold per fleet size and SLO.
+          expr: anomaly_density{detector="", by=""} > 0.1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High anomaly density in group {{ $labels.group }}"
+            description: |
+              More than 10% of series in group {{ $labels.group }} are
+              currently anomalous. Use `promanomaly top --group
+              {{ $labels.group }}` to see the worst series ranked by
+              severity.
 
         - alert: AnomalyNotReady
           expr: max(anomaly_group_ready) == 0

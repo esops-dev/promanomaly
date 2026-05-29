@@ -89,6 +89,11 @@ async def test_run_group_produces_score_samples(stub_source: StubSource) -> None
         "anomaly_duration_seconds",
         "anomaly_confidence_score",
         "anomaly_baseline_stability",
+        # Per-series severity plus the bounded fleet-density rollup.
+        "anomaly_severity",
+        "anomaly_active_series",
+        "anomaly_density",
+        "anomaly_severity_density",
     }
     score_sample = next(s for s in result.samples if s.metric == "anomaly_score")
     assert score_sample.label_dict["id"] == "metric_a"

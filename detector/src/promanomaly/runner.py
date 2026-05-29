@@ -28,6 +28,7 @@ from typing import Any, cast
 import pandas as pd
 import structlog
 
+from .anomaly_type import classify_window, coerce_declared_type
 from .calibration import calibrate_detector
 from .cohort_context import CohortContext, build_cohort_context
 from .config import (
@@ -63,6 +64,7 @@ from .plan import (
     merge_params,
 )
 from .selector import select_winner
+from .severity import compute_severity
 from .source import PromQLSource, QueryResult, QuerySeries, SourceQueryError
 from .state import GroupSnapshot, Sample, SnapshotStore
 from .stratified import (
@@ -88,6 +90,24 @@ REASON_INSUFFICIENT_DATA = "insufficient_data"
 REASON_UNKNOWN_DETECTOR = "unknown_detector"
 REASON_QUERY_EXCEPTION = "query_exception"
 REASON_CARDINALITY = "cardinality_overflow"
+
+# Per-dimension cap on the fleet-density slice partition
+# (``defaults.density_by``). density_by is meant for low-cardinality
+# dimensions; this bounds the rollup cardinality if an operator points it
+# at a high-cardinality label by mistake. A run producing more distinct
+# slice values than this skips that dimension and logs the drop.
+_MAX_DENSITY_SLICES = 200
+
+# Per-detector annotation labels that are NOT part of a series' *entity*
+# identity for the fleet-density rollup. ``detector`` / ``detector_instance``
+# distinguish detectors scoring the same series; ``cohort_label`` is stamped
+# only by cohort-aware detectors (it carries the *name* of the varying label,
+# not a per-entity value). Stripping all three makes a series count once per
+# (id, group, source-labels) entity no matter how many — or which kind of —
+# detectors scored it, so ``anomaly_density`` is a true fraction of entities.
+# Without ``cohort_label`` here, a host watched by both a per-host detector
+# (MAD) and a Cohort detector counts as two entities and density skews.
+_DENSITY_NON_IDENTITY_LABELS = frozenset({"detector", "detector_instance", "cohort_label"})
 
 
 # Re-exported under the historical private name so the dozens of in-file
@@ -423,6 +443,14 @@ class Runner:
                     out=out,
                 )
 
+        # Fleet anomaly-density rollup. Bounded-cardinality
+        # operational signal computed from this run's own samples — no
+        # new per-series cardinality and no extra TSDB queries. Appended
+        # to the snapshot so followers serve it and serve_stale keeps the
+        # last good value during source outages, consistent with every
+        # other snapshot metric.
+        out.samples.extend(self._density_samples(group, out.samples))
+
         return out
 
     async def _process_discovered_query(
@@ -443,7 +471,7 @@ class Runner:
 
         Discovery-tracked series that go missing past ``expect_grace_runs``
         trip ``anomaly_signal_missing`` with the discovered labels — the
-        v0.4 dynamic counterpart to the v0.1 ``expect:`` flag. The
+        dynamic counterpart to the static ``expect:`` flag. The
         rendered (non-template) id is emitted on the metric so the same
         logical series carries the same ``id`` label value in both
         present and missing states.
@@ -875,7 +903,7 @@ class Runner:
         # plain rolling. Stratified plans expose
         # ``baseline_refresh_interval_seconds`` AND ``query_window_seconds``;
         # plain rolling plans either omit both or expose only the latter
-        # (e.g. v0.2 HourOfDayMAD, which fetches its full lookback every
+        # (e.g. HourOfDayMAD, which fetches its full lookback every
         # refresh).
         short_window_seconds = defaults.window_seconds
         stratified_meta: list[tuple[float, float]] = []  # (window_seconds, refresh_seconds)
@@ -886,7 +914,7 @@ class Runner:
                 stratified_meta.append((qw, refresh))
             elif qw is not None and qw > short_window_seconds:
                 # Non-stratified detector that nevertheless wants a
-                # longer window than the group default — the v0.2
+                # longer window than the group default — the
                 # HourOfDayMAD pattern. Per-refresh fetch path.
                 short_window_seconds = qw
 
@@ -1050,7 +1078,7 @@ class Runner:
             is_suppressed = group.auto_select is True and winner is not None and not is_winner
             if is_suppressed and not run_losers:
                 # Skip the detector entirely — same compute profile as
-                # the v0.2 baseline before ensemble fusion landed.
+                # the baseline before ensemble fusion landed.
                 continue
             emit_samples = not is_suppressed
             # Per-detector threshold override. BOCPD's score is a posterior
@@ -1326,12 +1354,17 @@ class Runner:
                 )
             )
 
+        # A change-point fire is needed both for the counter below and
+        # for anomaly typing; read it once here so the two stay
+        # consistent even when emit_change_points is disabled.
+        change_point_fired = bool(score_row.get("change_point", False))
+
         # Change-point detectors (BOCPD, CUSUM, ...) flag their fires via
         # the optional ``change_point`` column in the score row. Other
         # detectors omit the column entirely so they don't pollute
         # ``anomaly_change_point_total`` with always-zero counters.
         if defaults.emit_change_points and "change_point" in score_row.index:
-            fired = bool(score_row["change_point"])
+            fired = change_point_fired
             cp_count = self._store.record_change_point(
                 group=group.name,
                 query_id=query.id,
@@ -1378,6 +1411,51 @@ class Runner:
                         value=calibration.baseline_stability,
                     )
                 )
+
+        # Operator-facing severity. One normalised 0-1 number that
+        # ranks "how much should I care" across detectors whose raw score
+        # units differ. Confidence / stability fold in when calibration
+        # has run; before that they default to neutral so a strongly
+        # firing un-calibrated series still ranks high. Severity is 0 when
+        # the firing was gated out (sub-threshold or practical floor).
+        if defaults.emit_severity:
+            severity = compute_severity(
+                score=score,
+                threshold=threshold_score,
+                detector_name=plan.name,
+                outside=outside,
+                confidence=calibration.confidence_score if calibration is not None else None,
+                baseline_stability=(
+                    calibration.baseline_stability if calibration is not None else None
+                ),
+                duration_seconds=duration_seconds,
+            )
+            samples.append(Sample(metric="anomaly_severity", labels=labels, value=severity))
+
+        # Anomaly typing (opt-in). A brand-new metric with a frozen
+        # ``type`` value-set, emitted only for firing series so the type
+        # dimension doesn't multiply non-firing cardinality. Detectors may
+        # declare their own ``anomaly_type`` in the score row; otherwise
+        # the window heuristic classifies the firing.
+        if defaults.emit_anomaly_type and outside:
+            declared = coerce_declared_type(score_row.get("anomaly_type"))
+            anomaly_kind = declared or classify_window(
+                detector_name=plan.name,
+                values=series.samples["y"].to_numpy(dtype=float, copy=False),
+                baseline=baseline,
+                latest_y=latest_y,
+                change_point_fired=change_point_fired,
+                cohort_aware=is_cohort_aware(plan.cls),
+            )
+            type_labels = self._series_labels(
+                group,
+                query,
+                series,
+                plan,
+                extras={**extras, "type": anomaly_kind},
+                filtered_labels=filtered_labels,
+            )
+            samples.append(Sample(metric="anomaly_type_score", labels=type_labels, value=score))
         return score, outside, samples
 
     @staticmethod
@@ -1586,6 +1664,164 @@ class Runner:
         if cfg.drop:
             drop = cfg.drop_set
             out = {k: v for k, v in out.items() if k not in drop}
+        return out
+
+    def _density_samples(self, group: GroupConfig, samples: list[Sample]) -> list[Sample]:
+        """Build the fleet anomaly-density rollup from a run's own samples.
+
+        A *series* for density purposes is one ``(id, group, source-labels)``
+        identity — the per-detector annotation labels
+        (``_DENSITY_NON_IDENTITY_LABELS``: ``detector`` /
+        ``detector_instance`` / ``cohort_label``) are stripped so a series
+        counts once no matter how many — or which kind of — detectors
+        scored it. A series is *active* when any detector fired
+        (``anomaly_outside_threshold == 1``). Per-series severity is the
+        max across that series' detectors.
+
+        Emits (all bounded-cardinality):
+
+        - ``anomaly_active_series{group}`` and ``anomaly_density{group}``
+          — the group rollup, always present so panels/alerts never see
+          NoData.
+        - ``anomaly_density{group, detector}`` — per-detector firing
+          fraction.
+        - ``anomaly_severity_density{group}`` — severity-weighted density
+          (only when severity is being emitted).
+        - ``anomaly_density{group, by, <label>}`` (and the severity
+          variant) — per-slice partitions for each ``defaults.density_by``
+          label, computed from this snapshot only.
+        """
+        defaults = self._config.defaults
+        emit_severity = defaults.emit_severity
+
+        def _series_key(label_dict: dict[str, str]) -> tuple[tuple[str, str], ...]:
+            return tuple(
+                sorted(
+                    (k, v) for k, v in label_dict.items() if k not in _DENSITY_NON_IDENTITY_LABELS
+                )
+            )
+
+        series_active: dict[tuple[tuple[str, str], ...], bool] = {}
+        series_severity: dict[tuple[tuple[str, str], ...], float] = {}
+        series_label_dict: dict[tuple[tuple[str, str], ...], dict[str, str]] = {}
+        det_total: dict[str, int] = {}
+        det_active: dict[str, int] = {}
+
+        for s in samples:
+            if s.metric == "anomaly_outside_threshold":
+                ld = dict(s.labels)
+                # Warming-up series carry a provisional score under the
+                # emit_with_flag policy; they have no settled verdict yet,
+                # so they are not part of "is the fleet healthy right now".
+                if ld.get("warming_up") == "true":
+                    continue
+                key = _series_key(ld)
+                active = s.value >= 1.0
+                series_active[key] = series_active.get(key, False) or active
+                series_label_dict.setdefault(key, ld)
+                detector = ld.get("detector", "")
+                det_total[detector] = det_total.get(detector, 0) + 1
+                if active:
+                    det_active[detector] = det_active.get(detector, 0) + 1
+            elif emit_severity and s.metric == "anomaly_severity":
+                key = _series_key(dict(s.labels))
+                series_severity[key] = max(series_severity.get(key, 0.0), s.value)
+
+        total = len(series_active)
+        if total == 0:
+            # No scored series this run (a fully warming-up or suppressed
+            # group). There is no fleet to measure yet, so emit nothing
+            # rather than a misleading 0/0 — the rollup appears as soon as
+            # any series produces a verdict.
+            return []
+        active_count = sum(1 for fired in series_active.values() if fired)
+        group_labels: tuple[tuple[str, str], ...] = (("group", group.name),)
+        out: list[Sample] = [
+            Sample(metric="anomaly_active_series", labels=group_labels, value=float(active_count)),
+            Sample(
+                metric="anomaly_density",
+                labels=group_labels,
+                value=(active_count / total) if total else 0.0,
+            ),
+        ]
+        if emit_severity:
+            severity_sum = sum(series_severity.get(key, 0.0) for key in series_active)
+            out.append(
+                Sample(
+                    metric="anomaly_severity_density",
+                    labels=group_labels,
+                    value=(severity_sum / total) if total else 0.0,
+                )
+            )
+
+        # Per-detector partition.
+        for detector in sorted(det_total):
+            det_labels = tuple(sorted({"group": group.name, "detector": detector}.items()))
+            out.append(
+                Sample(
+                    metric="anomaly_density",
+                    labels=det_labels,
+                    value=det_active.get(detector, 0) / det_total[detector],
+                )
+            )
+
+        # Per-slice partitions (defaults.density_by). One bucket per
+        # distinct value of the partition label seen this run.
+        for dimension in defaults.density_by:
+            buckets_total: dict[str, int] = {}
+            buckets_active: dict[str, int] = {}
+            buckets_severity: dict[str, float] = {}
+            for key, fired in series_active.items():
+                value = series_label_dict[key].get(dimension)
+                if value is None:
+                    continue
+                buckets_total[value] = buckets_total.get(value, 0) + 1
+                if fired:
+                    buckets_active[value] = buckets_active.get(value, 0) + 1
+                buckets_severity[value] = buckets_severity.get(value, 0.0) + series_severity.get(
+                    key, 0.0
+                )
+            # Bounded-cardinality guard: density_by is meant for
+            # low-cardinality dimensions (namespace, job, region). If an
+            # operator points it at a high-cardinality label (pod,
+            # instance) the slice partition would explode the rollup
+            # cardinality the rest of this metric family is careful to
+            # avoid. Cap the emitted slices and log the drop rather than
+            # silently truncating or blowing up the TSDB — per the
+            # project guide's "no silent caps" rule.
+            if len(buckets_total) > _MAX_DENSITY_SLICES:
+                logger.warning(
+                    "density_by_cardinality_capped",
+                    group=group.name,
+                    dimension=dimension,
+                    distinct_values=len(buckets_total),
+                    cap=_MAX_DENSITY_SLICES,
+                    note=(
+                        "density_by dimension exceeds the per-dimension slice "
+                        "cap; partition skipped this run. Point density_by at a "
+                        "low-cardinality label (namespace, job, region)."
+                    ),
+                )
+                continue
+            for value in sorted(buckets_total):
+                slice_labels = tuple(
+                    sorted({"group": group.name, "by": dimension, dimension: value}.items())
+                )
+                out.append(
+                    Sample(
+                        metric="anomaly_density",
+                        labels=slice_labels,
+                        value=buckets_active.get(value, 0) / buckets_total[value],
+                    )
+                )
+                if emit_severity:
+                    out.append(
+                        Sample(
+                            metric="anomaly_severity_density",
+                            labels=slice_labels,
+                            value=buckets_severity[value] / buckets_total[value],
+                        )
+                    )
         return out
 
     def _update_operational_metrics(self, result: GroupRunResult) -> None:
