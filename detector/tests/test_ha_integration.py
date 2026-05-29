@@ -102,8 +102,11 @@ def ha_app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Application:
     from unittest.mock import MagicMock
 
     from promanomaly.ha import HAComponents
-    from promanomaly.state import SharedSnapshotCache
+    from promanomaly.state import RedisDiscoveryMissTracker, SharedSnapshotCache
 
+    discovery_tracker = RedisDiscoveryMissTracker(
+        client=fake, ttl_seconds=60.0, key_prefix="promanomaly:discovery"
+    )
     app._ha = HAComponents(
         elector=MagicMock(),
         snapshot_cache=SharedSnapshotCache(
@@ -112,7 +115,12 @@ def ha_app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Application:
             key_prefix="promanomaly:snapshot",
         ),
         follower_syncer=MagicMock(),
+        discovery_tracker=discovery_tracker,
     )
+    # The store swap normally happens in _start_ha(); the fixture wires
+    # _ha by hand (without launching the elector), so mirror it here so
+    # the discovery-absence path uses the Redis-backed tracker.
+    app._store.set_discovery_tracker(discovery_tracker)
     return app
 
 

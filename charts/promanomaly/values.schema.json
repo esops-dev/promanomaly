@@ -53,7 +53,16 @@
       "type": "object",
       "properties": {
         "listen": {"type": "string"},
-        "refresh_interval": {"type": "string"}
+        "refresh_interval": {"type": "string"},
+        "expose_warmup_endpoint": {"type": "boolean"},
+        "selftest": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "detector": {"type": "string"},
+            "threshold": {"type": "number", "exclusiveMinimum": 0}
+          }
+        }
       }
     },
     "safety": {

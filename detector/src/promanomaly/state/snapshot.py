@@ -13,10 +13,40 @@ from __future__ import annotations
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from ..calibration import DetectorCalibration
 from ..duration import DurationTracker
 from .discovery import DiscoveryMissTracker
+
+SeriesKey = tuple[tuple[str, str], ...]
+
+
+class _DiscoveryTracker(Protocol):
+    """Structural type the snapshot store accepts for its discovery tracker.
+
+    Both the in-memory :class:`DiscoveryMissTracker` and the Redis-backed
+    :class:`RedisDiscoveryMissTracker` satisfy it, so HA mode can swap one
+    for the other without the store knowing which it holds.
+    """
+
+    is_blocking_io: bool
+
+    def record_observation(
+        self,
+        group: str,
+        query_id: str,
+        seen: Iterable[SeriesKey],
+        grace_runs: int,
+        *,
+        forget_after_runs: int | None = ...,
+    ) -> list[SeriesKey]: ...
+
+    def known_missing(self, group: str, query_id: str, grace_runs: int) -> list[SeriesKey]: ...
+
+    def known_series(self, group: str, query_id: str) -> set[SeriesKey]: ...
+
+    def drop_group(self, group: str) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -58,6 +88,14 @@ class SnapshotStore:
         self._lock = threading.RLock()
         self._snapshots: dict[str, GroupSnapshot] = {}
         self._group_ready: dict[str, bool] = {}
+        # group -> timestamp of the most recent snapshot that carried at
+        # least one ``anomaly_score`` sample. Distinct from the snapshot
+        # timestamp because a group can write a fresh snapshot that only
+        # contains warm-up flags (no scores yet) or, under drop_scores,
+        # only operational rollups; ``anomaly_series_staleness_seconds``
+        # must keep climbing in that case while ``anomaly_snapshot_age``
+        # resets. Rebuilt from zero on restart like every other counter.
+        self._last_scored_at: dict[str, float] = {}
         # (group, query_id, series_key) -> consecutive observation count.
         # Gates the warm-up window.
         self._observed_runs: dict[tuple[str, str, tuple[tuple[str, str], ...]], int] = {}
@@ -85,7 +123,31 @@ class SnapshotStore:
             tuple[str, str, tuple[tuple[str, str], ...], str, str | None],
             int,
         ] = {}
-        self._discovery = DiscoveryMissTracker()
+        # Discovery-absence miss tracker. In-memory by default; HA mode
+        # swaps in a Redis-backed tracker via ``set_discovery_tracker`` so
+        # the miss counts survive leader failover.
+        self._discovery: _DiscoveryTracker = DiscoveryMissTracker()
+
+    def set_discovery_tracker(self, tracker: _DiscoveryTracker) -> None:
+        """Replace the discovery-absence tracker (HA mode wiring).
+
+        Called once at HA startup to point the store at the Redis-backed
+        tracker so per-series miss counts are shared across replicas and
+        survive a Lease failover. Single-replica deployments keep the
+        in-memory default.
+        """
+        with self._lock:
+            self._discovery = tracker
+
+    @property
+    def discovery_blocking_io(self) -> bool:
+        """Whether the discovery tracker does blocking I/O (Redis backend).
+
+        The runner reads this to decide whether to offload the per-run
+        discovery-observation calls to a worker thread instead of running
+        them inline on the event loop.
+        """
+        return bool(getattr(self._discovery, "is_blocking_io", False))
 
     # ------------------------------------------------------------------
     # Snapshots
@@ -109,6 +171,8 @@ class SnapshotStore:
         with self._lock:
             self._snapshots[snapshot.group] = snapshot
             self._group_ready[snapshot.group] = mark_ready
+            if any(sample.metric == "anomaly_score" for sample in snapshot.samples):
+                self._last_scored_at[snapshot.group] = snapshot.timestamp
 
     def get(self, group: str) -> GroupSnapshot | None:
         with self._lock:
@@ -117,6 +181,18 @@ class SnapshotStore:
     def all_snapshots(self) -> list[GroupSnapshot]:
         with self._lock:
             return list(self._snapshots.values())
+
+    def last_scored_at(self, group: str) -> float | None:
+        """Timestamp of the freshest scoring snapshot for ``group``.
+
+        ``None`` until the group has produced at least one snapshot
+        carrying an ``anomaly_score`` sample — feeds
+        ``anomaly_series_staleness_seconds`` (the exporter omits the row
+        while this is ``None`` so a still-warming group doesn't report a
+        misleading staleness number).
+        """
+        with self._lock:
+            return self._last_scored_at.get(group)
 
     def all_samples(self) -> Iterable[Sample]:
         for snap in self.all_snapshots():
@@ -127,6 +203,7 @@ class SnapshotStore:
         with self._lock:
             self._snapshots.pop(group, None)
             self._group_ready.pop(group, None)
+            self._last_scored_at.pop(group, None)
             for obs_key in list(self._observed_runs):
                 if obs_key[0] == group:
                     del self._observed_runs[obs_key]
@@ -317,7 +394,7 @@ class SnapshotStore:
             self._calibrations.clear()
 
     # ------------------------------------------------------------------
-    # Discovery-based absence tracking (v0.4) — delegated to
+    # Discovery-based absence tracking — delegated to
     # :class:`DiscoveryMissTracker`.
     # ------------------------------------------------------------------
     def record_discovery_observation(

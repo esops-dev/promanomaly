@@ -18,6 +18,8 @@ def _print_inspect_text(payload: dict[str, Any]) -> None:
     sel_repr = ",".join(f"{k}={v}" for k, v in sorted(sel.items())) if sel else "(none)"
     click.echo(f"labels : {sel_repr}")
     click.echo(f"matched: {payload['matched_series']} / {payload['total_series']} series")
+    for hint in payload.get("metadata_lint", []):
+        click.echo(f"lint   : {hint.get('message', '')}")
     for series in payload.get("series", []):
         labels_repr = ",".join(f"{k}={v}" for k, v in sorted(series["labels"].items())) or "-"
         click.echo("")

@@ -164,11 +164,50 @@ class ReloadConfig(_ModelBase):
     auth: ReloadAuthConfig = Field(default_factory=ReloadAuthConfig)
 
 
+class SelfTestConfig(_ModelBase):
+    """End-to-end detection self-test (dead-man's-switch).
+
+    Off by default. When ``enabled``, each scheduled run drives one
+    synthetic series carrying a known injected anomaly through the real
+    detect → threshold → export path and asserts it is caught. It proves
+    the *detection pipeline itself* is live — a global misconfiguration
+    (an exporter regression, an absurd threshold) can leave the process
+    up and emitting nothing while silently catching no anomalies, which
+    the per-detector success ratios won't reveal.
+
+    Emits ``anomaly_selftest_ok`` (1/0) and
+    ``anomaly_selftest_failures_total``; the ``AnomalyPipelineDead``
+    reference alert fires when it stops passing. Stateless and bounded to
+    one synthetic series. Distinct from the self-monitoring example
+    config, which watches the detector's *operational* metrics rather
+    than re-driving the detection path.
+    """
+
+    enabled: bool = False
+    # Detector run through the synthetic path. Defaults to MAD — a robust
+    # baseline detector that reliably flags the injected point spike.
+    detector: str = "MAD"
+    # Alert threshold the synthetic score is checked against. Mirrors the
+    # default ``alert_thresholds.score`` so the self-test exercises the
+    # same threshold semantics the real pipeline uses.
+    threshold: float = Field(default=3.0, gt=0)
+
+
 class ServerConfig(_ModelBase):
     listen: str = ":9092"
     refresh_interval: Duration = "1m"
     reload: ReloadConfig = Field(default_factory=ReloadConfig)
     ready_endpoint: bool = True
+    # Opt-in ``GET /warmup`` endpoint reporting per-(group, query) "what
+    # is still loading?" status on a fresh install or after a restart.
+    # Off by default because even its one cheap probe per query is wasted
+    # work on the steady-state path — the operator workflow is "hit it a
+    # few times during the first refresh, then never again". The shipped
+    # NetworkPolicy denies external ingress to it alongside the /debug
+    # endpoints. See docs/operations.md.
+    expose_warmup_endpoint: bool = False
+    # End-to-end detection self-test (dead-man's-switch). Off by default.
+    selftest: SelfTestConfig = Field(default_factory=SelfTestConfig)
 
     @property
     def refresh_interval_seconds(self) -> float:
@@ -754,7 +793,44 @@ def load_config(path: str | Path) -> Config:
         raise ValueError(f"config {path}: top level must be a mapping")
     cfg = Config.model_validate(raw)
     _validate_detector_params(cfg)
+    _validate_selftest_detector(cfg)
     return cfg
+
+
+def _validate_selftest_detector(cfg: Config) -> None:
+    """Reject a self-test detector that can't work on one short window.
+
+    The self-test drives a single synthetic rolling-window series. A
+    stratified detector needs a multi-week lookback and a cohort detector
+    needs cross-series context — neither is available, so they would
+    silently always report ``anomaly_selftest_ok=0`` and fire a permanent
+    false ``AnomalyPipelineDead``. Fail fast at load rather than at 2 a.m.
+    Unknown / custom detectors are left alone ("no opinion"). Only
+    consulted when the self-test is enabled.
+    """
+    if not cfg.server.selftest.enabled:
+        return
+    from .detectors import UnknownDetectorError
+    from .detectors.cohort import is_cohort_aware
+    from .detectors.registry import get as get_detector
+    from .stratified import query_window_seconds_for
+
+    name = cfg.server.selftest.detector
+    try:
+        cls = get_detector(name)
+    except UnknownDetectorError:
+        return
+    hint = "use a rolling-window detector (e.g. MAD, Hampel, ZScoreEWMA, IQR)"
+    if is_cohort_aware(cls):
+        raise ValueError(
+            f"server.selftest.detector={name!r}: cohort detectors need cross-series "
+            f"context the single synthetic self-test series can't provide; {hint}"
+        )
+    if query_window_seconds_for(cls, dict(getattr(cls, "defaults", {}) or {})) is not None:
+        raise ValueError(
+            f"server.selftest.detector={name!r}: stratified detectors need a multi-week "
+            f"lookback the synthetic self-test window can't fill; {hint}"
+        )
 
 
 def _validate_detector_params(cfg: Config) -> None:
@@ -819,6 +895,7 @@ __all__ = [
     "ReloadAuthConfig",
     "ReloadConfig",
     "SafetyConfig",
+    "SelfTestConfig",
     "ServerConfig",
     "TelemetryConfig",
     "load_config",

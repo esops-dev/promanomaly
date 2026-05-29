@@ -211,4 +211,54 @@ spec:
               fail_ready policy is configured.
         {{- end }}
         {{- end }}
+        {{- with $rules.anomalyDetectorDegraded }}
+        {{- if .enabled }}
+        - alert: AnomalyDetectorDegraded
+          expr: anomaly_detect_success_ratio{window="{{ .window }}"} < {{ .threshold }}
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "Detector {{ "{{" }} $labels.detector {{ "}}" }} degraded in {{ "{{" }} $labels.group {{ "}}" }}"
+            description: |
+              anomaly_detect_success_ratio for detector
+              {{ "{{" }} $labels.detector {{ "}}" }} in group {{ "{{" }} $labels.group {{ "}}" }}
+              has been below {{ .threshold }} over the {{ .window }} window —
+              the detector is failing or timing out on too many series and
+              its scores are missing.
+        {{- end }}
+        {{- end }}
+        {{- with $rules.anomalySnapshotStale }}
+        {{- if .enabled }}
+        - alert: AnomalySnapshotStale
+          expr: anomaly_snapshot_age_seconds > {{ .maxAgeSeconds }}
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "promanomaly snapshot stale for {{ "{{" }} $labels.group {{ "}}" }}"
+            description: |
+              The most recent snapshot for group {{ "{{" }} $labels.group {{ "}}" }}
+              is older than {{ .maxAgeSeconds }}s. /metrics is serving stale
+              scores; cross-check AnomalySourceFailing and AnomalyStale.
+        {{- end }}
+        {{- end }}
+        {{- with $rules.anomalyPipelineDead }}
+        {{- if .enabled }}
+        - alert: AnomalyPipelineDead
+          expr: anomaly_selftest_ok == 0
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "promanomaly detection pipeline is dead (self-test failing)"
+            description: |
+              The end-to-end self-test for detector
+              {{ "{{" }} $labels.detector {{ "}}" }} has failed to catch its injected
+              synthetic anomaly for over {{ .for }}. The detect → threshold → export
+              pipeline is not surfacing anomalies even though the process is up —
+              check for a config/threshold mistake or an exporter regression.
+              See anomaly_selftest_failures_total. Requires server.selftest.enabled.
+        {{- end }}
+        {{- end }}
 {{- end }}

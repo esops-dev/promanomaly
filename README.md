@@ -79,7 +79,14 @@ monitoring, deploy-time silencing, cross-tool joins with promforecast).
 [`docs/when-to-use.md`](docs/when-to-use.md) walks through the
 "promforecast, promanomaly, or both?" decision tree, and
 [`docs/config-schema.md`](docs/config-schema.md) documents the v1
-schema stability commitments.
+schema stability commitments. Before going to production, work through
+the [`docs/production-checklist.md`](docs/production-checklist.md)
+sizing guide and readiness checklist, and keep the
+[degraded-mode playbook](docs/operations/degraded-modes.md) handy for
+on-call. Running many clusters? The
+[multi-cluster reference architectures](docs/architecture/multi-cluster.md)
+spell out the three topologies and their cardinality / network /
+blast-radius trade-offs.
 
 A self-monitoring example config is bundled at
 [`examples/configs/self-monitoring.yaml`](examples/configs/self-monitoring.yaml),

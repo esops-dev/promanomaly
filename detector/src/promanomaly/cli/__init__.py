@@ -61,7 +61,11 @@ from ._calibrate import (
     _round_to_dividing_bucket,
 )
 from ._common import _coerce_param, _safe_float
+from ._cost import run_estimate_cost as _run_estimate_cost
+from ._diagnose import run_diagnose_target as _run_diagnose_target
+from ._diagnose import run_diagnose_tsdb as _run_diagnose_tsdb
 from ._inspect import _print_inspect_text
+from ._metadata import run_metadata_lint as _run_metadata_lint
 from ._probe import (
     DiscoverProbeResult as _DiscoverProbeResult,
 )
@@ -127,7 +131,33 @@ def cli(ctx: click.Context, config_path: str | None, log_level: str) -> None:
     default=False,
     help=(
         "With --probe, exit non-zero when any query returns zero series "
-        "or errors. Suitable as a pre-deploy CI gate."
+        "or errors. With --estimate-cost, exit non-zero when the projected "
+        "series count exceeds safety.max_total_series. Suitable as a "
+        "pre-deploy CI gate."
+    ),
+)
+@click.option(
+    "--estimate-cost",
+    "estimate_cost",
+    is_flag=True,
+    default=False,
+    help=(
+        "Statically project cardinality, TSDB query load, and a coarse "
+        "CPU/memory estimate from the config — without touching the "
+        "datasource. Complements --probe (which checks the queries return "
+        "data)."
+    ),
+)
+@click.option(
+    "--lint-metadata",
+    "lint_metadata",
+    is_flag=True,
+    default=False,
+    help=(
+        "Query the datasource's /api/v1/metadata and warn when a query "
+        "feeds a raw counter to a detector without rate()/increase(). "
+        "Lint only — never rewrites the query. With --strict, any finding "
+        "exits non-zero. Composes with --probe and --estimate-cost."
     ),
 )
 @click.option(
@@ -142,36 +172,67 @@ def validate(
     config_path: str,
     probe: bool,
     strict: bool,
+    estimate_cost: bool,
+    lint_metadata: bool,
     datasource_url: str | None,
 ) -> None:
-    """Validate a config file (and optionally probe the datasource)."""
+    """Validate a config file (and optionally probe / estimate / lint it)."""
     try:
         cfg = load_config(config_path)
     except Exception as exc:
         click.echo(f"INVALID: {exc}", err=True)
         sys.exit(1)
 
-    if not probe:
-        if strict:
-            # --strict without --probe is a user error: schema validation
-            # is binary (pass / fail) and already exits non-zero on fail.
-            raise click.UsageError("--strict requires --probe")
+    runs_a_check = probe or estimate_cost or lint_metadata
+    if strict and not runs_a_check:
+        # --strict alone is a user error: schema validation is binary
+        # (pass / fail) and already exits non-zero on fail. It only gates
+        # something when paired with a check that has a soft verdict.
+        raise click.UsageError("--strict requires --probe, --estimate-cost, or --lint-metadata")
+
+    # Each requested check runs unconditionally and prints its own report;
+    # the process exits non-zero if *any* of them failed. Collecting the
+    # codes (rather than short-circuiting with ``or``) means a failing
+    # earlier check never suppresses a later check's output — an operator
+    # passing several flags sees every report in one run. The static cost
+    # projection runs first so a CI gate sees the cardinality verdict even
+    # when the datasource is unreachable.
+    codes: list[int] = []
+    if estimate_cost:
+        codes.append(_run_estimate_cost(cfg, strict=strict))
+
+    # --lint-metadata and --probe both touch the datasource. Pass the
+    # cli-module's ``PromQLSource`` symbol as the factory so tests that
+    # ``monkeypatch.setattr(cli, "PromQLSource", stub)`` win regardless of
+    # where the implementation lives.
+    if lint_metadata:
+        codes.append(
+            asyncio.run(
+                _run_metadata_lint(
+                    cfg,
+                    strict=strict,
+                    datasource_override=datasource_url,
+                    source_factory=PromQLSource,
+                )
+            )
+        )
+
+    if probe:
+        codes.append(
+            asyncio.run(
+                _run_probe(
+                    cfg,
+                    strict=strict,
+                    datasource_override=datasource_url,
+                    source_factory=PromQLSource,
+                )
+            )
+        )
+
+    if not runs_a_check:
         click.echo(f"OK: apiVersion={cfg.apiVersion} groups={[g.name for g in cfg.groups]}")
         return
-
-    # Pass the cli-module's ``PromQLSource`` symbol as the factory so
-    # tests that ``monkeypatch.setattr(cli, "PromQLSource", stub)`` win
-    # regardless of where the probe implementation lives. Production
-    # callers see the real source class.
-    exit_code = asyncio.run(
-        _run_probe(
-            cfg,
-            strict=strict,
-            datasource_override=datasource_url,
-            source_factory=PromQLSource,
-        )
-    )
-    sys.exit(exit_code)
+    sys.exit(max(codes) if codes else 0)
 
 
 # The 450+ LOC of probe logic that used to live here moved to
@@ -702,6 +763,17 @@ def inspect_cmd(
     help="Show at most this many series (ranked by severity).",
 )
 @click.option(
+    "--lint/--no-lint",
+    "lint",
+    default=True,
+    show_default=True,
+    help=(
+        "Ask the detector to include metadata-lint hints (counter fed to a "
+        "detector without rate()/increase()). Costs one extra metadata "
+        "query against the TSDB; pass --no-lint to skip it."
+    ),
+)
+@click.option(
     "--output",
     type=click.Choice(["text", "json"]),
     default="text",
@@ -719,6 +791,7 @@ def top_cmd(
     group: str | None,
     min_severity: float,
     limit: int,
+    lint: bool,
     output: str,
     timeout: float,
 ) -> None:
@@ -731,7 +804,11 @@ def top_cmd(
     """
     import httpx
 
-    params: dict[str, str] = {"min_severity": str(min_severity), "limit": str(limit)}
+    params: dict[str, str] = {
+        "min_severity": str(min_severity),
+        "limit": str(limit),
+        "lint": "true" if lint else "false",
+    }
     if group:
         params["group"] = group
     url = target_url.rstrip("/") + "/debug/anomalies"
@@ -752,6 +829,176 @@ def top_cmd(
         click.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
     _print_top_text(payload)
+
+
+@cli.command(name="warmup")
+@click.option(
+    "--target",
+    "target_url",
+    required=True,
+    help="Running detector base URL (e.g. http://localhost:9092).",
+)
+@click.option(
+    "--output",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    show_default=True,
+    help="Output format. 'json' is the raw /warmup response.",
+)
+@click.option(
+    "--timeout",
+    default=30.0,
+    show_default=True,
+    help="HTTP timeout for the /warmup call, in seconds.",
+)
+def warmup_cmd(target_url: str, output: str, timeout: float) -> None:
+    """Report which series are still warming up and an ETA to readiness.
+
+    Wraps a running detector's opt-in ``/warmup`` endpoint (enabled via
+    ``server.expose_warmup_endpoint``). Exit code is 0 when every query
+    in every group is ``ready`` (or there are no queries to warm up) and
+    1 when at least one is still warming or errored — so a CI pre-flight
+    can gate "is the install done?" on it. Network failures exit 2.
+    Mirrors ``promforecast warmup`` for cross-tool muscle memory.
+    """
+    import httpx
+
+    from ..warmup import render_table, report_from_payload
+
+    url = target_url.rstrip("/") + "/warmup"
+    try:
+        resp = httpx.get(url, timeout=timeout)
+        resp.raise_for_status()
+        payload = resp.json()
+    except httpx.HTTPError as exc:
+        click.echo(f"could not reach {target_url}: {exc}", err=True)
+        sys.exit(2)
+    except ValueError:
+        click.echo(f"non-JSON response from {url}", err=True)
+        sys.exit(2)
+
+    if output == "json":
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        click.echo(render_table(report_from_payload(payload)), nl=False)
+
+    statuses = {
+        q.get("status", "") for group in payload.get("groups", []) for q in group.get("queries", [])
+    }
+    # Empty config (no queries) is "done", not "still warming", so a
+    # docs-recommended ``until promanomaly warmup`` loop terminates
+    # against a fresh install rather than spinning forever.
+    if statuses and statuses != {"ready"}:
+        sys.exit(1)
+
+
+@cli.command(name="diagnose")
+@click.option(
+    "--target",
+    "target_url",
+    default=None,
+    help=(
+        "Running detector base URL (e.g. http://localhost:9092). Reads one "
+        "/metrics scrape for a current-state read (firing now, warming now, "
+        "empty now). Cannot compute a firing rate over time — use "
+        "--datasource-url for that."
+    ),
+)
+@click.option(
+    "--datasource-url",
+    "datasource_url",
+    default=None,
+    help=(
+        "TSDB URL holding the detector's own scraped metrics. Aggregates "
+        "anomaly_* over --window for the full analysis (never-fires / "
+        "fires-often firing-rate bands, chronic warm-up, empty queries)."
+    ),
+)
+@click.option(
+    "--window",
+    default="24h",
+    show_default=True,
+    help="Lookback for the TSDB analysis (Prometheus duration: 24h, 7d, ...).",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help=(
+        "Config file. With --datasource-url, cross-checks configured "
+        "detectors against emitted scores so a silent detector (dead config, "
+        "or a cohort below min_cohort_size) is flagged."
+    ),
+)
+@click.option(
+    "--fire-high",
+    default=0.5,
+    show_default=True,
+    type=float,
+    help="Firing-rate fraction at/above which a detector is flagged as too noisy.",
+)
+@click.option(
+    "--output",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    show_default=True,
+    help="Output format. 'json' is suitable for CI consumption.",
+)
+@click.option("--timeout", default=30.0, show_default=True, help="HTTP timeout in seconds.")
+def diagnose_cmd(
+    target_url: str | None,
+    datasource_url: str | None,
+    window: str,
+    config_path: str | None,
+    fire_high: float,
+    output: str,
+    timeout: float,
+) -> None:
+    """Report mis-tuned detectors: never-fires, fires-often, stuck warming, empty.
+
+    Pure analysis, no persisted state. Pairs with ``backtest`` and
+    ``calibrate-buckets`` to close the tuning loop. Parity with
+    ``promforecast diagnose``.
+    """
+    from ..diagnose import render_report
+
+    if bool(target_url) == bool(datasource_url):
+        raise click.UsageError("pass exactly one of --target or --datasource-url")
+
+    if target_url is not None:
+        import httpx
+
+        try:
+            report = _run_diagnose_target(target_url, timeout, fire_high=fire_high)
+        except httpx.HTTPError as exc:
+            click.echo(f"could not reach {target_url}: {exc}", err=True)
+            sys.exit(2)
+    else:
+        assert datasource_url is not None
+        cfg = load_config(config_path) if config_path else None
+        try:
+            report = asyncio.run(
+                _run_diagnose_tsdb(
+                    datasource_url,
+                    timeout,
+                    window=window,
+                    fire_high=fire_high,
+                    never_eps=0.0,
+                    source_factory=PromQLSource,
+                    config=cfg,
+                )
+            )
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
+        except SourceQueryError as exc:
+            click.echo(f"query failed: {exc}", err=True)
+            sys.exit(2)
+
+    if output == "json":
+        click.echo(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    else:
+        click.echo(render_report(report), nl=False)
 
 
 # Register the backtest command imported from promanomaly.backtest so
@@ -813,6 +1060,10 @@ __all__ = [
     "_probe_discover_query",
     "_recommend_detector",
     "_round_to_dividing_bucket",
+    "_run_diagnose_target",
+    "_run_diagnose_tsdb",
+    "_run_estimate_cost",
+    "_run_metadata_lint",
     "_run_offline_change_points",
     "_run_probe",
     "_safe_float",

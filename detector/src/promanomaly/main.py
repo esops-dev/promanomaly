@@ -39,6 +39,7 @@ from .ha import HAComponents, build_ha_components, run_follower_loop, stop_ha
 from .leader import resolve_identity
 from .logging import configure_logging, get_logger
 from .runner import Runner
+from .selftest import run_selftest
 from .server import build_app as _build_app
 from .source import PromQLSource, QueryResult
 from .state import SnapshotStore
@@ -137,6 +138,8 @@ class Application:
             # /metrics has data before the first scheduler tick.
             for group in self._config.groups:
                 self._spawn(self._safe_group_run(group.name))
+            if self._config.server.selftest.enabled:
+                self._spawn(self._selftest_tick())
 
     async def shutdown(self) -> None:
         await stop_ha(self._ha)
@@ -233,6 +236,19 @@ class Application:
                 max_instances=1,
                 coalesce=True,
             )
+        # End-to-end detection self-test, on the same cadence as the
+        # detector runs. Gated inside ``_selftest_tick`` by the leader flag
+        # like ``_tick``, so it fires on every replica but only the leader
+        # runs it in HA mode.
+        if self._config.server.selftest.enabled:
+            scheduler.add_job(
+                self._selftest_tick,
+                trigger=IntervalTrigger(seconds=interval),
+                id="selftest",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+            )
 
     async def _tick(self, group_name: str) -> None:
         # In HA mode followers must never run the detector pipeline —
@@ -286,6 +302,38 @@ class Application:
                     if not tasks:
                         self._running_group_tasks.pop(group_name, None)
 
+    async def _selftest_tick(self) -> None:
+        # Leader-gated like ``_tick``: the self-test fires on every replica
+        # but only the elected leader actually runs it in HA mode, so the
+        # ``anomaly_selftest_ok`` gauge is published once per cluster.
+        if self._ha_enabled and not self._is_leader:
+            return
+        self._run_selftest()
+
+    def _run_selftest(self) -> None:
+        """Run one end-to-end self-test and publish the result metrics.
+
+        Synchronous and tiny (one detector over a ~60-sample synthetic
+        window); runs inline. Exceptions inside ``run_selftest`` are caught
+        there and returned as a failed result, so this never raises.
+        """
+        cfg = self._config.server.selftest
+        result = run_selftest(
+            detector_name=cfg.detector,
+            threshold=cfg.threshold,
+            min_points=self._config.defaults.min_points,
+        )
+        self._ops.selftest_ok.labels(detector=cfg.detector).set(1.0 if result.ok else 0.0)
+        if not result.ok:
+            self._ops.selftest_failures_total.labels(detector=cfg.detector).inc()
+            logger.warning(
+                "selftest_failed",
+                detector=cfg.detector,
+                score=result.score,
+                threshold=result.threshold,
+                detail=result.detail,
+            )
+
     def _spawn(self, coro: Any) -> None:
         """Track background tasks so the GC keeps them alive (RUF006)."""
         task = asyncio.create_task(coro)
@@ -313,9 +361,16 @@ class Application:
             redis_client=self._redis,
             store=self._store,
             identity=self._identity,
+            refresh_interval_seconds=self._config.server.refresh_interval_seconds,
             on_started_leading=self._on_started_leading,
             on_stopped_leading=self._on_stopped_leading,
         )
+        # Point the snapshot store at the Redis-backed discovery tracker so
+        # per-series miss counts are shared across replicas and survive a
+        # Lease failover. Both leader and followers set it (followers never
+        # write — they don't run the pipeline — but a demoted-then-promoted
+        # replica then has it ready).
+        self._store.set_discovery_tracker(self._ha.discovery_tracker)
         self._ha.elector.start()
         self._ha.follower_task = asyncio.create_task(
             run_follower_loop(
@@ -345,6 +400,8 @@ class Application:
         self._runner.surface_misconfigurations()
         for group in self._config.groups:
             self._spawn(self._safe_group_run(group.name))
+        if self._config.server.selftest.enabled:
+            self._spawn(self._selftest_tick())
 
     async def _on_stopped_leading(self) -> None:
         """Stop being leader: cancel in-flight runs and cool down.

@@ -27,7 +27,12 @@ from typing import Any
 from .config import HighAvailabilityConfig, RedisConfig
 from .leader import LeaderElector, LeaseClient
 from .logging import get_logger
-from .state import FollowerSyncer, SharedSnapshotCache, SnapshotStore
+from .state import (
+    FollowerSyncer,
+    RedisDiscoveryMissTracker,
+    SharedSnapshotCache,
+    SnapshotStore,
+)
 
 logger = get_logger(__name__)
 
@@ -39,6 +44,7 @@ class HAComponents:
     elector: LeaderElector
     snapshot_cache: SharedSnapshotCache
     follower_syncer: FollowerSyncer
+    discovery_tracker: RedisDiscoveryMissTracker
     follower_task: asyncio.Task[None] | None = field(default=None)
 
 
@@ -49,6 +55,7 @@ def build_ha_components(
     redis_client: Any,
     store: SnapshotStore,
     identity: str,
+    refresh_interval_seconds: float,
     on_started_leading: Callable[[], Awaitable[None]],
     on_stopped_leading: Callable[[], Awaitable[None]],
 ) -> HAComponents:
@@ -66,6 +73,18 @@ def build_ha_components(
         key_prefix=f"{redis_config.key_prefix}:snapshot",
     )
     follower_syncer = FollowerSyncer(store=store, shared=snapshot_cache)
+    # Discovery-absence miss counts live in Redis so they survive a Lease
+    # failover (the in-memory tracker would reset the grace window on the
+    # new leader). The TTL is refreshed on every write, so while a leader
+    # writes each refresh the key never expires; it only matters for the
+    # failover gap and orphan cleanup, so a few refresh intervals (floored
+    # at the snapshot TTL) is ample.
+    discovery_ttl = max(config.snapshot_ttl_seconds, refresh_interval_seconds * 4.0)
+    discovery_tracker = RedisDiscoveryMissTracker(
+        client=redis_client,
+        ttl_seconds=discovery_ttl,
+        key_prefix=f"{redis_config.key_prefix}:discovery",
+    )
     elector = LeaderElector(
         ha=config,
         identity=identity,
@@ -81,6 +100,7 @@ def build_ha_components(
         elector=elector,
         snapshot_cache=snapshot_cache,
         follower_syncer=follower_syncer,
+        discovery_tracker=discovery_tracker,
     )
 
 

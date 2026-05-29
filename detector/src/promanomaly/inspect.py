@@ -37,6 +37,7 @@ from .detectors.cohort import (
     cohort_key_for,
     is_cohort_aware,
 )
+from .metadata_lint import lint_query
 from .plan import build_detector as _build_detector
 from .plan import build_detector_plans, effective_threshold
 from .source import PromQLSource, QuerySeries, SourceQueryError
@@ -203,6 +204,18 @@ async def inspect_series(
             "label_selector": selector,
         }
 
+    # Metadata-aware lint hint: surface the same counter-not-rated warning
+    # the validate lint reports, computed live for this query. Best-effort
+    # — a TSDB without a metadata endpoint just yields no hint rather than
+    # failing the inspect.
+    metadata_lint: list[dict[str, Any]] = []
+    try:
+        metadata = await source.metric_metadata()
+    except SourceQueryError:
+        metadata = {}
+    for finding in lint_query(group.name, query, metadata):
+        metadata_lint.append(finding.to_dict())
+
     matching = [s for s in qresult.series if _matches(s, selector)]
     # Pre-compute cohort baselines from the *unfiltered* result set so a
     # cohort-aware detector inspecting one member still sees the full
@@ -321,6 +334,7 @@ async def inspect_series(
         "warmup_policy": defaults.warmup_policy,
         "matched_series": len(series_payload),
         "total_series": len(qresult.series),
+        "metadata_lint": metadata_lint,
         "series": series_payload,
     }
 

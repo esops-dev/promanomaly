@@ -16,6 +16,7 @@ private :class:`CollectorRegistry`.
 from __future__ import annotations
 
 import re
+import time
 from collections import defaultdict
 from collections.abc import Iterable
 
@@ -27,6 +28,7 @@ from prometheus_client import (
     generate_latest,
 )
 
+from .self_observability import DetectOutcomeTracker
 from .source import PromQLSource
 from .state import Sample, SnapshotStore
 
@@ -258,10 +260,17 @@ class OperationalMetrics:
 
     def __init__(self) -> None:
         self.registry = CollectorRegistry()
+        # The rolling detector-success ledger is owned here so both the
+        # runner (which records per-run outcomes) and the exporter (which
+        # renders the derived ratio gauge at scrape time) reach it through
+        # the one shared ``OperationalMetrics`` instance.
+        self.detect_outcomes = DetectOutcomeTracker()
         self._declare_runner_metrics()
         self._declare_cache_metrics()
         self._declare_leader_metrics()
         self._declare_discovery_metrics()
+        self._declare_self_observability_metrics()
+        self._declare_selftest_metrics()
 
     # ------------------------------------------------------------------
     # Runner-owned metrics: per-group timing, readiness, source-failure
@@ -415,6 +424,76 @@ class OperationalMetrics:
             registry=self.registry,
         )
 
+    # ------------------------------------------------------------------
+    # Self-observability metrics. Telemetry about the detector's
+    # own internals: per-detector compute success rate, per-group CPU /
+    # memory attribution, and per-series freshness. All bounded by the
+    # configured group / detector cardinality. ``detect_success_ratio``
+    # and the resource gauges are repopulated from the trackers on every
+    # render; the staleness / snapshot-age gauges are time-relative and
+    # set at render time straight from the snapshot store.
+    # ------------------------------------------------------------------
+    def _declare_self_observability_metrics(self) -> None:
+        self.detect_success_ratio = Gauge(
+            "anomaly_detect_success_ratio",
+            (
+                "Fraction of attempted detector computations that completed "
+                "without raising, over a rolling window. A degrading detector "
+                "surfaces here before its missed scores reach downstream alerts."
+            ),
+            ["group", "detector", "window"],
+            registry=self.registry,
+        )
+        self.group_cpu_seconds_total = Counter(
+            "anomaly_group_cpu_seconds",
+            "Cumulative detector compute time attributed to a group, in seconds.",
+            ["group"],
+            registry=self.registry,
+        )
+        self.group_memory_bytes = Gauge(
+            "anomaly_group_memory_bytes",
+            "Best-effort size of the per-group output snapshot held by the exporter.",
+            ["group"],
+            registry=self.registry,
+        )
+        self.series_staleness_seconds = Gauge(
+            "anomaly_series_staleness_seconds",
+            "Age in seconds of the freshest per-series score in a group.",
+            ["group"],
+            registry=self.registry,
+        )
+        self.snapshot_age_seconds = Gauge(
+            "anomaly_snapshot_age_seconds",
+            "Age in seconds of the group's most recent successful snapshot.",
+            ["group"],
+            registry=self.registry,
+        )
+
+    # ------------------------------------------------------------------
+    # Self-test (dead-man's-switch) metrics. Carry a ``detector``
+    # label so the series only appears once the self-test has actually run
+    # — a disabled self-test emits nothing and ``AnomalyPipelineDead``
+    # ( anomaly_selftest_ok == 0 ) never fires on an opted-out deployment.
+    # ------------------------------------------------------------------
+    def _declare_selftest_metrics(self) -> None:
+        self.selftest_ok = Gauge(
+            "anomaly_selftest_ok",
+            (
+                "1 when the end-to-end detection self-test caught its injected "
+                "synthetic anomaly on the last run, 0 when the detect/threshold/"
+                "export pipeline failed to surface it. Emitted only when "
+                "server.selftest.enabled."
+            ),
+            ["detector"],
+            registry=self.registry,
+        )
+        self.selftest_failures_total = Counter(
+            "anomaly_selftest_failures_total",
+            "Total self-test runs that failed to catch the injected anomaly.",
+            ["detector"],
+            registry=self.registry,
+        )
+
     def render(self) -> bytes:
         return generate_latest(self.registry)
 
@@ -460,6 +539,7 @@ class Exporter:
 
     def render(self) -> tuple[bytes, str]:
         self._refresh_cache_metrics()
+        self._refresh_self_observability_metrics()
         op_bytes = self._operational.render()
         snapshots = self._store.all_snapshots()
         key = tuple(sorted((snap.group, snap.timestamp) for snap in snapshots))
@@ -469,6 +549,36 @@ class Exporter:
             self._snapshot_render_key = key
         body = op_bytes + self._snapshot_render_bytes
         return body, CONTENT_TYPE_LATEST
+
+    def _refresh_self_observability_metrics(self) -> None:
+        """Repopulate the render-time self-observability gauges.
+
+        ``anomaly_detect_success_ratio`` is derived from the rolling
+        outcome ledger; ``anomaly_series_staleness_seconds`` and
+        ``anomaly_snapshot_age_seconds`` are time-relative and must be
+        recomputed on every scrape so they keep climbing between runs
+        (an operator alerting on ``... > 600`` needs the value to grow,
+        not freeze at the last run's timestamp). The per-group CPU
+        counter and memory gauge are written directly by the runner and
+        need no render-time work.
+        """
+        ops = self._operational
+        for point in ops.detect_outcomes.render():
+            ops.detect_success_ratio.labels(
+                group=point.group,
+                detector=point.detector,
+                window=point.window_label,
+            ).set(point.ratio)
+        now = time.time()
+        for snapshot in self._store.all_snapshots():
+            ops.snapshot_age_seconds.labels(group=snapshot.group).set(
+                max(0.0, now - snapshot.timestamp)
+            )
+            scored_at = self._store.last_scored_at(snapshot.group)
+            if scored_at is not None:
+                ops.series_staleness_seconds.labels(group=snapshot.group).set(
+                    max(0.0, now - scored_at)
+                )
 
     def _refresh_cache_metrics(self) -> None:
         if self._source is None or self._source.cache is None:

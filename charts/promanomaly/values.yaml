@@ -45,6 +45,20 @@ server:
     auth:
       type: none       # none | bearer | mtls
       existingSecret: ""
+  # Opt-in GET /warmup endpoint (off by default). When true the
+  # detector reports per-(group, query) warm-up status; the shipped
+  # NetworkPolicy keeps it in-namespace alongside /debug/*.
+  expose_warmup_endpoint: false
+  # End-to-end detection self-test (dead-man's-switch). Off by default.
+  # When enabled, each run drives a synthetic series with a known
+  # injected anomaly through the real detect/threshold/export path and
+  # emits anomaly_selftest_ok (1/0); the AnomalyPipelineDead alert fires
+  # when it stops passing. Proves the detection path itself is live, not
+  # merely that the process is up.
+  selftest:
+    enabled: false
+    detector: MAD
+    threshold: 3.0
 
 safety:
   max_series_per_query: 1000
@@ -296,3 +310,34 @@ prometheusRule:
       threshold: 0.1
       for: 5m
       severity: warning
+    # Self-observability: the detector's own health.
+    # AnomalyDetectorDegraded fires when a detector's rolling compute
+    # success ratio drops — it is silently missing scores before any
+    # downstream anomaly alert can fire.
+    anomalyDetectorDegraded:
+      enabled: true
+      threshold: 0.9
+      # Must be one of the emitted window labels: "1h" or "1d". The
+      # detector emits anomaly_detect_success_ratio only at these two
+      # windows, so any other value matches no series and the alert
+      # silently never fires.
+      window: 1h
+      for: 10m
+      severity: warning
+    # AnomalySnapshotStale fires when the served /metrics snapshot ages
+    # past maxAgeSeconds — distinct from AnomalyStale, which keys off the
+    # last successful-run timestamp.
+    anomalySnapshotStale:
+      enabled: true
+      maxAgeSeconds: 600
+      for: 5m
+      severity: warning
+    # AnomalyPipelineDead (dead-man's-switch) fires when the opt-in
+    # end-to-end self-test stops catching its injected synthetic anomaly —
+    # the whole detect/threshold/export pipeline is silently dead. The
+    # underlying anomaly_selftest_ok series only exists when
+    # server.selftest.enabled, so this rule is dormant otherwise.
+    anomalyPipelineDead:
+      enabled: true
+      for: 5m
+      severity: critical
