@@ -42,9 +42,7 @@ def test_fit_score_normalises_residual_by_band(stub_prophet: type) -> None:
     assert bool(row["is_outside"]) is False
 
 
-def test_params_forwarded_to_prophet(
-    monkeypatch: pytest.MonkeyPatch, stub_prophet: type
-) -> None:
+def test_params_forwarded_to_prophet(monkeypatch: pytest.MonkeyPatch, stub_prophet: type) -> None:
     # Sanity check: custom params reach the Prophet constructor. We
     # wrap the stub with a capturing subclass that records the kwargs
     # it was called with — simpler than threading state through the

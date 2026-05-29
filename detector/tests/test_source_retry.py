@@ -43,7 +43,9 @@ async def test_transient_transport_error_is_retried_once() -> None:
 
     src = _source_with_handler(handler)
     try:
-        result = await src.range_query(promql="up", end=100.0, window_seconds=60.0, step_seconds=15.0)
+        result = await src.range_query(
+            promql="up", end=100.0, window_seconds=60.0, step_seconds=15.0
+        )
     finally:
         await src.close()
 

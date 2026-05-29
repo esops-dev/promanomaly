@@ -261,9 +261,7 @@ class PromQLSource:
             await self._cache_put(cache_key, query_result)
         return query_result
 
-    async def _cache_get(
-        self, cache_key: tuple[str, float, float, int, int]
-    ) -> QueryResult | None:
+    async def _cache_get(self, cache_key: tuple[str, float, float, int, int]) -> QueryResult | None:
         """Read from the cache without blocking the event loop.
 
         The in-process :class:`TTLCache` is a lock-guarded memory lookup and

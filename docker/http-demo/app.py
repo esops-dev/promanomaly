@@ -54,7 +54,11 @@ app = FastAPI(title=APP_NAME)
 
 @app.middleware("http")
 async def observe(request: Request, call_next):
-    endpoint = request.scope.get("route").path if request.scope.get("route") else request.url.path
+    endpoint = (
+        request.scope.get("route").path
+        if request.scope.get("route")
+        else request.url.path
+    )
     method = request.method
     http_requests_in_flight.inc()
     start = time.perf_counter()
@@ -67,8 +71,12 @@ async def observe(request: Request, call_next):
     finally:
         elapsed = time.perf_counter() - start
         http_requests_in_flight.dec()
-        http_request_duration_seconds.labels(method=method, endpoint=endpoint).observe(elapsed)
-        http_requests_total.labels(method=method, endpoint=endpoint, status=str(status)).inc()
+        http_request_duration_seconds.labels(method=method, endpoint=endpoint).observe(
+            elapsed
+        )
+        http_requests_total.labels(
+            method=method, endpoint=endpoint, status=str(status)
+        ).inc()
     return response
 
 
@@ -79,7 +87,17 @@ def _sleep_lognormal(mu: float, sigma: float, cap: float) -> float:
 
 @app.get("/")
 async def root() -> dict:
-    body = {"app": APP_NAME, "endpoints": ["/", "/api/users", "/api/products", "/api/slow", "/api/flaky", "/healthz"]}
+    body = {
+        "app": APP_NAME,
+        "endpoints": [
+            "/",
+            "/api/users",
+            "/api/products",
+            "/api/slow",
+            "/api/flaky",
+            "/healthz",
+        ],
+    }
     http_payload_bytes.labels(endpoint="/").observe(len(str(body)))
     return body
 
@@ -88,7 +106,9 @@ async def root() -> dict:
 async def users() -> dict:
     # Fast endpoint, ~5-20ms.
     await asyncio.sleep(_sleep_lognormal(mu=-4.5, sigma=0.4, cap=0.2))
-    payload = {"users": [{"id": i, "name": f"user-{i}"} for i in range(random.randint(5, 25))]}
+    payload = {
+        "users": [{"id": i, "name": f"user-{i}"} for i in range(random.randint(5, 25))]
+    }
     http_payload_bytes.labels(endpoint="/api/users").observe(len(str(payload)))
     return payload
 
@@ -97,7 +117,12 @@ async def users() -> dict:
 async def products() -> dict:
     # Medium endpoint, ~30-150ms with occasional spikes.
     await asyncio.sleep(_sleep_lognormal(mu=-3.0, sigma=0.6, cap=1.5))
-    payload = {"products": [{"sku": f"sku-{i}", "price": round(random.uniform(1, 99), 2)} for i in range(20)]}
+    payload = {
+        "products": [
+            {"sku": f"sku-{i}", "price": round(random.uniform(1, 99), 2)}
+            for i in range(20)
+        ]
+    }
     http_payload_bytes.labels(endpoint="/api/products").observe(len(str(payload)))
     return payload
 
@@ -127,4 +152,6 @@ async def healthz() -> dict:
 
 @app.get("/metrics")
 async def metrics() -> PlainTextResponse:
-    return PlainTextResponse(generate_latest(registry).decode("utf-8"), media_type=CONTENT_TYPE_LATEST)
+    return PlainTextResponse(
+        generate_latest(registry).decode("utf-8"), media_type=CONTENT_TYPE_LATEST
+    )
