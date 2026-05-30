@@ -1,0 +1,19 @@
+# Exercise the optional push-sink configmap branch. Uses the
+# remote_write sink (the grafana_annotations branch is symmetric).
+sink:
+  type: remote_write
+  remote_write:
+    url: http://victoriametrics.monitoring.svc:8428/api/v1/write
+    timeout: 10s
+    auth:
+      type: bearer
+      existingSecret: remote-write-credentials
+
+groups:
+  - name: ci_sink
+    priority: 1
+    queries:
+      - id: queue_depth
+        promql: max(queue_depth) by (queue)
+        detectors:
+          - name: MAD

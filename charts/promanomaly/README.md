@@ -34,6 +34,13 @@ notable bits:
 - ``existingConfigMap`` lets GitOps tooling (Argo CD, Flux) manage the
   detector configuration out-of-band; the chart then skips its own
   ConfigMap rendering.
+- ``datasource.auth`` supports ``none``/``bearer``/``basic``/``mtls``.
+  For anything other than ``none``, set
+  ``datasource.auth.existingSecret`` to a Secret carrying the credential
+  — the chart mounts it as files and references it by path so it never
+  lands in the ConfigMap. Expected Secret keys: ``token`` (bearer),
+  ``password`` (basic; set ``datasource.auth.username`` too), or
+  ``ca.crt``/``tls.crt``/``tls.key`` (mTLS).
 - ``networkPolicy.enabled`` defaults on; turn it off if your cluster
   does not use NetworkPolicies.
 - ``serviceMonitor.honorLabels: true`` is the default and required

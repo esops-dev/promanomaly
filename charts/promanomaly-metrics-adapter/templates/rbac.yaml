@@ -1,0 +1,65 @@
+{{- if .Values.rbac.create }}
+# Delegated authentication/authorization: the aggregated apiserver asks
+# the core apiserver to authenticate and authorize incoming requests.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "adapter.fullname" . }}:system:auth-delegator
+  labels: {{- include "adapter.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "adapter.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Read the extension-apiserver-authentication ConfigMap in kube-system so
+# the adapter can validate client certs presented by the aggregation layer.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "adapter.fullname" . }}-auth-reader
+  namespace: kube-system
+  labels: {{- include "adapter.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "adapter.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Let the HPA controller read the metrics APIs this adapter serves.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "adapter.fullname" . }}-metrics-reader
+  labels: {{- include "adapter.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - external.metrics.k8s.io
+      - custom.metrics.k8s.io
+    resources:
+      - "*"
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "adapter.fullname" . }}-hpa-metrics-reader
+  labels: {{- include "adapter.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "adapter.fullname" . }}-metrics-reader
+subjects:
+  - kind: ServiceAccount
+    name: horizontal-pod-autoscaler
+    namespace: kube-system
+{{- end }}

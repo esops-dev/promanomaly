@@ -1,0 +1,90 @@
+name: promanomaly config validation
+description: >-
+  Validate a promanomaly detector config on every PR — schema, optional live
+  probe, static cardinality/cost estimate, and counter-metadata lint — so a
+  broken or over-expensive config never reaches the cluster.
+branding:
+  icon: activity
+  color: purple
+
+inputs:
+  config:
+    description: Path to the promanomaly config file to validate.
+    required: true
+  probe:
+    description: >-
+      Execute every query against a live datasource and fail on empty/erroring
+      queries. Requires network access to the TSDB from the runner; usually a
+      mock or staging datasource in CI. Defaults to off.
+    required: false
+    default: "false"
+  estimate-cost:
+    description: >-
+      Statically project cardinality, TSDB query load, and a coarse CPU/memory
+      estimate from the config (no datasource access). On by default — it is
+      cheap and needs nothing external.
+    required: false
+    default: "true"
+  lint-metadata:
+    description: >-
+      Query the datasource's /api/v1/metadata and warn when a query feeds a raw
+      counter to a detector without rate()/increase(). Requires datasource
+      access. Defaults to off.
+    required: false
+    default: "false"
+  strict:
+    description: >-
+      Fail the job on a soft finding from any enabled check: empty/erroring
+      queries (probe), projected series over safety.max_total_series
+      (estimate-cost), or a counter-not-rated finding (lint-metadata). On by
+      default so the action gates a PR. Set to "false" to report only.
+    required: false
+    default: "true"
+  datasource-url:
+    description: >-
+      Override the datasource URL used by --probe / --lint-metadata, e.g. a
+      staging or mock TSDB. Leave empty to use the URL from the config.
+    required: false
+    default: ""
+  python-version:
+    description: Python version used to run the validator.
+    required: false
+    default: "3.12"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install promanomaly
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        # Install the detector from this action's own checkout so the
+        # validator version always matches the action ref the caller pinned.
+        pip install "${GITHUB_ACTION_PATH}/detector"
+
+    - name: Validate config
+      shell: bash
+      env:
+        PROMANOMALY_CONFIG: ${{ inputs.config }}
+        PROMANOMALY_PROBE: ${{ inputs.probe }}
+        PROMANOMALY_ESTIMATE_COST: ${{ inputs.estimate-cost }}
+        PROMANOMALY_LINT_METADATA: ${{ inputs.lint-metadata }}
+        PROMANOMALY_STRICT: ${{ inputs.strict }}
+        PROMANOMALY_DATASOURCE_URL: ${{ inputs.datasource-url }}
+      run: |
+        set -euo pipefail
+        args=(validate --config "${PROMANOMALY_CONFIG}")
+        if [ "${PROMANOMALY_PROBE}" = "true" ]; then args+=(--probe); fi
+        if [ "${PROMANOMALY_ESTIMATE_COST}" = "true" ]; then args+=(--estimate-cost); fi
+        if [ "${PROMANOMALY_LINT_METADATA}" = "true" ]; then args+=(--lint-metadata); fi
+        if [ "${PROMANOMALY_STRICT}" = "true" ]; then args+=(--strict); fi
+        if [ -n "${PROMANOMALY_DATASOURCE_URL}" ]; then
+          args+=(--datasource-url "${PROMANOMALY_DATASOURCE_URL}")
+        fi
+        echo "+ promanomaly ${args[*]}"
+        promanomaly "${args[@]}"

@@ -1,0 +1,16 @@
+# Exercise the datasource-auth Secret mount + file-referenced credential
+# rendering (bearer here; basic/mtls render the analogous *_file paths).
+datasource:
+  url: http://victoriametrics.monitoring.svc:8428/
+  auth:
+    type: bearer
+    existingSecret: tsdb-credentials
+
+groups:
+  - name: ci_auth
+    priority: 1
+    queries:
+      - id: up_probe
+        promql: up
+        detectors:
+          - name: MAD

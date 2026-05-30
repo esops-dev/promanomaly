@@ -1,0 +1,6 @@
+# APIService registration with insecureSkipTLSVerify (chart still mints a
+# serving cert; the aggregation layer just doesn't verify it).
+datasource:
+  url: http://victoriametrics.monitoring.svc:8428/
+apiService:
+  insecureSkipTLSVerify: true

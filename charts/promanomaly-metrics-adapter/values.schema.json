@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://promanomaly.io/schemas/v1/metrics-adapter.values.schema.json",
+  "title": "promanomaly-metrics-adapter chart values",
+  "description": "Stable v1 schema for the opt-in Kubernetes metrics adapter chart.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["image", "datasource"],
+  "properties": {
+    "image": {
+      "type": "object",
+      "required": ["repository"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string"},
+        "pullPolicy": {"type": "string", "enum": ["Always", "IfNotPresent", "Never"]}
+      }
+    },
+    "imagePullSecrets": {"type": "array"},
+    "nameOverride": {"type": "string"},
+    "fullnameOverride": {"type": "string"},
+    "replicaCount": {"type": "integer", "minimum": 1},
+    "datasource": {
+      "type": "object",
+      "required": ["url"],
+      "properties": {
+        "url": {"type": "string", "minLength": 1},
+        "timeout": {"type": "string"},
+        "auth": {
+          "type": "object",
+          "properties": {
+            "type": {"type": "string", "enum": ["none", "bearer", "basic", "mtls"]},
+            "username": {"type": "string"},
+            "existingSecret": {"type": "string"}
+          }
+        }
+      }
+    },
+    "metrics": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$"}
+    },
+    "customResources": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "tls": {
+      "type": "object",
+      "properties": {
+        "existingSecret": {"type": "string"},
+        "caBundle": {"type": "string"}
+      }
+    },
+    "apiService": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "insecureSkipTLSVerify": {"type": "boolean"},
+        "groupPriorityMinimum": {"type": "integer", "minimum": 1},
+        "versionPriority": {"type": "integer", "minimum": 1}
+      }
+    },
+    "service": {
+      "type": "object",
+      "properties": {
+        "type": {"type": "string"},
+        "port": {"type": "integer"},
+        "targetPort": {"type": "integer"}
+      }
+    },
+    "containerPort": {"type": "integer", "minimum": 1, "maximum": 65535},
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "create": {"type": "boolean"},
+        "name": {"type": "string"}
+      }
+    },
+    "existingConfigMap": {"type": "string"},
+    "rbac": {
+      "type": "object",
+      "properties": {
+        "create": {"type": "boolean"}
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"}
+      }
+    },
+    "resources": {"type": "object"},
+    "securityContext": {"type": "object"},
+    "containerSecurityContext": {"type": "object"},
+    "podAnnotations": {"type": "object"},
+    "podLabels": {"type": "object"},
+    "nodeSelector": {"type": "object"},
+    "tolerations": {"type": "array"},
+    "affinity": {"type": "object"}
+  }
+}

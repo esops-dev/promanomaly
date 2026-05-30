@@ -31,6 +31,7 @@ import asyncio
 import json
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import click
@@ -64,6 +65,7 @@ from ._common import _coerce_param, _safe_float
 from ._cost import run_estimate_cost as _run_estimate_cost
 from ._diagnose import run_diagnose_target as _run_diagnose_target
 from ._diagnose import run_diagnose_tsdb as _run_diagnose_tsdb
+from ._generate_rules import generate_prometheus_rules as _generate_prometheus_rules
 from ._inspect import _print_inspect_text
 from ._metadata import run_metadata_lint as _run_metadata_lint
 from ._probe import (
@@ -238,6 +240,43 @@ def validate(
 # The 450+ LOC of probe logic that used to live here moved to
 # :mod:`promanomaly.cli._probe` — kept re-exported above so existing
 # monkeypatch hooks (``promanomaly.cli._run_probe``, etc.) keep working.
+
+
+@cli.command(name="generate-rules")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False),
+    required=True,
+)
+@click.option(
+    "--output",
+    "output_path",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Write the generated PrometheusRule here instead of stdout.",
+)
+@click.option(
+    "--name",
+    "rule_name",
+    default="promanomaly-generated",
+    show_default=True,
+    help="metadata.name for the generated PrometheusRule.",
+)
+def generate_rules(config_path: str, output_path: str | None, rule_name: str) -> None:
+    """Scaffold a PrometheusRule from a config (selectors filled, thresholds TODO)."""
+    try:
+        cfg = load_config(config_path)
+    except Exception as exc:
+        click.echo(f"INVALID: {exc}", err=True)
+        sys.exit(1)
+
+    manifest = _generate_prometheus_rules(cfg, name=rule_name)
+    if output_path is not None:
+        Path(output_path).write_text(manifest)
+        click.echo(f"wrote {output_path}", err=True)
+    else:
+        click.echo(manifest, nl=False)
 
 
 @cli.command(name="dry-run")
@@ -1006,6 +1045,54 @@ def diagnose_cmd(
 # longer ``python -m promanomaly.backtest`` (which still works because
 # the module retains its own entry point for Makefile use).
 cli.add_command(backtest_cmd, name="backtest")
+
+
+@cli.command(name="adapter")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(dir_okay=False, exists=True),
+    required=True,
+    help="Path to the adapter YAML configuration file.",
+)
+def adapter(config_path: str) -> None:
+    """Run the Kubernetes custom/external metrics adapter.
+
+    Serves the anomaly metrics already written to the TSDB through the
+    external.metrics.k8s.io / custom.metrics.k8s.io APIs so HPA / KEDA
+    can consume them. promanomaly stays the provider; the autoscaler
+    stays the decision-maker.
+    """
+    from ..adapter import serve_adapter  # local import: avoids uvicorn for CLI utilities
+
+    serve_adapter(config_path)
+
+
+@cli.command(name="adapter-validate")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(dir_okay=False, exists=True),
+    required=True,
+    help="Path to the adapter YAML configuration file.",
+)
+def adapter_validate(config_path: str) -> None:
+    """Validate an adapter config file (schema only)."""
+    from ..adapter import load_adapter_config
+
+    cfg = load_adapter_config(config_path)
+    click.echo(
+        json.dumps(
+            {
+                "status": "ok",
+                "listen": cfg.listen,
+                "tls": cfg.tls.enabled,
+                "metrics": cfg.metrics,
+                "custom_resources": cfg.custom_resources,
+            },
+            indent=2,
+        )
+    )
 
 
 @cli.group()

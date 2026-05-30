@@ -1,0 +1,32 @@
+apiVersion: v2
+name: promanomaly-metrics-adapter
+description: |
+  Opt-in Kubernetes external/custom metrics adapter for promanomaly. A
+  stateless aggregated apiserver that re-serves the anomaly metrics the
+  detector already wrote to the TSDB through external.metrics.k8s.io /
+  custom.metrics.k8s.io, so existing HPA and KEDA tooling can consume
+  anomaly signal like any other metric. promanomaly stays the metrics
+  provider; the autoscaler stays the decision-maker.
+
+  Off by default — install this chart only when you intend to scale or
+  gate on anomaly signal, and read the guard-rails in the README first
+  (scaling raw on anomaly_score AMPLIFIES incidents).
+type: application
+icon: https://raw.githubusercontent.com/esops-dev/promanomaly/main/.github/logo.png
+home: https://github.com/esops-dev/promanomaly
+sources:
+  - https://github.com/esops-dev/promanomaly
+maintainers:
+  - name: promanomaly maintainers
+    url: https://github.com/esops-dev/promanomaly
+keywords:
+  - prometheus
+  - anomaly-detection
+  - kubernetes
+  - autoscaling
+  - hpa
+  - keda
+# Chart and app versions are placeholders intentionally — the release
+# pipeline rewrites both at tag time.
+version: 0.0.0
+appVersion: "0.0.0"

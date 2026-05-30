@@ -1,0 +1,30 @@
+{{- if .Values.apiService.enabled }}
+{{- $caBundle := "" }}
+{{- if not .Values.apiService.insecureSkipTLSVerify }}
+{{- $caBundle = include "adapter.caBundle" . }}
+{{- end }}
+{{- range $group := list "external.metrics.k8s.io" "custom.metrics.k8s.io" }}
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.{{ $group }}
+  labels: {{- include "adapter.labels" $ | nindent 4 }}
+spec:
+  service:
+    name: {{ include "adapter.fullname" $ }}
+    namespace: {{ $.Release.Namespace }}
+    port: {{ $.Values.service.port }}
+  group: {{ $group }}
+  version: v1beta1
+  {{- if $.Values.apiService.insecureSkipTLSVerify }}
+  insecureSkipTLSVerify: true
+  {{- else if $caBundle }}
+  caBundle: {{ $caBundle }}
+  {{- else }}
+  insecureSkipTLSVerify: true
+  {{- end }}
+  groupPriorityMinimum: {{ $.Values.apiService.groupPriorityMinimum }}
+  versionPriority: {{ $.Values.apiService.versionPriority }}
+{{- end }}
+{{- end }}

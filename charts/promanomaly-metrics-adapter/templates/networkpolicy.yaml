@@ -1,0 +1,23 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "adapter.fullname" . }}
+  labels: {{- include "adapter.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "adapter.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # The aggregation layer reaches the adapter through the kube-apiserver,
+    # which is host-networked, so ingress can't be pinned to a pod
+    # selector. Restrict to the serving port instead.
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.containerPort }}
+  egress:
+    # Allow the adapter to reach the TSDB and DNS.
+    - {}
+{{- end }}

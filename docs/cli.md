@@ -8,6 +8,7 @@ promanomaly ships with a small, focused set of CLI commands for validation, test
 |---------------------|---------|
 | (default)           | Start the production server |
 | `validate`          | Validate config (optionally probe datasource) |
+| `generate-rules`    | Scaffold a PrometheusRule from a config (selectors filled, thresholds TODO) |
 | `dry-run`           | Validate + run one full detection cycle, then exit |
 | `detect-once`       | Run one detector on an ad-hoc PromQL query |
 | `analyze`           | Offline change-point analysis over historical data |
@@ -17,8 +18,10 @@ promanomaly ships with a small, focused set of CLI commands for validation, test
 | `top`               | List the currently-firing series, ranked by severity |
 | `warmup`            | Report which series are still warming up, with an ETA to readiness |
 | `diagnose`          | Flag mis-tuned detectors (never-fires, fires-often, stuck warming, empty) |
+| `adapter`           | Run the Kubernetes external/custom metrics adapter |
+| `adapter-validate`  | Validate an adapter config file (schema only) |
 
-All commands accept `--log-level`. `--config` is required only for server, `validate`, and `dry-run`.
+All commands accept `--log-level`. `--config` is required only for server, `validate`, `generate-rules`, and `dry-run`.
 
 ## `validate`
 
@@ -49,6 +52,28 @@ One `{"status": "lint", ...}` JSON line per finding (`group`, `query`, `metric`,
 ### `--estimate-cost` output
 
 One JSON line per group plus a summary line. Per group: `projected_series` (worst case at `safety.max_series_per_query`), `short_queries_per_refresh`, `discovery_probe_queries_per_refresh`, `stratified_baseline_queries_per_day`, `estimated_memory_bytes`, and `estimated_cpu_cores`. The summary aggregates the totals and flags `over_budget` against `safety.max_total_series`. The CPU figure is anchored to the documented "~10k series at a 1-minute refresh on one 1-CPU replica" model — an order-of-magnitude sizing aid, not a benchmark. Pairs with `--probe` (which confirms the queries actually return data); see [production-checklist.md](production-checklist.md).
+
+## `generate-rules`
+
+Scaffolds a `PrometheusRule` manifest from a config so you don't hand-copy `id`/`group` label sets. Emits one `AnomalyOutsideThreshold`-style alert per group/query with the selectors already filled in, plus the global `max`-ensemble recording-rule fallback (`anomaly_outside_threshold_any`) described in [patterns.md](patterns.md). Groups that set an `ensemble:` block also get an ensemble-agreement alert.
+
+```bash
+promanomaly generate-rules --config config.yaml                 # to stdout
+promanomaly generate-rules --config config.yaml --output rules.yaml
+promanomaly generate-rules --config config.yaml --name my-team-anomalies
+```
+
+Severities, `for:` windows, and any runbook links are emitted as clearly-marked `# TODO` placeholders — the project ships **no opinionated thresholds**, so this is scaffolding, not a recommendation. Each alert gets a unique, descriptive name (derived from group + query id) so the file is duplicate-rule-lint clean (`promtool check rules`) and each alert is individually routable / silenceable in Alertmanager. Discover-templated query ids can't be pinned to a single literal `id=`, so those alerts scope by `group` only and carry a note to narrow the selector once the expansions are known.
+
+The intended workflow pairs with the GitOps validation Action: **generate, edit the `TODO`s, validate, commit.**
+
+**Flags**
+
+| Flag                | Default                | Description |
+|---------------------|------------------------|-------------|
+| `--config <path>`   | required               | Path to YAML config |
+| `--output <path>`   | stdout                 | Write the manifest to a file instead of stdout |
+| `--name <name>`     | `promanomaly-generated`| `metadata.name` for the generated PrometheusRule |
 
 ## `dry-run`
 
@@ -227,3 +252,14 @@ promanomaly diagnose --target http://localhost:9092
 | `--timeout <s>`     | 30      | HTTP timeout |
 
 Pure analysis, no persisted state. Pairs with `backtest` (precision/recall on injected anomalies) and `calibrate-buckets` (stratified bucketing) to close the tuning loop. Parity with `promforecast diagnose`.
+
+## `adapter`
+
+Run the Kubernetes external/custom metrics adapter — a separate, stateless process from the detector that re-serves the anomaly metrics already in the TSDB through `external.metrics.k8s.io` / `custom.metrics.k8s.io`, so HPA and KEDA can consume anomaly signal. It is normally deployed via the [`promanomaly-metrics-adapter`](../charts/promanomaly-metrics-adapter/) chart, which generates this config and wires the serving TLS + APIService registrations. See [adapter.md](adapter.md) for the full surface and the autoscaling guard-rails.
+
+```bash
+promanomaly adapter --config adapter.yaml
+promanomaly adapter-validate --config adapter.yaml   # schema only
+```
+
+The adapter takes its **own** config file (datasource, listen address, serving TLS, the metric allow-list). It shares the datasource auth shapes (`none`/`bearer`/`basic`/`mtls`) with the detector. `adapter-validate` checks the schema and prints the resolved listen address, TLS state, and exposed metrics — suitable as a CI pre-deploy gate.

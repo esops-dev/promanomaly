@@ -41,6 +41,7 @@ from .logging import configure_logging, get_logger
 from .runner import Runner
 from .selftest import run_selftest
 from .server import build_app as _build_app
+from .sinks import Sink, build_sinks
 from .source import PromQLSource, QueryResult
 from .state import SnapshotStore
 from .telemetry import Telemetry
@@ -81,6 +82,11 @@ class Application:
             telemetry=self._telemetry,
         )
         self._exporter = Exporter(self._store, self._ops, self._source)
+        # Optional push sinks (remote_write / grafana_annotations) running
+        # alongside the always-on /metrics exporter. Empty when pull-only.
+        # Started in startup(); swapped on reload only when the sink config
+        # actually changed.
+        self._sinks: list[Sink] = build_sinks(config, self._ops)
         self._scheduler: AsyncIOScheduler | None = None
         # Anchor background tasks so the GC can't drop them mid-run.
         self._background: set[asyncio.Task[Any]] = set()
@@ -123,6 +129,8 @@ class Application:
     # ------------------------------------------------------------------
     async def startup(self) -> None:
         await self._source.start()
+        for sink in self._sinks:
+            await sink.start()
         self._scheduler = AsyncIOScheduler()
         self._reschedule_jobs(self._scheduler)
         self._scheduler.start()
@@ -147,6 +155,8 @@ class Application:
         if self._scheduler is not None:
             self._scheduler.shutdown(wait=False)
             self._scheduler = None
+        for sink in self._sinks:
+            await sink.aclose()
         await self._source.close()
         # Shut down the runner's thread pool so pending detector
         # invocations don't outlive the process. wait=False mirrors the
@@ -192,6 +202,7 @@ class Application:
 
             self._runner.replace_config(new_config)
             self._source.replace_cache(_build_query_cache(new_config, self._redis))
+            await self._swap_sinks(new_config)
             self._config = new_config
             self._stamp_config_hash(new_config)
             if self._scheduler is not None:
@@ -287,13 +298,21 @@ class Application:
             # ``_on_stopped_leading``: once demotion has flipped
             # ``_is_leader`` under the lock, any task waiting here on
             # the same lock observes the new value and skips the publish.
-            if result.succeeded and self._ha is not None:
+            if result.succeeded:
                 snapshot = self._store.get(group_name)
                 if snapshot is not None:
-                    lock = self._ensure_publish_lock()
-                    async with lock:
-                        if not self._ha_enabled or self._is_leader:
-                            self._ha.snapshot_cache.publish(snapshot)
+                    if self._ha is not None:
+                        lock = self._ensure_publish_lock()
+                        async with lock:
+                            if not self._ha_enabled or self._is_leader:
+                                self._ha.snapshot_cache.publish(snapshot)
+                    # Push to the configured sinks. In HA mode only the
+                    # leader emits, so a snapshot is pushed once per
+                    # cluster. A brief duplicate during failover is
+                    # harmless (remote-write samples and Grafana
+                    # annotations are effectively idempotent).
+                    if self._sinks and (not self._ha_enabled or self._is_leader):
+                        await self._emit_to_sinks(snapshot)
         finally:
             if task is not None:
                 tasks = self._running_group_tasks.get(group_name)
@@ -301,6 +320,41 @@ class Application:
                     tasks.discard(task)
                     if not tasks:
                         self._running_group_tasks.pop(group_name, None)
+
+    async def _swap_sinks(self, new_config: Config) -> None:
+        """Rebuild the push sinks on reload only when their config changed.
+
+        Comparing the effective sink lists avoids churning the httpx
+        clients (and resetting the Grafana-annotations transition
+        baselines) on reloads that don't touch the sinks. A genuine change
+        closes the old sinks and starts the new ones; resetting the
+        baselines on a real change is the safe direction — already-firing
+        series re-baseline silently rather than replaying as fresh
+        annotations.
+        """
+        if new_config.effective_sinks() == self._config.effective_sinks():
+            return
+        for sink in self._sinks:
+            await sink.aclose()
+        self._sinks = build_sinks(new_config, self._ops)
+        for sink in self._sinks:
+            await sink.start()
+
+    async def _emit_to_sinks(self, snapshot: Any) -> None:
+        """Push a snapshot to every configured sink with an outer safety net.
+
+        Concrete sinks already swallow and count their own failures
+        (the "never blocks /metrics or readiness" contract), so this
+        guard only catches programming errors that escape that net; it
+        must never let one sink's fault propagate into the scheduler task
+        or starve a later sink — each emit is isolated.
+        """
+        for sink in self._sinks:
+            try:
+                await sink.emit(snapshot)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.exception("sink_emit_failed", sink=sink.name, error=str(exc))
+                self._ops.sink_failures_total.labels(sink=sink.name, reason="exception").inc()
 
     async def _selftest_tick(self) -> None:
         # Leader-gated like ``_tick``: the self-test fires on every replica

@@ -53,6 +53,15 @@ otel = [
     "opentelemetry-sdk>=1.27.0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.27.0",
 ]
+# Push sinks (remote_write / grafana_annotations). Only the remote-write
+# sink needs an extra dependency: ``cramjam`` provides the snappy block
+# compression the remote-write 1.0 spec mandates, as a wheel-distributed
+# Rust binding with no system libsnappy. Install with
+# ``pip install promanomaly[sinks]`` when configuring ``sink:``. The
+# WriteRequest protobuf is hand-encoded, so no ``protobuf`` / ``protoc``.
+sinks = [
+    "cramjam>=2.8.0",
+]
 dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
@@ -70,6 +79,9 @@ dev = [
     # with the dev extras means ``uv sync --all-extras`` covers both
     # single-replica and HA test paths.
     "kubernetes>=31.0.0",
+    # Snappy compression for the remote-write sink test suite; matches
+    # the ``sinks`` extra so ``uv sync --all-extras`` exercises it.
+    "cramjam>=2.8.0",
 ]
 
 [project.scripts]
@@ -124,6 +136,7 @@ module = [
     "kubernetes.*",
     "fakeredis.*",
     "opentelemetry.*",
+    "cramjam.*",
 ]
 ignore_missing_imports = true
 

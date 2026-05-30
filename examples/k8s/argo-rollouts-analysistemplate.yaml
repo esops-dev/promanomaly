@@ -1,0 +1,95 @@
+# Argo Rollouts AnalysisTemplate — anomaly-gated progressive delivery.
+#
+# This is the strongest fit for promanomaly in the reaction space: use the
+# Cohort detector to compare the *canary* pods against the cohort of
+# *stable* pods, and FAIL the rollout when the new version's golden
+# signals look anomalous relative to its peers. No static thresholds to
+# maintain — "different from the fleet" is the signal.
+#
+# How it works:
+#   1. promanomaly runs a Cohort detector over a per-pod golden signal
+#      (e.g. error rate or p95 latency), with the pod's role
+#      (canary|stable) carried as a label. See the cohort example config.
+#   2. Argo Rollouts runs this AnalysisTemplate during the canary steps.
+#   3. The metric queries promanomaly's anomaly output for the CANARY
+#      pods. If a canary pod is outside threshold relative to the cohort,
+#      the analysis fails and Argo aborts/rolls back.
+#
+# Argo Rollouts' Prometheus provider talks to the TSDB directly, so no
+# metrics adapter is needed for this path.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: anomaly-cohort-gate
+  namespace: workloads
+spec:
+  args:
+    - name: service-name
+    - name: canary-role
+      value: canary
+  metrics:
+    - name: canary-cohort-anomaly
+      # GUARD-RAIL: require several consecutive clean measurements before
+      # promoting, and tolerate no anomalous readings. interval * count
+      # should cover at least one promanomaly refresh_interval.
+      interval: 1m
+      count: 5
+      # Fail the analysis if the canary is anomalous relative to the
+      # cohort even once: failureLimit 0 means a single firing aborts.
+      failureLimit: 0
+      successCondition: result == 0
+      failureCondition: result > 0
+      provider:
+        prometheus:
+          address: http://victoriametrics.monitoring.svc:8428
+          # Count canary series that the Cohort detector flagged as
+          # outside threshold. anomaly_outside_threshold is 0/1 per
+          # series; summing over canary pods yields the number of
+          # canary pods diverging from the stable cohort right now.
+          query: |
+            sum(
+              anomaly_outside_threshold{
+                group="{{args.service-name}}_cohort",
+                detector="Cohort",
+                role="{{args.canary-role}}"
+              }
+            )
+            or vector(0)
+---
+# Wiring snippet: reference the template from a Rollout's canary strategy.
+# (Trimmed to the analysis wiring — keep your own replicas/template/etc.)
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: orders-api
+  namespace: workloads
+spec:
+  strategy:
+    canary:
+      steps:
+        - setWeight: 20
+        - pause: {duration: 2m}
+        # Run the cohort anomaly gate as a background analysis across the
+        # remaining canary steps. If a canary pod diverges from the stable
+        # cohort, the rollout aborts and rolls back automatically.
+        - analysis:
+            templates:
+              - templateName: anomaly-cohort-gate
+            args:
+              - name: service-name
+                value: orders_api
+        - setWeight: 50
+        - pause: {duration: 2m}
+        - setWeight: 100
+  selector:
+    matchLabels:
+      app: orders-api
+  template:
+    metadata:
+      labels:
+        app: orders-api
+    spec:
+      containers:
+        - name: orders-api
+          image: ghcr.io/example/orders-api:latest

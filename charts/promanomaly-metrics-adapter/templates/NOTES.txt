@@ -1,0 +1,27 @@
+promanomaly-metrics-adapter is installed.
+
+The adapter serves anomaly signal through the Kubernetes metrics APIs:
+
+  external.metrics.k8s.io/v1beta1   (recommended for autoscaling)
+  custom.metrics.k8s.io/v1beta1
+
+Verify the API is registered and answering:
+
+  kubectl get apiservices | grep metrics.k8s.io
+  kubectl get --raw "/apis/external.metrics.k8s.io/v1beta1" | jq .
+
+Query a metric (cluster-scoped external metric example):
+
+  kubectl get --raw \
+    "/apis/external.metrics.k8s.io/v1beta1/namespaces/{{ .Release.Namespace }}/anomaly_density?labelSelector=group%3Dqueue_depths" | jq .
+
+GUARD-RAILS — read before wiring an autoscaler:
+
+  * Scale on anomaly_density (e.g. "add workers when the backlog is
+    anomalously deep"), gated on anomaly_confidence_score and
+    anomaly_duration_seconds.
+  * Do NOT scale raw on anomaly_score — it AMPLIFIES incidents.
+  * Always pair an anomaly-driven scaler with a reactive fallback HPA.
+
+Worked KEDA / HPA / Argo Rollouts recipes (with the guard-rails baked
+in) live in examples/k8s/ in the promanomaly repository.

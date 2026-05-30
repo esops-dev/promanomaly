@@ -53,6 +53,24 @@ Example alert:
   for: 5m
 ```
 
+## Scaffolding Rules From Your Config
+
+Rather than hand-copying `id`/`group` label sets into alert rules, generate
+a starting-point `PrometheusRule` straight from your config:
+
+```bash
+promanomaly generate-rules --config config.yaml --output rules.yaml
+```
+
+It emits one outside-threshold alert per group/query with the selectors
+pre-filled, plus the global `max`-ensemble recording-rule fallback
+(`anomaly_outside_threshold_any = max by (id, group) (anomaly_outside_threshold)`)
+— the recording-rule equivalent of an `ensemble: { method: max }` block, for
+operators who don't use the built-in `ensemble:`. Severities, `for:` windows,
+and runbook links are left as `# TODO` placeholders (the project ships no
+opinionated thresholds). The generated file is `promtool check rules` clean.
+See [cli.md](cli.md#generate-rules).
+
 ## Flap Suppression
 
 Use the standard alert `for:` clause:
