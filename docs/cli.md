@@ -19,10 +19,11 @@ promanomaly ships with a small, focused set of CLI commands for validation, test
 | `warmup`            | Report which series are still warming up, with an ETA to readiness |
 | `diagnose`          | Flag mis-tuned detectors (never-fires, fires-often, stuck warming, empty) |
 | `timeline`          | Post-incident anomaly timeline over a historical window |
+| `migrate-config`    | Upgrade config across schema/apiVersion changes |
 | `adapter`           | Run the Kubernetes external/custom metrics adapter |
 | `adapter-validate`  | Validate an adapter config file (schema only) |
 
-All commands accept `--log-level`. `--config` is required only for server, `validate`, `generate-rules`, and `dry-run`.
+All commands accept `--log-level`. `--config` is required only for server, `validate`, `generate-rules`, `dry-run`, and `migrate-config`.
 
 ## `validate`
 
@@ -277,6 +278,23 @@ promanomaly timeline --from -24h --output json
 | `--timeout`        | `30s`                      | Datasource HTTP timeout |
 
 Each event carries: `time`, `time_rfc3339`, `kind` (`anomaly` or `change_point`), `id`, `group`, `detector`, `detector_instance`, and `severity` (when available). Events are sorted by ascending time; ties break by kind then `id` for a deterministic order.
+
+## `migrate-config`
+
+Upgrades a config file (or directory of fragments) across `apiVersion` changes. Idempotent: running on an already-current config is a no-op.
+
+```bash
+promanomaly migrate-config --config config.yaml              # write in place
+promanomaly migrate-config --config config.yaml --dry-run    # print diff
+promanomaly migrate-config --config config.d/                # directory of fragments
+```
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--config` | (required) | Path to the YAML config file or directory to migrate |
+| `--dry-run` | `false` | Print a unified diff of the changes without writing |
+
+Migrations are registered per schema revision. Currently supported: `promanomaly.io/v1alpha1` to `promanomaly.io/v1` (apiVersion rewrite only). A migrated config produces identical output metrics to the original.
 
 ## `adapter`
 

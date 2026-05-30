@@ -43,9 +43,46 @@
         "auth": {
           "type": "object",
           "properties": {
-            "type": {"type": "string", "enum": ["none", "bearer", "basic", "mtls"]},
+            "type": {"type": "string", "enum": ["none", "bearer", "basic", "mtls", "sigv4", "gcp", "azure", "oauth2"]},
             "username": {"type": "string"},
-            "existingSecret": {"type": "string"}
+            "existingSecret": {"type": "string"},
+            "sigv4": {
+              "type": "object",
+              "properties": {
+                "region": {"type": "string"},
+                "profile": {"type": "string"}
+              }
+            },
+            "gcp": {
+              "type": "object",
+              "properties": {
+                "credentials_file": {"type": "string"}
+              }
+            },
+            "azure": {
+              "type": "object",
+              "properties": {
+                "client_id": {"type": "string"},
+                "tenant_id": {"type": "string"},
+                "existingSecret": {"type": "string"}
+              }
+            },
+            "oauth2": {
+              "type": "object",
+              "properties": {
+                "token_url": {"type": "string"},
+                "client_id": {"type": "string"},
+                "existingSecret": {"type": "string"},
+                "scopes": {"type": "array", "items": {"type": "string"}}
+              }
+            }
+          }
+        },
+        "tenant": {
+          "type": "object",
+          "properties": {
+            "id": {"type": "string"},
+            "header": {"type": "string"}
           }
         }
       }

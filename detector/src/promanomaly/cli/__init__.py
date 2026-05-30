@@ -88,9 +88,9 @@ from ._top import _print_top_text
 @click.option(
     "--config",
     "config_path",
-    type=click.Path(dir_okay=False),
+    type=click.Path(),
     default=None,
-    help="Path to the YAML configuration file.",
+    help="Path to the YAML configuration file or directory of fragments.",
 )
 @click.option(
     "--log-level",
@@ -116,7 +116,7 @@ def cli(ctx: click.Context, config_path: str | None, log_level: str) -> None:
 @click.option(
     "--config",
     "config_path",
-    type=click.Path(exists=True, dir_okay=False),
+    type=click.Path(exists=True),
     required=True,
 )
 @click.option(
@@ -284,7 +284,7 @@ def generate_rules(config_path: str, output_path: str | None, rule_name: str) ->
 @click.option(
     "--config",
     "config_path",
-    type=click.Path(exists=True, dir_okay=False),
+    type=click.Path(exists=True),
     required=True,
 )
 def dry_run(config_path: str) -> None:
@@ -296,6 +296,7 @@ def dry_run(config_path: str) -> None:
             cfg.datasource.url,
             cfg.datasource.timeout_seconds,
             auth=cfg.datasource.auth,
+            tenant=cfg.datasource.tenant,
         )
         store = SnapshotStore()
         ops = OperationalMetrics()
@@ -316,6 +317,7 @@ def dry_run(config_path: str) -> None:
                     )
                 )
         finally:
+            await runner.close_tenant_sources()
             await source.close()
         return 0
 
@@ -1158,6 +1160,60 @@ def diagnose_cmd(
         click.echo(json.dumps(report.to_dict(), indent=2, sort_keys=True))
     else:
         click.echo(render_report(report), nl=False)
+
+
+@cli.command(name="migrate-config")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True),
+    required=True,
+    help="Path to the YAML config file or directory to migrate.",
+)
+@click.option(
+    "--dry-run",
+    "dry_run",
+    is_flag=True,
+    default=False,
+    help="Print a unified diff of the changes without writing.",
+)
+def migrate_config(config_path: str, dry_run: bool) -> None:
+    """Upgrade a config across schema/apiVersion changes in place.
+
+    Reads a config at any supported ``apiVersion``, applies the
+    registered forward-migrations, and writes the upgraded document.
+    Idempotent: running it on an already-current config is a no-op.
+    With ``--dry-run``, prints a unified diff instead of writing.
+    """
+    from ..migrate import migrate_directory, migrate_file
+
+    p = Path(config_path)
+    if p.is_dir():
+        results = migrate_directory(p, dry_run=dry_run)
+        if not results:
+            click.echo("all configs are already at the current version")
+            return
+        for fpath, output, changes in results:
+            click.echo(f"--- {fpath} ---")
+            for change in changes:
+                click.echo(f"  {change}")
+            if dry_run and output:
+                click.echo(output)
+    else:
+        try:
+            output, changes = migrate_file(p, dry_run=dry_run)
+        except (ValueError, OSError) as exc:
+            click.echo(f"error: {exc}", err=True)
+            sys.exit(1)
+        if not changes:
+            click.echo("config is already at the current version")
+            return
+        for change in changes:
+            click.echo(f"  {change}")
+        if dry_run and output:
+            click.echo(output)
+        elif not dry_run:
+            click.echo(f"migrated {config_path}")
 
 
 # Register the backtest command imported from promanomaly.backtest so

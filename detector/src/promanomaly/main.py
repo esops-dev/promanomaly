@@ -67,6 +67,7 @@ class Application:
             timeout=config.datasource.timeout_seconds,
             auth=config.datasource.auth,
             cache=_build_query_cache(config, self._redis),
+            tenant=config.datasource.tenant,
         )
         # OpenTelemetry tracing — built from config exactly once at boot.
         # Reload swaps in a fresh Telemetry via ``Runner._telemetry`` only
@@ -158,6 +159,7 @@ class Application:
         for sink in self._sinks:
             await sink.aclose()
         await self._source.close()
+        await self._runner.close_tenant_sources()
         # Shut down the runner's thread pool so pending detector
         # invocations don't outlive the process. wait=False mirrors the
         # scheduler behaviour: in-flight detection runs are abandoned
@@ -201,7 +203,31 @@ class Application:
                 return False, f"validation failed: {exc}"
 
             self._runner.replace_config(new_config)
-            self._source.replace_cache(_build_query_cache(new_config, self._redis))
+            # Close stale tenant sources — the runner will lazily create
+            # new ones on the next group run with the new config's tenants.
+            await self._runner.close_tenant_sources()
+            # Rebuild the main source if the datasource config changed
+            # (url, auth, timeout, or tenant). A simple cache swap is
+            # not enough: the tenant header, auth hooks, and timeout are
+            # baked into the httpx client at construction time. Comparing
+            # the full model catches credential rotations, timeout
+            # changes, and any other field change.
+            old_ds = self._config.datasource
+            new_ds = new_config.datasource
+            if old_ds != new_ds:
+                await self._source.close()
+                self._source = PromQLSource(
+                    base_url=new_ds.url,
+                    timeout=new_ds.timeout_seconds,
+                    auth=new_ds.auth,
+                    cache=_build_query_cache(new_config, self._redis),
+                    tenant=new_ds.tenant,
+                )
+                await self._source.start()
+                self._runner._source = self._source
+                self._runner._stratified.replace_source(self._source)
+            else:
+                self._source.replace_cache(_build_query_cache(new_config, self._redis))
             await self._swap_sinks(new_config)
             self._config = new_config
             self._stamp_config_hash(new_config)

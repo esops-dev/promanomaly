@@ -30,7 +30,7 @@ datasource:
   url: http://victoria-metrics-single-server:8428/
   timeout: 10s
   auth:
-    type: none          # none | bearer | basic | mtls
+    type: none          # none | bearer | basic | mtls | sigv4 | gcp | azure | oauth2
     username: ""        # basic-auth username (not sensitive; the password
                         # comes from existingSecret)
     # Secret carrying the credential, mounted as files and referenced by
@@ -38,7 +38,35 @@ datasource:
     #   bearer -> token
     #   basic  -> password   (username above)
     #   mtls   -> ca.crt, tls.crt, tls.key
+    #   oauth2 -> client_secret
     existingSecret: ""
+    # AWS SigV4 signing for Amazon Managed Service for Prometheus.
+    # Only consulted when type: sigv4.
+    sigv4:
+      region: ""
+      profile: ""       # optional AWS CLI profile name
+    # Google Cloud auth for Google Managed Prometheus.
+    # Only consulted when type: gcp.
+    gcp:
+      credentials_file: ""  # path to service-account JSON key; empty = ADC
+    # Azure auth for Azure Monitor managed Prometheus.
+    # Only consulted when type: azure.
+    azure:
+      client_id: ""
+      tenant_id: ""
+      existingSecret: ""  # Secret with a `client_secret` key
+    # Generic OAuth2 client-credentials grant.
+    # Only consulted when type: oauth2.
+    oauth2:
+      token_url: ""
+      client_id: ""
+      existingSecret: ""  # Secret with a `client_secret` key
+      scopes: []
+  # Multi-tenant datasource support (Mimir / Cortex). Sets a tenant
+  # header on every PromQL request. Overridable per group.
+  tenant:
+    id: ""              # tenant ID (e.g. "team-a"); empty = disabled
+    header: X-Scope-OrgID
 
 # Reload endpoint protection. The shipped NetworkPolicy denies ingress
 # to /-/reload and the debug endpoints by default; auth is defence in

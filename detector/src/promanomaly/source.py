@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from .cache import TTLCache
-from .config import AuthConfig
+from .config import AuthConfig, TenantConfig
 from .httpauth import build_httpx_auth
 
 # Shared connection pool sized for the typical 10k-series workload. The
@@ -89,12 +89,14 @@ class PromQLSource:
         timeout: float,
         auth: AuthConfig | None = None,
         cache: TTLCache[tuple[str, float, float, int, int], QueryResult] | None = None,
+        tenant: TenantConfig | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._auth = auth or AuthConfig()
         self._client: httpx.AsyncClient | None = None
         self._cache = cache
+        self._tenant = tenant
 
     @property
     def cache(self) -> TTLCache[tuple[str, float, float, int, int], QueryResult] | None:
@@ -122,7 +124,13 @@ class PromQLSource:
             "base_url": self._base_url,
             "limits": _HTTP_LIMITS,
         }
-        kwargs.update(build_httpx_auth(self._auth))
+        auth_kwargs = build_httpx_auth(self._auth)
+        # Merge tenant header into any existing headers from auth.
+        if self._tenant:
+            existing_headers = auth_kwargs.get("headers", {})
+            existing_headers[self._tenant.header] = self._tenant.id
+            auth_kwargs["headers"] = existing_headers
+        kwargs.update(auth_kwargs)
         self._client = httpx.AsyncClient(**kwargs)
 
     async def close(self) -> None:
@@ -165,8 +173,13 @@ class PromQLSource:
             # ZeroDivisionError.
             step = float(step_seconds) if step_seconds > 0 else 1e-6
             bucket = int(end // step)
+            # Include tenant in the cache key so two sources with different
+            # tenants sharing the same cache backend (e.g. Redis) never
+            # collide. The tenant prefix is prepended to the promql string
+            # to keep the key tuple shape unchanged.
+            tenant_prefix = f"[{self._tenant.header}:{self._tenant.id}]" if self._tenant else ""
             cache_key = (
-                promql,
+                tenant_prefix + promql,
                 float(window_seconds),
                 float(step_seconds),
                 int(max_series or 0),
