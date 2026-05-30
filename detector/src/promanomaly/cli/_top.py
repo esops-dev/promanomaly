@@ -35,11 +35,39 @@ def _print_lint_hints(payload: dict[str, Any]) -> None:
     click.echo("")
 
 
+def _print_blast_radius(payload: dict[str, Any]) -> None:
+    rows = payload.get("blast_radius") or []
+    if not rows:
+        return
+    click.echo("")
+    click.echo("blast radius:")
+    header = (
+        f"  {'SCOPE':<8}  {'GROUP':<16}  {'FIRING':>7}"
+        f"  {'TOTAL':>7}  {'FRAC':>6}  {'MAX DUR':>7}  COHORT"
+    )
+    click.echo(header)
+    for r in rows:
+        cohort = ""
+        if r.get("cohort_label"):
+            key_repr = ",".join(f"{k}={v}" for k, v in sorted((r.get("cohort_key") or {}).items()))
+            cohort = f"{r['cohort_label']} {{{key_repr}}}" if key_repr else r["cohort_label"]
+        click.echo(
+            f"  {r.get('scope', ''):<8}  "
+            f"{r.get('group', ''):<16}  "
+            f"{r.get('firing', 0):>7}  "
+            f"{r.get('total', 0):>7}  "
+            f"{r.get('fraction', 0.0):>5.0%}  "
+            f"{_format_duration(r.get('max_co_firing_seconds', 0.0)):>7}  "
+            f"{cohort}"
+        )
+
+
 def _print_top_text(payload: dict[str, Any]) -> None:
     _print_lint_hints(payload)
     anomalies = payload.get("anomalies", [])
     if not anomalies:
         click.echo("no firing anomalies")
+        _print_blast_radius(payload)
         return
     header = f"{'SEV':>5}  {'SCORE':>8}  {'DUR':>6}  {'TYPE':<16}  {'GROUP':<16}  ID / LABELS"
     click.echo(header)
@@ -63,6 +91,7 @@ def _print_top_text(payload: dict[str, Any]) -> None:
             f"{a.get('group', ''):<16}  "
             f"{id_repr}"
         )
+    _print_blast_radius(payload)
 
 
 __all__ = ["_print_top_text"]

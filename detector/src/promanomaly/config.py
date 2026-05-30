@@ -774,6 +774,35 @@ class EnsembleConfig(_ModelBase):
 AutoSelect = bool | Literal["explicit_plus_best"]
 
 
+class RecurrenceConfig(_ModelBase):
+    """Opt-in recurrence-pattern analysis for a group.
+
+    When enabled, the runner queries the TSDB for historical
+    ``anomaly_outside_threshold`` and emits a 7x24 day-of-week x
+    hour-of-day firing-rate heatmap as ``anomaly_recurrence_score``.
+    The analysis runs at most once per ``refresh_interval`` (default
+    ``1h``) — not on every group refresh — because the 4-week lookback
+    makes frequent re-queries wasteful.
+    """
+
+    enabled: bool = False
+    lookback: Duration = "4w"
+    step: Duration = "1h"
+    refresh_interval: Duration = "1h"
+
+    @property
+    def lookback_seconds(self) -> float:
+        return parse_duration(self.lookback)
+
+    @property
+    def step_seconds(self) -> float:
+        return parse_duration(self.step)
+
+    @property
+    def refresh_interval_seconds(self) -> float:
+        return parse_duration(self.refresh_interval)
+
+
 class GroupConfig(_ModelBase):
     name: PromName
     priority: int = 1
@@ -781,6 +810,7 @@ class GroupConfig(_ModelBase):
     ensemble: EnsembleConfig | None = None
     auto_select: AutoSelect = False
     auto_select_interval: Duration = "24h"
+    recurrence: RecurrenceConfig = Field(default_factory=RecurrenceConfig)
 
     @property
     def auto_select_interval_seconds(self) -> float:
