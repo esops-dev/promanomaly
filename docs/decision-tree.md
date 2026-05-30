@@ -56,6 +56,17 @@ Note: both stratified detectors bucket in UTC. If your team thinks in a
 non-UTC timezone, bucket boundaries won't align with local "midnight" or
 local "Monday morning" — see `docs/detectors.md` for the caveat.
 
+Seasonal signal with occasional outliers?
+├── Want robust outlier test on the residual → SeasonalHybridESD
+└── Want trend + seasonal decomposition on dashboards → STLResidualMAD (requires `[seasonal]`)
+
+Mean is stable but distribution shape changes (variance, tails, bimodality)?
+├── Raw time series → DistributionShift (KS/Wasserstein two-sample test)
+└── Prometheus histogram buckets → HistogramDistributionShift
+
+Anomaly is a *wrong shape* (missing ramp, irregular waveform)?
+└── Yes → MatrixProfile (requires `[matrixprofile]`). Set `m` to one cycle length.
+
 Breaks on deploys or rolling restarts?
 └── Yes → BOCPD (probabilistic) or CUSUM (sigma-multiplier). See `change-points.md`.
 
@@ -65,6 +76,10 @@ Comparing identical instances (nodes, pods, replicas)?
     cohort itself. Pair with explicit detector selection (not `auto_select`)
     because the synthetic-injection calibration cycle is single-series-shaped
     and can't score a cross-member detector — see `docs/detectors.md`.
+
+Want an unsupervised ML detector with a different inductive bias?
+└── Yes → IsolationForest (community extra: `pip install promanomaly-iforest`).
+    Refits per window, nothing persisted.
 
 Cannot decide between MAD / Hampel / IQR for a given series?
 └── Yes → set `auto_select: true` on the group and let the calibration cycle choose per series (see `docs/auto-select.md`).

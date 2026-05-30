@@ -31,6 +31,19 @@ COPY --from=builder /wheels /wheels
 RUN pip install --no-cache-dir --no-index --find-links=/wheels 'promanomaly[ha,sinks]' && \
     rm -rf /wheels
 
+# Optional detector extras — uncomment to include in the image:
+#
+#   [seasonal]      — STLResidualMAD detector (statsmodels)
+#   [matrixprofile]  — MatrixProfile detector (stumpy + numba)
+#
+# Or extend this image in your own Dockerfile:
+#   FROM ghcr.io/esops-dev/promanomaly:latest
+#   RUN pip install --no-cache-dir 'promanomaly[seasonal,matrixprofile]'
+#
+# Community detectors (e.g. promanomaly-iforest) are installed the
+# same way:
+#   RUN pip install --no-cache-dir promanomaly-iforest
+
 USER promanomaly:promanomaly
 
 EXPOSE 9092

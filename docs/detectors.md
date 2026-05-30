@@ -623,6 +623,224 @@ on a `sum`/`avg`-aggregated query, or skip Cohort entirely).
 See [`patterns.md`](patterns.md) for composing Cohort output with
 other detectors via PromQL joins on `(id, group, instance)`.
 
+## DistributionShift — Two-Sample Distribution Shift
+
+```yaml
+detectors:
+  - name: DistributionShift
+    params:
+      split: 0.5         # default
+      statistic: ks       # default
+```
+
+**What it catches.** Variance and distribution-shape changes that
+mean-based detectors miss: latency distributions widening, a bimodal
+split emerging, a variance regime change. Compares the recent
+sub-window's distribution against the preceding baseline sub-window
+using a two-sample statistical test.
+
+**What it misses.**
+- Pure level shifts with the same distribution shape — `MAD` /
+  `CUSUM` / `BOCPD` catch those.
+- Point outliers — the two-sample test needs enough recent samples
+  to characterise the distribution; a single spike won't shift the
+  KS statistic enough. Use `MAD` / `Hampel` for point spikes.
+
+**How to tune.**
+- `split` (default `0.5`) — fraction of the window used as the
+  recent sub-window. `0.5` splits the window in half; `0.3` uses
+  the last 30% as recent and the first 70% as baseline.
+- `statistic` (default `"ks"`) — two-sample test to use:
+  - `"ks"` (Kolmogorov-Smirnov) — score is `-log10(p_value)`, so a
+    p-value of 0.001 maps to score 3.0 (consistent with the default
+    `alert_thresholds.score`).
+  - `"wasserstein"` — Wasserstein (earth mover's) distance,
+    normalised by the baseline MAD.
+  - `"energy"` — energy distance variant, same normalisation.
+
+**When to choose it.** Signals where the mean is stable but the
+*shape* changes — latency distributions, request-size distributions,
+any metric where variance or tail behaviour is the anomaly.
+
+**When *not* to choose it.** Level shifts (use `CUSUM` / `BOCPD`),
+point outliers (use `MAD` / `Hampel`), or histogram-bucketed metrics
+(use `HistogramDistributionShift`).
+
+## HistogramDistributionShift — Histogram Bucket Distribution Shift
+
+```yaml
+detectors:
+  - name: HistogramDistributionShift
+    params:
+      split: 0.5         # default
+      statistic: ks       # default
+      n_samples: 200      # default
+```
+
+**What it catches.** Shifts in the *distribution across Prometheus
+histogram buckets* — a p99 latency tail fattening while the median
+holds, a bimodal split emerging. Uses the same two-sample machinery
+as `DistributionShift` (KS/Wasserstein over the bucket CDF),
+normalised to the shared score scale.
+
+The simple "anomaly on p95/p99" case stays a cookbook recipe using
+`histogram_quantile()` in the source query — this detector is
+specifically for *whole-distribution* shape, not a single quantile.
+
+**What it misses.**
+- Single-quantile shifts (use `histogram_quantile()` in the source
+  query with a scalar detector).
+- Non-histogram signals — falls back to raw-value distribution
+  shift, but `DistributionShift` is the better choice for those.
+
+**How to tune.**
+- `split` (default `0.5`) — fraction of timestamps used as the
+  recent window.
+- `statistic` (default `"ks"`) — `"ks"` or `"wasserstein"`.
+- `n_samples` (default `200`) — synthetic samples drawn from each
+  CDF for the two-sample test. Higher = more stable p-values.
+
+**When to choose it.** HTTP latency, request-size, or error
+distributions exposed as Prometheus histograms where the anomaly is a
+shape shift, not a level shift.
+
+**When *not* to choose it.** Scalar metrics (use
+`DistributionShift`), single-quantile monitoring (use
+`histogram_quantile()` in the source query).
+
+## SeasonalHybridESD — Seasonal-Hybrid Extreme Studentized Deviate
+
+```yaml
+detectors:
+  - name: SeasonalHybridESD
+    params:
+      period: 24          # default
+      max_anomalies: 10   # default
+      alpha: 0.05         # default
+```
+
+**What it catches.** Outliers on strongly seasonal signals —
+median-based seasonal decomposition plus generalised ESD on the
+residual. A well-trodden, robust seasonal-anomaly method.
+
+**This is still baseline detection, not forecasting.** It scores
+residuals against historical structure; it does not predict future
+values.
+
+**What it misses.**
+- Non-seasonal signals — the decomposition produces noisy residuals
+  and the ESD fires randomly. Use `MAD` / `Hampel` for flat signals.
+- Regime shifts in the seasonal pattern itself — the median-based
+  decomposition drags old structure. Use `BOCPD` for that case.
+
+**How to tune.**
+- `period` (default `24`) — samples per seasonal cycle. For hourly
+  buckets on a daily pattern, this is 24.
+- `max_anomalies` (default `10`) — maximum number of anomalies the
+  ESD pass searches for.
+- `alpha` (default `0.05`) — significance level for the ESD test.
+
+**When to choose it.** Strongly seasonal signals where you want
+robust outlier detection that doesn't false-fire on the daily shape.
+More powerful than `HourOfDayMAD` for detecting subtle outliers in
+seasonal residuals; lighter than a full STL decomposition.
+
+**When *not* to choose it.** Flat signals (use `MAD`), or signals
+where you want the trend/seasonal components exposed on dashboards
+(use `STLResidualMAD`).
+
+### SeasonalHybridESD vs STLResidualMAD
+
+| Aspect | SeasonalHybridESD | STLResidualMAD |
+|---|---|---|
+| Decomposition | Median-based (fast) | STL / LOESS (heavier) |
+| Outlier test | Generalised ESD | MAD on residual |
+| Dependency | scipy (base) | statsmodels (optional) |
+| Baseline bands | No | Yes |
+| Best for | Seasonal + outlier detection | Seasonal decomposition + dashboards |
+
+## STLResidualMAD — STL Decomposition + MAD on Residual
+
+```yaml
+detectors:
+  - name: STLResidualMAD
+    params:
+      period: 24          # default
+      robust: true        # default
+```
+
+**What it catches.** Anomalies on seasonal signals, scored by MAD on
+the STL residual. Lighter than Seasonal-Hybrid ESD: robust residual
+scoring without the ESD machinery. Optionally emits the trend +
+seasonal components as `anomaly_baseline` for dashboard overlay.
+
+**This is still baseline detection, not forecasting.** It decomposes
+the present window; it does not predict future values.
+
+**Requires `statsmodels`.** Install with
+`pip install promanomaly[seasonal]` (or `pip install statsmodels`).
+
+**What it misses.**
+- Non-seasonal signals — residuals will be noisy. Use `MAD`.
+- Point spikes that don't survive STL's robust LOESS — the trend
+  absorbs them. Use `MAD` or `Hampel` alongside.
+
+**How to tune.**
+- `period` (default `24`) — samples per seasonal cycle.
+- `robust` (default `true`) — use robust fitting so outliers don't
+  contaminate the decomposition.
+
+**When to choose it.** Seasonal signals where you want the
+trend/seasonal decomposition visible on dashboards, and a simple
+residual-MAD score. The baseline bands include the seasonal +
+trend structure.
+
+**When *not* to choose it.** Non-seasonal signals (use `MAD`), or
+when you want a statistical test on the residual rather than raw MAD
+(use `SeasonalHybridESD`).
+
+## MatrixProfile — Shape / Subsequence Discord
+
+```yaml
+detectors:
+  - name: MatrixProfile
+    params:
+      m: 24               # default
+```
+
+**What it catches.** *Wrong shape* anomalies — a missing daily ramp,
+an irregular waveform — rather than level or point outliers. Computes
+the matrix profile over the rolling window at subsequence length `m`;
+the latest subsequence's distance to its nearest neighbour (the
+"discord" distance) is the score, normalised by the median profile
+distance.
+
+**Requires `stumpy`.** Install with
+`pip install promanomaly[matrixprofile]` (or `pip install stumpy`).
+Given the heavier compute and dependency, this ships as an optional
+extra.
+
+**What it misses.**
+- Point spikes — a single sample can't form a meaningful
+  subsequence. Use `MAD` / `Hampel`.
+- Level shifts with the same shape — if the waveform is identical
+  but higher, the z-normalised matrix profile won't catch it. Use
+  `CUSUM` / `BOCPD`.
+
+**How to tune.**
+- `m` (default `24`) — subsequence length. Should roughly match one
+  cycle of the expected pattern (e.g. 24 for hourly samples on a
+  daily cycle). Too small = noise; too large = slow and
+  insensitive.
+
+**When to choose it.** Signals with a repeating pattern where the
+anomaly is "the shape is wrong" — a missing periodic ramp, an
+irregular waveform, a gap in an expected cycle.
+
+**When *not* to choose it.** Point outliers (use `MAD`), level shifts
+(use `CUSUM`), or non-periodic signals where shape isn't the
+discriminant (use `MAD` / `Hampel` / `IQR`).
+
 ## Auto-select Best Detector Per Series
 
 ```yaml

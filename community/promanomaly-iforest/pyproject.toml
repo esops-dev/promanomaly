@@ -1,0 +1,66 @@
+[project]
+name = "promanomaly-iforest"
+version = "0.0.0"
+description = "Stateless Isolation-Forest anomaly detector for promanomaly."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{ name = "promanomaly maintainers" }]
+keywords = ["prometheus", "anomaly-detection", "isolation-forest", "promanomaly"]
+
+# ``promanomaly`` is the host detector service — we register against
+# its entry-point group. ``scikit-learn`` provides the Isolation Forest
+# implementation. Operators install with
+# ``pip install promanomaly promanomaly-iforest``.
+dependencies = [
+    "promanomaly",
+    "scikit-learn>=1.4",
+    "pandas>=2.2.3",
+    "numpy>=2.1.0",
+]
+
+[project.optional-dependencies]
+# The test suite stubs ``sklearn`` so contributors who don't want to
+# install the heavy dependency can still run tests. The dev extras
+# don't pull ``scikit-learn`` itself for the same reason — CI uses
+# the same stubbed path.
+dev = [
+    "pytest>=8.3.0",
+    "ruff>=0.7.0",
+    "mypy>=1.13.0",
+]
+
+[project.entry-points."promanomaly.detectors"]
+IsolationForest = "promanomaly_iforest.detector:IsolationForest"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/promanomaly_iforest"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "RUF", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["promanomaly_iforest"]
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = ["sklearn.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -27,7 +27,7 @@ import pandas as pd
 from .base import ParamSpec
 
 try:
-    from scipy.special import gammaln as _scipy_gammaln  # type: ignore[import-untyped]
+    from scipy.special import gammaln as _scipy_gammaln
 except ImportError:
     _scipy_gammaln = None
 

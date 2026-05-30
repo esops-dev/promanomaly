@@ -1,0 +1,75 @@
+# Seasonal anomaly detection example.
+#
+# Detects outliers on strongly seasonal signals using SeasonalHybridESD
+# (median-based decomposition + ESD) and STLResidualMAD (STL + MAD on
+# residual). Both are baseline detectors — they score the present
+# against historical structure, they do not predict future values.
+#
+# STLResidualMAD requires the [seasonal] extra:
+#   pip install promanomaly[seasonal]
+
+apiVersion: promanomaly.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 10s
+
+server:
+  listen: ":9092"
+  refresh_interval: 1m
+
+safety:
+  max_series_per_query: 500
+  max_total_series: 5000
+  on_source_failure: serve_stale
+
+defaults:
+  window: 6h
+  step: 15s
+  min_points: 60
+  warmup_policy: emit_warming_up
+  emit_baseline: true
+  emit_duration: true
+  alert_thresholds:
+    score: 3.0
+
+groups:
+  - name: seasonal_traffic
+    priority: 10
+    queries:
+      # Seasonal-Hybrid ESD: median-based decomposition + generalised
+      # ESD on the residual. Works with scipy (base install), no
+      # optional extras needed.
+      - id: request_rate_seasonal
+        promql: sum(rate(http_requests_total[5m]))
+        detectors:
+          - name: SeasonalHybridESD
+            params:
+              period: 24         # 24 samples per cycle (hourly at 15m step)
+              max_anomalies: 10  # default
+              alpha: 0.05        # 5% significance level
+
+      # STL-residual MAD: STL decomposition + MAD on residual. Emits
+      # trend + seasonal components as baseline for dashboard overlay.
+      # Requires statsmodels: pip install promanomaly[seasonal]
+      - id: request_rate_stl
+        promql: sum(rate(http_requests_total[5m]))
+        detectors:
+          - name: STLResidualMAD
+            params:
+              period: 24
+              robust: true       # robust fitting against outliers
+
+  - name: seasonal_with_changepoint
+    priority: 5
+    queries:
+      # Compose seasonal detection with change-point detection:
+      # SeasonalHybridESD catches "this phase is anomalous"; CUSUM
+      # catches a regime shift the seasonal baseline would absorb.
+      - id: batch_throughput
+        promql: sum(rate(batch_processed_total[5m]))
+        detectors:
+          - name: SeasonalHybridESD
+            params:
+              period: 24
+          - name: CUSUM

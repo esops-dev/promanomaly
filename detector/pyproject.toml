@@ -20,6 +20,11 @@ dependencies = [
     "PyYAML>=6.0.2",
     "numpy>=2.1.0",
     "pandas>=2.2.3",
+    # scipy for the built-in distribution-shift and seasonal-ESD
+    # detectors (KS test, Wasserstein distance, t-distribution
+    # critical values). Kept in the base install because these are
+    # built-in detectors that should work out of the box.
+    "scipy>=1.12.0",
     # Redis-backed query + snapshot cache, used in HA mode and any
     # time ``safety.query_cache.backend=redis``. Kept in the base
     # install because the client itself is small (~50KB) and most HA
@@ -62,6 +67,17 @@ otel = [
 sinks = [
     "cramjam>=2.8.0",
 ]
+# STL-residual detector via statsmodels. Heavy (~30MB) and only consumed
+# when the STLResidualMAD detector is configured; install with
+# ``pip install promanomaly[seasonal]``.
+seasonal = [
+    "statsmodels>=0.14.0",
+]
+# Matrix-profile (discord) shape detector via stumpy. Heavier compute
+# and dependency; install with ``pip install promanomaly[matrixprofile]``.
+matrixprofile = [
+    "stumpy>=1.12.0",
+]
 dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
@@ -82,6 +98,13 @@ dev = [
     # Snappy compression for the remote-write sink test suite; matches
     # the ``sinks`` extra so ``uv sync --all-extras`` exercises it.
     "cramjam>=2.8.0",
+    # STL decomposition for STLResidualMAD test suite; matches the
+    # ``seasonal`` extra so ``uv sync --all-extras`` exercises it.
+    "statsmodels>=0.14.0",
+    # stumpy is NOT included in dev extras because it depends on numba /
+    # llvmlite which may not build on the latest Python. MatrixProfile
+    # tests stub stumpy entirely. Install ``[matrixprofile]`` explicitly
+    # on a supported Python version to exercise the real path.
 ]
 
 [project.scripts]
@@ -97,6 +120,11 @@ DayOfWeekMAD = "promanomaly.detectors.day_of_week_mad:DayOfWeekMAD"
 BOCPD = "promanomaly.detectors.bocpd:BOCPD"
 CUSUM = "promanomaly.detectors.cusum:CUSUM"
 Cohort = "promanomaly.detectors.cohort:Cohort"
+DistributionShift = "promanomaly.detectors.distribution_shift:DistributionShift"
+HistogramDistributionShift = "promanomaly.detectors.histogram_distribution_shift:HistogramDistributionShift"
+SeasonalHybridESD = "promanomaly.detectors.seasonal_hybrid_esd:SeasonalHybridESD"
+STLResidualMAD = "promanomaly.detectors.stl_residual_mad:STLResidualMAD"
+MatrixProfile = "promanomaly.detectors.matrix_profile:MatrixProfile"
 
 [build-system]
 requires = ["hatchling"]
@@ -137,6 +165,9 @@ module = [
     "fakeredis.*",
     "opentelemetry.*",
     "cramjam.*",
+    "statsmodels.*",
+    "stumpy.*",
+    "scipy.*",
 ]
 ignore_missing_imports = true
 
