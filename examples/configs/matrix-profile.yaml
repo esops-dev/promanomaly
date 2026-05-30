@@ -1,0 +1,61 @@
+# Matrix-profile (shape anomaly) detection example.
+#
+# Detects "wrong shape" anomalies — a missing daily ramp, an irregular
+# waveform, a gap in an expected cycle — that level/point detectors
+# miss. Pairs MatrixProfile with MAD for full coverage.
+#
+# Requires the [matrixprofile] extra:
+#   pip install promanomaly[matrixprofile]
+
+apiVersion: promanomaly.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 10s
+
+server:
+  listen: ":9092"
+  refresh_interval: 1m
+
+safety:
+  max_series_per_query: 200
+  max_total_series: 2000
+  on_source_failure: serve_stale
+
+defaults:
+  window: 6h
+  step: 15s
+  min_points: 60
+  warmup_policy: emit_warming_up
+  emit_baseline: true
+  emit_duration: true
+  alert_thresholds:
+    score: 3.0
+
+groups:
+  - name: pattern_anomalies
+    priority: 10
+    ensemble:
+      method: max
+    queries:
+      # Daily traffic ramp: MatrixProfile catches a missing or
+      # distorted ramp; MAD catches point spikes. The ensemble fires
+      # on either.
+      - id: daily_traffic
+        promql: sum(rate(http_requests_total[5m]))
+        detectors:
+          - name: MatrixProfile
+            params:
+              m: 24            # one daily cycle at 15m-step resolution
+          - name: MAD
+
+      # Batch job waveform: the job runs a predictable pattern every
+      # cycle. MatrixProfile detects when the pattern breaks.
+      - id: batch_waveform
+        promql: avg(rate(batch_processed_total[5m]))
+        alert_thresholds:
+          score: 4.0           # shape anomalies benefit from a higher threshold
+        detectors:
+          - name: MatrixProfile
+            params:
+              m: 48            # two-cycle subsequence for extra stability

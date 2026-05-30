@@ -197,6 +197,117 @@ sum by (id, group) (
 
 Do NOT silence change-point alerts during deploys inside the detector — fire on the change-point in Prometheus, silence in Alertmanager during the deploy window via webhooks. Damping scores during deploys hides the failure modes operators most need to see.
 
+## Distribution-Shift + Quantile Monitoring
+
+For latency signals, combine whole-distribution shift detection with
+per-quantile outlier detection. The distribution shift catches shape
+changes the quantile misses; the quantile catches spikes the
+distribution smears.
+
+```yaml
+queries:
+  - id: latency_distribution
+    promql: rate(http_request_duration_seconds_bucket{service="api"}[5m])
+    detectors:
+      - name: HistogramDistributionShift
+
+  - id: latency_p99
+    promql: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket{service="api"}[5m]))
+    detectors:
+      - name: MAD
+```
+
+Alert when the distribution is shifting OR p99 is anomalous:
+
+```promql
+anomaly_outside_threshold{id="latency_distribution"} == 1
+  or on (group) anomaly_outside_threshold{id="latency_p99"} == 1
+```
+
+For raw (non-histogram) signals where variance is the anomaly, use
+`DistributionShift` directly:
+
+```yaml
+queries:
+  - id: response_time_shape
+    promql: http_request_duration_seconds{quantile="0.5"}
+    detectors:
+      - name: DistributionShift
+        params:
+          statistic: ks
+      - name: MAD
+```
+
+## Seasonal Outlier + Change-Point Composition
+
+Layer seasonal decomposition on top of change-point detection for
+signals with strong periodicity that also experience regime shifts:
+
+```yaml
+queries:
+  - id: traffic
+    promql: sum(rate(http_requests_total[5m]))
+    detectors:
+      - name: SeasonalHybridESD
+        params:
+          period: 24
+      - name: CUSUM
+```
+
+The seasonal detector catches "this hour is anomalous given prior
+same-phase observations"; CUSUM catches a regime shift the seasonal
+baseline would slowly absorb. Alert recipes:
+
+```promql
+# Seasonal outlier (ESD residual is extreme).
+anomaly_outside_threshold{detector="SeasonalHybridESD"} == 1
+
+# Regime shift on a seasonal signal.
+anomaly_outside_threshold{detector="CUSUM"} == 1
+  and on (id, group) anomaly_outside_threshold{detector="SeasonalHybridESD"} == 0
+```
+
+The second rule says "the regime shifted but the seasonal detector
+hasn't noticed yet" — exactly the window where the operator needs to
+look.
+
+## Shape Anomaly Detection
+
+MatrixProfile catches "wrong shape" anomalies that level/point
+detectors miss. Compose with MAD for full coverage:
+
+```yaml
+queries:
+  - id: batch_pattern
+    promql: avg(rate(batch_processed_total[5m]))
+    detectors:
+      - name: MatrixProfile
+        params:
+          m: 24              # one daily cycle at hourly resolution
+      - name: MAD
+    ensemble:
+      method: max
+```
+
+MatrixProfile scores the latest subsequence's discord distance; MAD
+catches point outliers. The `max` ensemble fires when either
+detector sees an anomaly.
+
+For signals where the shape is the primary concern and point spikes
+are noise, use MatrixProfile alone and raise `alert_thresholds.score`:
+
+```yaml
+queries:
+  - id: daily_ramp
+    promql: ...
+    alert_thresholds:
+      score: 4.0
+    detectors:
+      - name: MatrixProfile
+        params:
+          m: 48              # two-cycle subsequence for extra stability
+```
+
 ## Cross-Tool: promforecast + promanomaly
 
 ```promql

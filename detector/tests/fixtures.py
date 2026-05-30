@@ -99,5 +99,55 @@ def variance_shift(
     return _frame(values)
 
 
+def periodic_spike(
+    n: int = 240,
+    mean: float = 10.0,
+    noise: float = 0.1,
+    spike: float = 10.0,
+    period: int = 60,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """Recurring anomaly at a regular cadence."""
+    rng = np.random.default_rng(seed)
+    values = mean + rng.normal(0.0, noise, size=n)
+    for i in range(period - 1, n, period):
+        values[i] = mean + spike
+    return _frame(values)
+
+
+def diurnal(
+    n: int = 240,
+    mean: float = 10.0,
+    amplitude: float = 5.0,
+    noise: float = 0.2,
+    period: int = 24,
+    anomaly_phase: int | None = None,
+    anomaly_magnitude: float = 10.0,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """Clean periodic signal with optional anomaly at one phase."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(n)
+    values = mean + amplitude * np.sin(2 * np.pi * t / period) + rng.normal(0.0, noise, size=n)
+    if anomaly_phase is not None:
+        values[anomaly_phase] += anomaly_magnitude
+    return _frame(values)
+
+
+def gap_window(
+    n: int = 120,
+    mean: float = 10.0,
+    noise: float = 0.1,
+    gap_start: int = 50,
+    gap_end: int = 70,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """A window of missing data (NaN) inside the lookback."""
+    rng = np.random.default_rng(seed)
+    values = mean + rng.normal(0.0, noise, size=n)
+    values[gap_start:gap_end] = np.nan
+    return _frame(values)
+
+
 def short_window(n: int = 5, mean: float = 10.0) -> pd.DataFrame:
     return _frame(np.full(n, mean))

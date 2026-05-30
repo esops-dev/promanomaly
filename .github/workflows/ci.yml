@@ -120,6 +120,42 @@ jobs:
       - name: pytest
         run: pytest -q
 
+  community-iforest:
+    name: Community IsolationForest (lint + test with sklearn stubbed)
+    # scikit-learn is a large dependency. The detector itself only
+    # exercises ``IsolationForest(...).fit(...).score_samples(...)``,
+    # so we lint + test against a tiny sklearn stub (tests/conftest.py)
+    # without installing the real thing.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: community/promanomaly-iforest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install host detector + community package (editable)
+        run: |
+          python -m pip install --upgrade pip
+          # Install promanomaly first so the community detector can
+          # import ParamSpec; then install the community package without
+          # its sklearn dependency (the tests stub it out).
+          pip install -e ../../detector
+          pip install --no-deps -e .
+          pip install pytest ruff mypy pandas pandas-stubs numpy
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: mypy --strict
+        run: mypy --strict src
+
+      - name: pytest
+        run: pytest -q
+
   chart-lint:
     name: Lint Helm charts
     runs-on: ubuntu-latest

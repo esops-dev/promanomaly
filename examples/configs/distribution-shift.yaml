@@ -1,0 +1,71 @@
+# Distribution-shift detection example.
+#
+# Detects variance and distribution-shape changes on latency signals —
+# tail fattening, bimodal splits, volatility regime changes — that
+# mean-based detectors miss. Pairs DistributionShift (raw series) and
+# HistogramDistributionShift (histogram buckets) with MAD for full
+# coverage.
+
+apiVersion: promanomaly.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 10s
+
+server:
+  listen: ":9092"
+  refresh_interval: 1m
+
+safety:
+  max_series_per_query: 500
+  max_total_series: 5000
+  on_source_failure: serve_stale
+
+defaults:
+  window: 1h
+  step: 15s
+  min_points: 60
+  warmup_policy: emit_warming_up
+  emit_baseline: true
+  emit_duration: true
+  alert_thresholds:
+    score: 3.0
+
+groups:
+  - name: latency_distribution
+    priority: 10
+    ensemble:
+      method: max
+    queries:
+      # Whole-distribution shape shift on histogram buckets.
+      # Catches p99 tail fattening while the median holds, bimodal
+      # splits emerging, and other shape changes that single-quantile
+      # detectors miss entirely.
+      - id: request_latency_distribution
+        promql: rate(http_request_duration_seconds_bucket{service="api"}[5m])
+        detectors:
+          - name: HistogramDistributionShift
+            params:
+              split: 0.5       # default — half baseline, half recent
+              statistic: ks    # KS test; try "wasserstein" for earth-mover distance
+
+      # Per-quantile outlier detection on p99 — complements the
+      # distribution-shift detector for single-point spikes.
+      - id: request_latency_p99
+        promql: histogram_quantile(0.99, rate(http_request_duration_seconds_bucket{service="api"}[5m]))
+        detectors:
+          - name: MAD
+
+  - name: error_rate_variance
+    priority: 5
+    queries:
+      # Variance/shape change on a raw (non-histogram) signal.
+      # The error rate's mean stays stable but its spread widens —
+      # a sign that something intermittent is going wrong.
+      - id: error_rate_shape
+        promql: sum by (service) (rate(http_requests_total{status=~"5.."}[5m]))
+        detectors:
+          - name: DistributionShift
+            params:
+              statistic: ks
+          - name: MAD
