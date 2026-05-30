@@ -59,6 +59,7 @@ class Hampel:
             type_="int",
             default=3,
             doc="Half-width of the local sub-window; sub-window spans 2*t0 + 1 points.",
+            minimum=1,
         ),
         ParamSpec(
             name="recursive_trim",
@@ -78,6 +79,7 @@ class Hampel:
                 "Local-MAD-units cutoff used by recursive_trim to drop "
                 "contaminating points from the second-pass baseline."
             ),
+            minimum=0.0,
         ),
     )
 

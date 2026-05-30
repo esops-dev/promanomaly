@@ -237,22 +237,30 @@ def collect_blast_radius(store: SnapshotStore) -> list[BlastRadiusRow]:
     # breach is read from the same series that is firing.
     durations: dict[tuple[tuple[str, str], ...], float] = {}
 
+    # Deferred outside-threshold samples: we need durations (populated in
+    # the same pass) before computing max breach, so these are buffered
+    # and replayed after the single pass over all snapshots.
+    deferred_outside: list[tuple[dict[str, str], float]] = []
+
+    # Single pass over all snapshots — collects durations, rollup gauges,
+    # warming-up markers, and outside-threshold samples in one traversal
+    # instead of three separate loops.
     for snap in store.all_snapshots():
         for sample in snap.samples:
-            labels = dict(sample.labels)
-            grp = labels.get("group", "")
             metric = sample.metric
             if metric == "anomaly_duration_seconds":
+                labels = dict(sample.labels)
                 durations[_detector_key(labels)] = sample.value
-            elif metric == "anomaly_active_series" and set(labels) == {"group"}:
-                group_active[grp] = sample.value
-            elif metric == "anomaly_density" and set(labels) == {"group"}:
-                group_density[grp] = sample.value
-
-    for snap in store.all_snapshots():
-        for sample in snap.samples:
-            labels = dict(sample.labels)
-            if sample.metric == "anomaly_warming_up" and sample.value >= 1.0:
+            elif metric == "anomaly_active_series":
+                labels = dict(sample.labels)
+                if set(labels) == {"group"}:
+                    group_active[labels.get("group", "")] = sample.value
+            elif metric == "anomaly_density":
+                labels = dict(sample.labels)
+                if set(labels) == {"group"}:
+                    group_density[labels.get("group", "")] = sample.value
+            elif metric == "anomaly_warming_up" and sample.value >= 1.0:
+                labels = dict(sample.labels)
                 grp = labels.get("group", "")
                 ident = _series_identity(labels)
                 group_warming.setdefault(grp, set()).add(ident)
@@ -260,29 +268,30 @@ def collect_blast_radius(store: SnapshotStore) -> list[BlastRadiusRow]:
                 if axis is not None:
                     key = cohort_key_for(labels, axis)
                     cohort_warming.setdefault((grp, axis, key), set()).add(ident)
+            elif metric == "anomaly_outside_threshold":
+                labels = dict(sample.labels)
+                deferred_outside.append((labels, sample.value))
 
-    for snap in store.all_snapshots():
-        for sample in snap.samples:
-            if sample.metric != "anomaly_outside_threshold":
-                continue
-            labels = dict(sample.labels)
-            grp = labels.get("group", "")
-            ident = _series_identity(labels)
-            group_total.setdefault(grp, set()).add(ident)
-            firing_now = sample.value >= 1.0
+    # Replay the buffered outside-threshold samples now that durations
+    # are fully populated.
+    for labels, value in deferred_outside:
+        grp = labels.get("group", "")
+        ident = _series_identity(labels)
+        group_total.setdefault(grp, set()).add(ident)
+        firing_now = value >= 1.0
+        if firing_now:
+            group_firing.setdefault(grp, set()).add(ident)
+            breach = durations.get(_detector_key(labels), 0.0)
+            group_max_duration[grp] = max(group_max_duration.get(grp, 0.0), breach)
+        axis = labels.get("cohort_label")
+        if axis is not None:
+            key = cohort_key_for(labels, axis)
+            cid = (grp, axis, key)
+            cohort_total.setdefault(cid, set()).add(ident)
             if firing_now:
-                group_firing.setdefault(grp, set()).add(ident)
+                cohort_firing.setdefault(cid, set()).add(ident)
                 breach = durations.get(_detector_key(labels), 0.0)
-                group_max_duration[grp] = max(group_max_duration.get(grp, 0.0), breach)
-            axis = labels.get("cohort_label")
-            if axis is not None:
-                key = cohort_key_for(labels, axis)
-                cid = (grp, axis, key)
-                cohort_total.setdefault(cid, set()).add(ident)
-                if firing_now:
-                    cohort_firing.setdefault(cid, set()).add(ident)
-                    breach = durations.get(_detector_key(labels), 0.0)
-                    cohort_max_duration[cid] = max(cohort_max_duration.get(cid, 0.0), breach)
+                cohort_max_duration[cid] = max(cohort_max_duration.get(cid, 0.0), breach)
 
     rows: list[BlastRadiusRow] = []
 

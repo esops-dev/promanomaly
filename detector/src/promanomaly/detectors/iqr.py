@@ -45,6 +45,7 @@ class IQR:
             type_="float",
             default=1.5,
             doc="Multiplier for the IQR band. 1.5 = classical outlier; 3.0 = far outlier.",
+            minimum=0.0,
         ),
     )
 

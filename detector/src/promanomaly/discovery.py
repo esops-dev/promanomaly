@@ -138,7 +138,13 @@ def expand_query(query: QueryConfig, value_sets: dict[str, list[str]]) -> list[E
         # Don't raise — keep the run going so a stray entry doesn't
         # take production offline mid-rollout — but the warning surfaces
         # in tests and logs.
-        pass
+        import warnings
+
+        warnings.warn(
+            f"query {query.id!r}: discover variables {sorted(extra)!r} "
+            "are declared but never referenced in id or promql templates",
+            stacklevel=2,
+        )
     ordered_vars = [d.variable for d in query.discover]
     bindings_list: list[list[str]] = []
     for name in ordered_vars:
@@ -148,7 +154,7 @@ def expand_query(query: QueryConfig, value_sets: dict[str, list[str]]) -> list[E
         bindings_list.append(values)
     out: list[ExpandedQuery] = []
     for combo in itertools.product(*bindings_list):
-        binding = dict(zip(ordered_vars, combo, strict=False))
+        binding = dict(zip(ordered_vars, combo, strict=True))
         rendered_id = _render(query.id, binding)
         if not _PROM_NAME_RE.match(rendered_id):
             raise DiscoveryError(

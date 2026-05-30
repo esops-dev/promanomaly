@@ -23,11 +23,14 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import logging
 import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Monotonic counter handed out to each cache instance on construction.
 # The exporter watches ``cache.version`` to detect reload-driven cache
@@ -194,6 +197,7 @@ class RedisQueryCache[K, V]:
         try:
             count = sum(1 for _ in self._iter_keys())
         except Exception:
+            logger.debug("redis_cache_size_scan_failed", exc_info=True)
             count = self._cached_size
         with self._lock:
             self._cached_size = count
@@ -207,6 +211,7 @@ class RedisQueryCache[K, V]:
         except Exception:
             # Best-effort. A Redis outage during clear is non-fatal —
             # entries TTL out anyway.
+            logger.debug("redis_cache_clear_failed", exc_info=True)
             return
 
     def get(self, key: K, now: float) -> V | None:
@@ -215,6 +220,7 @@ class RedisQueryCache[K, V]:
         try:
             raw = self._client.get(redis_key)
         except Exception:
+            logger.debug("redis_cache_get_failed", exc_info=True)
             with self._lock:
                 self.stats.misses += 1
             return None
@@ -250,10 +256,12 @@ class RedisQueryCache[K, V]:
             # Refusing to cache an un-encodable value is preferable to
             # poisoning Redis with garbage that every reader has to
             # discover and drop.
+            logger.debug("redis_cache_encode_failed", exc_info=True)
             return
         try:
             self._client.set(redis_key, payload, ex=self._ttl)
         except Exception:
+            logger.debug("redis_cache_put_failed", exc_info=True)
             return
 
     def _encode_key(self, key: K) -> str:

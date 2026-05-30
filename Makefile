@@ -145,10 +145,6 @@ dev-up-load: ## Start the full demo stack: minimum + http-demo + loadgen + Grafa
 dev-down: ## Stop the local dev stack (any profile).
 	docker compose -f docker-compose.dev.yml --profile load down -v
 
-.PHONY: load-test
-load-test: ## Synthetic high-cardinality run for safety-control validation.
-	cd $(DETECTOR) && $(UV) run python -m promanomaly.scripts.load_test
-
 # ---------- Aggregate ----------
 
 .PHONY: ci

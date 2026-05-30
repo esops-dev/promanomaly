@@ -500,6 +500,151 @@ promanomaly diagnose --target http://localhost:9092
 
 Pure analysis, no persisted state; pairs with `backtest` and `calibrate-buckets` to close the tuning loop. See [`cli.md`](cli.md) for the full flag reference.
 
+## Cloud-Managed Datasource Authentication
+
+When metrics live in a managed Prometheus-compatible backend (Amazon Managed Service for Prometheus, Google Managed Prometheus, Azure Monitor), `datasource.auth.type` supports four cloud-native auth modes alongside the existing `bearer` / `basic` / `mtls`:
+
+| Type | Backend | Credential source |
+|------|---------|-------------------|
+| `sigv4` | Amazon Managed Service for Prometheus | Standard AWS credential chain (instance/pod role, env, shared config) |
+| `gcp` | Google Managed Prometheus / Cloud Monitoring | Application Default Credentials / Workload Identity |
+| `azure` | Azure Monitor managed Prometheus | `DefaultAzureCredential` (Managed Identity, Workload Identity, az-cli) |
+| `oauth2` | Any backend with a token endpoint | Client-credentials grant against a configurable `token_url` |
+
+Each cloud SDK ships as an optional extra so the base image stays slim:
+
+```bash
+pip install promanomaly[aws]    # sigv4
+pip install promanomaly[gcp]    # gcp
+pip install promanomaly[azure]  # azure
+```
+
+A missing SDK surfaces an actionable `ImportError` at boot rather than a cryptic failure from the source layer. Token refresh is transparent to the retry/timeout wrapper.
+
+### Worked example: Amazon Managed Service for Prometheus
+
+```yaml
+datasource:
+  url: https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-xxxxx/api/v1/
+  auth:
+    type: sigv4
+    sigv4:
+      region: us-east-1
+```
+
+### Worked example: Google Managed Prometheus
+
+```yaml
+datasource:
+  url: https://monitoring.googleapis.com/v1/projects/my-project/location/global/prometheus/
+  auth:
+    type: gcp
+    gcp: {}   # uses Application Default Credentials
+```
+
+### Worked example: Azure Monitor
+
+```yaml
+datasource:
+  url: https://my-monitor.eastus.prometheus.monitor.azure.com/
+  auth:
+    type: azure
+    azure:
+      client_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+      tenant_id: "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+      client_secret_file: /etc/promanomaly-datasource-auth/client_secret
+```
+
+### Worked example: Generic OAuth2
+
+```yaml
+datasource:
+  url: https://metrics.example.com/
+  auth:
+    type: oauth2
+    oauth2:
+      token_url: https://auth.example.com/oauth2/token
+      client_id: promanomaly
+      client_secret_file: /etc/promanomaly-datasource-auth/client_secret
+      scopes:
+        - metrics:read
+```
+
+## Multi-Tenant Datasource Support
+
+For multi-tenant Mimir or Cortex backends, a `tenant` field injects the `X-Scope-OrgID` header (or a custom header) on every PromQL request:
+
+```yaml
+datasource:
+  url: http://mimir-query-frontend:8080/
+  tenant:
+    id: team-platform
+    header: X-Scope-OrgID   # default; configurable for non-standard backends
+```
+
+Per-group overrides let a single detector deployment query multiple tenants:
+
+```yaml
+groups:
+  - name: team_a_errors
+    tenant:
+      id: team-a
+    queries:
+      - id: error_rate
+        promql: 'rate(http_requests_total{code=~"5.."}[5m])'
+        detectors: [MAD]
+  - name: team_b_errors
+    tenant:
+      id: team-b
+    queries:
+      - id: error_rate
+        promql: 'rate(http_requests_total{code=~"5.."}[5m])'
+        detectors: [MAD]
+```
+
+The tenant value is **not** emitted as an output label by default (it is a query-side concern, not a signal-side one), keeping the cross-tool `(id, group)` join contract intact. The query-cache key includes the tenant so two tenants' identical PromQL do not collide on a cached result.
+
+## Config Composition for Multi-Team Ownership
+
+When many teams contribute detector config under GitOps, splitting the monolithic YAML into per-team fragments avoids merge conflicts. `--config` accepts a directory (or a glob) in addition to a single file:
+
+```bash
+promanomaly --config /etc/promanomaly/config.d/
+promanomaly validate --config /etc/promanomaly/config.d/
+```
+
+**Directory layout:**
+
+```
+config.d/
+  _defaults.yaml       # datasource, server, safety, defaults, exporter
+  team_platform.yaml   # groups owned by the platform team
+  team_payments.yaml   # groups owned by the payments team
+```
+
+`_defaults.yaml` carries the base settings (`datasource`, `server`, `safety`, `defaults`, `exporter`). Every other `*.yaml` fragment's `groups:` are merged in deterministic filename-sorted order. Duplicate group names across fragments are a hard validation error (not a silent last-wins).
+
+`validate`, `validate --probe`, and `--estimate-cost` all accept the directory form so CI gates work unchanged. `anomaly_config_hash` reflects the merged document.
+
+The Helm chart supports this via `existingConfigMap` pointing at a ConfigMap you manage out-of-band (Argo CD app-of-apps, Flux Kustomization).
+
+## Config Schema Migration
+
+`promanomaly migrate-config` upgrades config files across schema/apiVersion changes:
+
+```bash
+# Preview changes without writing
+promanomaly migrate-config --config config.yaml --dry-run
+
+# Apply migration in place
+promanomaly migrate-config --config config.yaml
+
+# Migrate all files in a directory
+promanomaly migrate-config --config config.d/
+```
+
+Idempotent: running on an already-current config is a no-op. Migrations are registered per schema revision so the path composes across multiple versions.
+
 ## Metadata-Aware Validation Lint
 
 `promanomaly validate --lint-metadata` queries the datasource's `/api/v1/metadata` and warns when a query feeds a raw counter to a detector without a `rate()` / `increase()` wrapper — a monotonic counter scored directly produces nonsense. Lint only (it never rewrites the query); under `--strict` any finding fails CI, and it composes with `--probe` / `--estimate-cost`. The same hint surfaces live in `inspect` and `promanomaly top --lint`. Absent metadata is treated as "no opinion", so the lint never manufactures a false positive from a metric the TSDB carries no type for. See [`cli.md`](cli.md).

@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from .cache import TTLCache
-from .config import AuthConfig
+from .config import AuthConfig, TenantConfig
 from .httpauth import build_httpx_auth
 
 # Shared connection pool sized for the typical 10k-series workload. The
@@ -89,12 +89,14 @@ class PromQLSource:
         timeout: float,
         auth: AuthConfig | None = None,
         cache: TTLCache[tuple[str, float, float, int, int], QueryResult] | None = None,
+        tenant: TenantConfig | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._auth = auth or AuthConfig()
         self._client: httpx.AsyncClient | None = None
         self._cache = cache
+        self._tenant = tenant
 
     @property
     def cache(self) -> TTLCache[tuple[str, float, float, int, int], QueryResult] | None:
@@ -122,7 +124,13 @@ class PromQLSource:
             "base_url": self._base_url,
             "limits": _HTTP_LIMITS,
         }
-        kwargs.update(build_httpx_auth(self._auth))
+        auth_kwargs = build_httpx_auth(self._auth)
+        # Merge tenant header into any existing headers from auth.
+        if self._tenant:
+            existing_headers = auth_kwargs.get("headers", {})
+            existing_headers[self._tenant.header] = self._tenant.id
+            auth_kwargs["headers"] = existing_headers
+        kwargs.update(auth_kwargs)
         self._client = httpx.AsyncClient(**kwargs)
 
     async def close(self) -> None:
@@ -132,6 +140,62 @@ class PromQLSource:
             await self._client.aclose()
         finally:
             self._client = None
+
+    async def _request_with_retry(
+        self,
+        path: str,
+        params: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        """Issue a GET with one transparent retry on transient transport errors.
+
+        The common case is a keepalive connection the TSDB (or an
+        intermediary) closed while idle between scrapes: the next request
+        on that pooled connection fails immediately and a fresh connection
+        succeeds. A single retry absorbs that blip instead of degrading the
+        whole group to serve_stale and tripping AnomalySourceFailing on a
+        harmless hiccup. Timeouts are NOT retried — under a slow TSDB a
+        retry only compounds load. HTTP error envelopes (4xx/5xx) are real
+        server responses, not transport failures, so they are checked after
+        the retry loop.
+        """
+        if self._client is None:
+            await self.start()
+        assert self._client is not None
+
+        response: httpx.Response | None = None
+        transport_exc: httpx.HTTPError | None = None
+        for _attempt in range(2):
+            try:
+                response = await self._client.get(path, params=params)
+                break
+            except httpx.TimeoutException as exc:
+                raise SourceQueryError("timeout", _exc_detail(exc)) from exc
+            except httpx.HTTPError as exc:
+                transport_exc = exc
+        if response is None:
+            assert transport_exc is not None
+            raise SourceQueryError("transport_error", _exc_detail(transport_exc)) from transport_exc
+
+        if response.status_code >= 500:
+            raise SourceQueryError("server_error", f"HTTP {response.status_code}")
+        if response.status_code >= 400:
+            raise SourceQueryError(
+                "client_error",
+                f"HTTP {response.status_code}: {response.text[:200]}",
+            )
+        return response
+
+    @staticmethod
+    def _parse_json_payload(response: httpx.Response) -> dict[str, Any]:
+        """Parse a Prometheus-API JSON envelope, raising on failure."""
+        try:
+            payload: dict[str, Any] = response.json()
+        except ValueError as exc:
+            raise SourceQueryError("invalid_response", str(exc)) from exc
+        if payload.get("status") != "success":
+            err = payload.get("error") or "unknown"
+            raise SourceQueryError("query_error", str(err))
+        return payload
 
     async def range_query(
         self,
@@ -165,8 +229,13 @@ class PromQLSource:
             # ZeroDivisionError.
             step = float(step_seconds) if step_seconds > 0 else 1e-6
             bucket = int(end // step)
+            # Include tenant in the cache key so two sources with different
+            # tenants sharing the same cache backend (e.g. Redis) never
+            # collide. The tenant prefix is prepended to the promql string
+            # to keep the key tuple shape unchanged.
+            tenant_prefix = f"[{self._tenant.header}:{self._tenant.id}]" if self._tenant else ""
             cache_key = (
-                promql,
+                tenant_prefix + promql,
                 float(window_seconds),
                 float(step_seconds),
                 int(max_series or 0),
@@ -176,10 +245,6 @@ class PromQLSource:
             if cached is not None:
                 return cached
 
-        if self._client is None:
-            await self.start()
-        assert self._client is not None
-
         start = end - window_seconds
         params = {
             "query": promql,
@@ -187,47 +252,8 @@ class PromQLSource:
             "end": f"{end:.3f}",
             "step": f"{step_seconds:.3f}",
         }
-        # One transparent retry on a transient transport error. The common
-        # case is a keepalive connection the TSDB (or an intermediary)
-        # closed while idle between scrapes: the next request on that pooled
-        # connection fails immediately and a fresh connection succeeds. A
-        # single retry absorbs that blip instead of degrading the whole
-        # group to serve_stale and tripping AnomalySourceFailing on a
-        # harmless hiccup. Timeouts are NOT retried — under a slow TSDB a
-        # retry only compounds load, and the per-query timeout already
-        # bounds the wait. HTTP error envelopes (4xx/5xx) are real server
-        # responses handled below, not transport failures, so they never
-        # reach this retry.
-        response: httpx.Response | None = None
-        transport_exc: httpx.HTTPError | None = None
-        for _attempt in range(2):
-            try:
-                response = await self._client.get("/api/v1/query_range", params=params)
-                break
-            except httpx.TimeoutException as exc:
-                raise SourceQueryError("timeout", _exc_detail(exc)) from exc
-            except httpx.HTTPError as exc:
-                transport_exc = exc
-        if response is None:
-            assert transport_exc is not None
-            raise SourceQueryError("transport_error", _exc_detail(transport_exc)) from transport_exc
-
-        if response.status_code >= 500:
-            raise SourceQueryError("server_error", f"HTTP {response.status_code}")
-        if response.status_code >= 400:
-            raise SourceQueryError(
-                "client_error",
-                f"HTTP {response.status_code}: {response.text[:200]}",
-            )
-
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise SourceQueryError("invalid_response", str(exc)) from exc
-
-        if payload.get("status") != "success":
-            err = payload.get("error") or "unknown"
-            raise SourceQueryError("query_error", str(err))
+        response = await self._request_with_retry("/api/v1/query_range", params)
+        payload = self._parse_json_payload(response)
 
         data = payload.get("data") or {}
         result = data.get("result") or []
@@ -261,27 +287,8 @@ class PromQLSource:
         dropped. Raises :class:`SourceQueryError` on a TSDB-side failure so
         the caller can report it.
         """
-        if self._client is None:
-            await self.start()
-        assert self._client is not None
-        try:
-            response = await self._client.get("/api/v1/query", params={"query": promql})
-        except httpx.TimeoutException as exc:
-            raise SourceQueryError("timeout", _exc_detail(exc)) from exc
-        except httpx.HTTPError as exc:
-            raise SourceQueryError("transport_error", _exc_detail(exc)) from exc
-        if response.status_code >= 500:
-            raise SourceQueryError("server_error", f"HTTP {response.status_code}")
-        if response.status_code >= 400:
-            raise SourceQueryError(
-                "client_error", f"HTTP {response.status_code}: {response.text[:200]}"
-            )
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise SourceQueryError("invalid_response", str(exc)) from exc
-        if payload.get("status") != "success":
-            raise SourceQueryError("query_error", str(payload.get("error") or "unknown"))
+        response = await self._request_with_retry("/api/v1/query", {"query": promql})
+        payload = self._parse_json_payload(response)
         data = payload.get("data") or {}
         result = data.get("result") or []
         rows: list[tuple[dict[str, str], float]] = []
@@ -316,23 +323,9 @@ class PromQLSource:
         Mimir / Thanos are absorbed: a malformed envelope yields ``{}``
         rather than crashing the lint.
         """
-        if self._client is None:
-            await self.start()
-        assert self._client is not None
+        response = await self._request_with_retry("/api/v1/metadata")
         try:
-            response = await self._client.get("/api/v1/metadata")
-        except httpx.TimeoutException as exc:
-            raise SourceQueryError("timeout", _exc_detail(exc)) from exc
-        except httpx.HTTPError as exc:
-            raise SourceQueryError("transport_error", _exc_detail(exc)) from exc
-        if response.status_code >= 500:
-            raise SourceQueryError("server_error", f"HTTP {response.status_code}")
-        if response.status_code >= 400:
-            raise SourceQueryError(
-                "client_error", f"HTTP {response.status_code}: {response.text[:200]}"
-            )
-        try:
-            payload = response.json()
+            payload: dict[str, Any] = response.json()
         except ValueError as exc:
             raise SourceQueryError("invalid_response", str(exc)) from exc
         data = payload.get("data") if isinstance(payload, dict) else None

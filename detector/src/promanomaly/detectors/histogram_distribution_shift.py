@@ -159,16 +159,18 @@ class HistogramDistributionShift:
             return 0.0
 
         split_idx = max(2, int(unique_ts.size * (1.0 - split)))
-        baseline_ts = set(unique_ts[:split_idx].tolist())
-        recent_ts = set(unique_ts[split_idx:].tolist())
+        baseline_ts = unique_ts[:split_idx]
+        recent_ts = unique_ts[split_idx:]
 
         # Aggregate bucket counts per window.
         unique_le = np.sort(np.unique(le_vals[np.isfinite(le_vals)]))
         if unique_le.size < 2:
             return 0.0
 
-        def _aggregate_cdf(ts_set: set[float]) -> np.ndarray[Any, Any]:
-            mask = np.array([t in ts_set for t in timestamps])
+        def _aggregate_cdf(ts_arr: np.ndarray[Any, Any]) -> np.ndarray[Any, Any]:
+            # Vectorised membership test — O(n) via numpy hashing instead
+            # of the O(n*m) Python list comprehension it replaces.
+            mask = np.isin(timestamps, ts_arr)
             agg = np.zeros(unique_le.size)
             for i, le in enumerate(unique_le):
                 bucket_mask = mask & (le_vals == le)

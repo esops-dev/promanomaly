@@ -68,6 +68,8 @@ class ZScoreEWMA:
                 "EWMA smoothing factor in (0, 1]. Smaller tracks the mean more slowly; "
                 "larger adapts faster but lets recent anomalies pollute the baseline."
             ),
+            minimum=0.0,
+            maximum=1.0,
         ),
     )
 

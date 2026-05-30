@@ -144,6 +144,10 @@ class StratifiedFetcher:
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+    def replace_source(self, new_source: PromQLSource) -> None:
+        """Swap the underlying PromQL source (e.g. on datasource reload)."""
+        self._source = new_source
+
     def replace_config(self, new_config: Config) -> None:
         """Update the config and prune state the new shape no longer owns."""
         self._config = new_config
@@ -188,6 +192,7 @@ class StratifiedFetcher:
         baseline_window_seconds: float,
         baseline_refresh_seconds: float,
         template_query: QueryConfig | None = None,
+        source: PromQLSource | None = None,
     ) -> QueryResult:
         """Sliding-window fetch for queries with a stratified detector.
 
@@ -212,13 +217,14 @@ class StratifiedFetcher:
         wipe every discover-derived cache entry (the template id never
         equals the rendered id).
         """
+        effective_source = source or self._source
         defaults = self._config.defaults
         max_series = self._config.safety.max_series_per_query
         cache_key = (group.name, query.id)
         template = template_query or query
 
         try:
-            short_result = await self._source.range_query(
+            short_result = await effective_source.range_query(
                 promql=query.promql,
                 end=end,
                 window_seconds=short_window_seconds,
@@ -250,7 +256,7 @@ class StratifiedFetcher:
         )
         if baseline_stale:
             try:
-                baseline_result = await self._source.range_query(
+                baseline_result = await effective_source.range_query(
                     promql=query.promql,
                     end=end,
                     window_seconds=baseline_window_seconds,

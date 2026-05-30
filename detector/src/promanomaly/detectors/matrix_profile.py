@@ -95,11 +95,15 @@ class MatrixProfile:
                 ]
             )
 
-        # Fill NaNs for stumpy (it can't handle them).
-        clean = values.copy()
-        nan_mask = ~np.isfinite(clean)
+        # Fill NaNs for stumpy (it can't handle them).  Copy only when
+        # NaN replacement is needed; the source array belongs to the
+        # caller's DataFrame and must not be mutated in place.
+        nan_mask = ~np.isfinite(values)
         if nan_mask.any():
+            clean = values.copy()
             clean[nan_mask] = float(np.nanmedian(values))
+        else:
+            clean = values
 
         profile = stumpy.stump(clean, m)
         # profile[:, 0] contains the nearest-neighbour distances.

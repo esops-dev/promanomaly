@@ -37,6 +37,7 @@ from .config import (
     DetectorEntry,
     GroupConfig,
     QueryConfig,
+    TenantConfig,
 )
 from .detectors import Detector, UnknownDetectorError, get
 from .detectors.cohort import (
@@ -249,6 +250,12 @@ class Runner:
         # this facade; the runner delegates to it rather than owning
         # the heavy cache state directly.
         self._stratified = StratifiedFetcher(source=source, config=config)
+        # Per-tenant source instances. When groups carry a ``tenant``
+        # override that differs from the datasource-level default, we
+        # create a dedicated PromQLSource for that tenant so the
+        # ``X-Scope-OrgID`` header is set on every request. Instances
+        # are lazily created and cached by tenant id.
+        self._tenant_sources: dict[str, PromQLSource] = {}
         # Tracks the last time recurrence analysis ran per group so it
         # doesn't execute on every group refresh (the 4-week lookback
         # makes frequent re-queries wasteful). Between refreshes, the
@@ -267,6 +274,51 @@ class Runner:
     @property
     def config(self) -> Config:
         return self._config
+
+    def _effective_tenant(self, group: GroupConfig) -> TenantConfig | None:
+        """Resolve the effective tenant for a group.
+
+        Group-level tenant overrides the datasource-level default.
+        """
+        return group.tenant or self._config.datasource.tenant
+
+    async def _source_for_group(self, group: GroupConfig) -> PromQLSource:
+        """Return the PromQLSource for a group, respecting tenant overrides.
+
+        Groups without a tenant override use the default source. Groups
+        with a per-group tenant get a dedicated source instance so the
+        tenant header is set on every request.
+        """
+        tenant = self._effective_tenant(group)
+        default_tenant = self._config.datasource.tenant
+        # If the group's effective tenant matches the default source's
+        # tenant (or both are None), use the shared source.
+        if tenant == default_tenant:
+            return self._source
+        if tenant is None:
+            return self._source
+        # Create a per-tenant source on demand.
+        cache_key = f"{tenant.header}:{tenant.id}"
+        if cache_key not in self._tenant_sources:
+            source = PromQLSource(
+                base_url=self._config.datasource.url,
+                timeout=self._config.datasource.timeout_seconds,
+                auth=self._config.datasource.auth,
+                tenant=tenant,
+            )
+            await source.start()
+            self._tenant_sources[cache_key] = source
+        return self._tenant_sources[cache_key]
+
+    async def close_tenant_sources(self) -> None:
+        """Close all per-tenant source instances.
+
+        Called from ``Application.shutdown()`` and internally from
+        ``replace_config()`` so stale tenant connections don't leak.
+        """
+        for source in self._tenant_sources.values():
+            await source.close()
+        self._tenant_sources.clear()
 
     # ------------------------------------------------------------------
     # Test-friendly accessors. The underscored attributes are
@@ -779,9 +831,10 @@ class Runner:
         (the runner treats that like an ``expect:`` empty result).
         """
         defaults = self._config.defaults
+        source = await self._source_for_group(group)
 
         async def _probe(promql: str) -> QueryResult:
-            return await self._source.range_query(
+            return await source.range_query(
                 promql=promql,
                 end=time.time(),
                 window_seconds=defaults.window_seconds,
@@ -1012,6 +1065,7 @@ class Runner:
             # with different baseline refresh intervals — fresher data
             # for everyone, at the cost of more TSDB load.
             baseline_refresh = min(refresh for _, refresh in stratified_meta)
+            group_source = await self._source_for_group(group)
             result = await self._stratified.fetch(
                 group=group,
                 query=query,
@@ -1020,9 +1074,11 @@ class Runner:
                 baseline_window_seconds=baseline_window,
                 baseline_refresh_seconds=baseline_refresh,
                 template_query=template_query or query,
+                source=group_source,
             )
         else:
-            result = await self._source.range_query(
+            source = await self._source_for_group(group)
+            result = await source.range_query(
                 promql=query.promql,
                 end=end,
                 window_seconds=short_window_seconds,
@@ -1921,7 +1977,8 @@ class Runner:
         # multi-detector inflation where N detectors scoring the same id
         # would otherwise contribute N observations per time step.
         promql = f'max by (id, group) (anomaly_outside_threshold{{group="{group.name}"}})'
-        result = await self._source.range_query(
+        source = await self._source_for_group(group)
+        result = await source.range_query(
             promql=promql,
             end=time.time(),
             window_seconds=group.recurrence.lookback_seconds,

@@ -81,8 +81,12 @@ def _generalized_esd(
     latest_flagged = False
     latest_score = 0.0
 
-    working = clean.copy()
-    working_indices = indices.copy()
+    # ``clean`` is already a fresh array from the isfinite filter;
+    # ``indices`` is from np.arange — both can be used directly without
+    # an extra copy since neither is referenced after the loop mutates
+    # ``working`` / ``working_indices`` via boolean masking.
+    working = clean
+    working_indices = indices
 
     for k in range(1, min(max_anomalies, n - 2) + 1):
         median = float(np.median(working))

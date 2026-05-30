@@ -133,8 +133,71 @@ class _ModelBase(BaseModel):
     model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
 
 
+class OAuth2Config(_ModelBase):
+    """Generic OAuth2 client-credentials grant for token-based auth.
+
+    Performs a ``client_credentials`` grant against ``token_url``, caches
+    the resulting access token, and transparently refreshes it before
+    expiry. ``client_secret`` should come from a Secret ref (mounted
+    file via ``client_secret_file``), never inlined in the ConfigMap.
+    """
+
+    token_url: str
+    client_id: str
+    client_secret: str | None = None
+    client_secret_file: str | None = None
+    scopes: list[str] = Field(default_factory=list)
+
+    def resolved_client_secret(self) -> str | None:
+        """Client secret, read from ``client_secret_file`` when set, else inline."""
+        if self.client_secret_file:
+            return _read_secret_file(self.client_secret_file)
+        return self.client_secret
+
+
+class SigV4Config(_ModelBase):
+    """AWS SigV4 request signing for Amazon Managed Service for Prometheus.
+
+    Uses the standard AWS credential chain (instance/pod role, env vars,
+    shared config). The ``region`` field is required because AMP endpoints
+    are regional.
+    """
+
+    region: str = Field(min_length=1)
+    # Optional explicit profile; omit to use the default credential chain.
+    profile: str | None = Field(default=None, min_length=1)
+
+
+class GCPAuthConfig(_ModelBase):
+    """Google Cloud auth for Google Managed Prometheus / Cloud Monitoring.
+
+    Mints and refreshes a Google access token from Application Default
+    Credentials or Workload Identity. No configuration beyond enabling
+    ``type: gcp`` is needed when running on GKE with Workload Identity.
+    """
+
+    # Optional path to a service-account JSON key file. When unset,
+    # Application Default Credentials are used (the recommended path on
+    # GKE with Workload Identity).
+    credentials_file: str | None = Field(default=None, min_length=1)
+
+
+class AzureAuthConfig(_ModelBase):
+    """Azure auth for Azure Monitor managed Prometheus.
+
+    Uses ``azure-identity`` ``DefaultAzureCredential`` by default, which
+    covers Managed Identity, Workload Identity, and az-cli fallback.
+    """
+
+    # Optional explicit client/tenant for service-principal auth.
+    # When unset, ``DefaultAzureCredential`` is used.
+    client_id: str | None = None
+    tenant_id: str | None = None
+    client_secret_file: str | None = None
+
+
 class AuthConfig(_ModelBase):
-    type: Literal["none", "bearer", "basic", "mtls"] = "none"
+    type: Literal["none", "bearer", "basic", "mtls", "sigv4", "gcp", "azure", "oauth2"] = "none"
     token: str | None = None
     username: str | None = None
     password: str | None = None
@@ -149,6 +212,27 @@ class AuthConfig(_ModelBase):
     ca_file: str | None = None
     cert_file: str | None = None
     key_file: str | None = None
+    # Cloud-managed backend auth (v1.6). Each cloud SDK ships as an
+    # optional extra ([aws], [gcp], [azure]) so the base image stays
+    # slim and a missing SDK surfaces an actionable error rather than
+    # an ImportError from the source layer.
+    sigv4: SigV4Config | None = None
+    gcp: GCPAuthConfig | None = None
+    azure: AzureAuthConfig | None = None
+    oauth2: OAuth2Config | None = None
+
+    @model_validator(mode="after")
+    def _validate_cloud_auth_block(self) -> AuthConfig:
+        """Require the matching nested block for cloud auth types."""
+        block_map: dict[str, object | None] = {
+            "sigv4": self.sigv4,
+            "gcp": self.gcp,
+            "azure": self.azure,
+            "oauth2": self.oauth2,
+        }
+        if self.type in block_map and block_map[self.type] is None:
+            raise ValueError(f"auth.type={self.type!r} requires a matching auth.{self.type} block")
+        return self
 
     def resolved_token(self) -> str | None:
         """Bearer token, read from ``token_file`` when set, else inline."""
@@ -169,10 +253,25 @@ def _read_secret_file(path: str) -> str:
     return Path(path).read_text().strip()
 
 
+class TenantConfig(_ModelBase):
+    """Multi-tenant datasource support for Mimir / Cortex backends.
+
+    Injects a tenant header (``X-Scope-OrgID`` by default) on every
+    PromQL request for the group. The ``header`` name is configurable
+    for backends that use a non-standard header.
+    """
+
+    id: str = Field(min_length=1)
+    header: str = Field(default="X-Scope-OrgID", min_length=1)
+
+
 class DatasourceConfig(_ModelBase):
     url: str
     timeout: Duration = "10s"
     auth: AuthConfig = Field(default_factory=AuthConfig)
+    # Default tenant for multi-tenant Mimir / Cortex backends.
+    # Overridable per group via ``GroupConfig.tenant``.
+    tenant: TenantConfig | None = None
 
     @property
     def timeout_seconds(self) -> float:
@@ -187,6 +286,10 @@ class ReloadAuthConfig(_ModelBase):
 
 class ReloadConfig(_ModelBase):
     enabled: bool = True
+    # When True (the default), the detector watches the mounted ConfigMap
+    # for changes and triggers a reload automatically. Disabling this
+    # restricts reloads to explicit ``/-/reload`` calls or SIGHUP.
+    watch_configmap: bool = True
     auth: ReloadAuthConfig = Field(default_factory=ReloadAuthConfig)
 
 
@@ -811,6 +914,12 @@ class GroupConfig(_ModelBase):
     auto_select: AutoSelect = False
     auto_select_interval: Duration = "24h"
     recurrence: RecurrenceConfig = Field(default_factory=RecurrenceConfig)
+    # Per-group tenant override. When set, this tenant header is injected
+    # on every PromQL request for this group instead of the datasource-level
+    # default. The tenant value is NOT emitted as an output label by default
+    # (it's a query-side concern, not a signal-side one), keeping the
+    # cross-tool ``(id, group)`` join contract intact.
+    tenant: TenantConfig | None = None
 
     @property
     def auto_select_interval_seconds(self) -> float:
@@ -994,14 +1103,110 @@ class Config(_ModelBase):
 
 
 def load_config(path: str | Path) -> Config:
-    """Parse a YAML config file into a validated :class:`Config`."""
-    raw = yaml.safe_load(Path(path).read_text())
+    """Parse a YAML config file or directory into a validated :class:`Config`.
+
+    When ``path`` is a directory, the loader reads a base file
+    (``_defaults.yaml`` if present) for ``datasource`` / ``server`` /
+    ``safety`` / ``defaults`` / ``exporter`` settings, then merges every
+    other ``*.yaml`` / ``*.yml`` fragment's ``groups:`` list into one
+    config in deterministic filename-sorted order. Duplicate group names
+    across fragments are a hard validation error. The merged result is
+    validated against the same pydantic schema as a single file.
+    """
+    p = Path(path)
+    if p.is_dir():
+        raw = _load_config_dir(p)
+    elif "*" in str(path) or "?" in str(path):
+        import glob as _glob
+
+        matches = sorted(_glob.glob(str(path)))
+        if not matches:
+            raise ValueError(f"config glob {path!r}: no files matched")
+        if len(matches) == 1 and Path(matches[0]).is_file():
+            raw = yaml.safe_load(Path(matches[0]).read_text())
+        else:
+            raw = _load_config_from_files(matches)
+    else:
+        raw = yaml.safe_load(p.read_text())
     if not isinstance(raw, dict):
         raise ValueError(f"config {path}: top level must be a mapping")
     cfg = Config.model_validate(raw)
     _validate_detector_params(cfg)
     _validate_selftest_detector(cfg)
     return cfg
+
+
+def _load_config_dir(directory: Path) -> dict[str, Any]:
+    """Merge a directory of YAML fragments into a single config dict."""
+    yaml_files = sorted(
+        f for f in directory.iterdir() if f.is_file() and f.suffix in (".yaml", ".yml")
+    )
+    if not yaml_files:
+        raise ValueError(f"config directory {directory}: no YAML files found")
+    return _load_config_from_files([str(f) for f in yaml_files])
+
+
+def _load_config_from_files(files: list[str]) -> dict[str, Any]:
+    """Merge multiple YAML files: base settings from _defaults, groups merged."""
+    base: dict[str, Any] = {}
+    all_groups: list[dict[str, Any]] = []
+    seen_group_names: dict[str, str] = {}  # name -> source file
+
+    defaults_files = [f for f in files if Path(f).stem == "_defaults"]
+    fragment_files = [f for f in files if Path(f).stem != "_defaults"]
+
+    # Load base settings from _defaults.yaml if present.
+    for df in defaults_files:
+        content = yaml.safe_load(Path(df).read_text())
+        if isinstance(content, dict):
+            base.update(content)
+
+    # Merge groups from all fragment files.
+    for fpath in sorted(fragment_files):
+        content = yaml.safe_load(Path(fpath).read_text())
+        if not isinstance(content, dict):
+            continue
+        # If the fragment has top-level keys other than ``groups``, merge
+        # them into the base (a fragment may carry its own datasource
+        # override, etc.). ``groups`` is always merged into the list.
+        fragment_groups = content.pop("groups", None)
+        if content:
+            # Non-group keys from fragments merge into base; _defaults
+            # has lowest precedence, then alphabetical fragment order.
+            for key, value in content.items():
+                if key == "groups":
+                    continue
+                base[key] = value
+        if isinstance(fragment_groups, list):
+            for g in fragment_groups:
+                if isinstance(g, dict):
+                    gname = g.get("name", "<unnamed>")
+                    if gname in seen_group_names:
+                        raise ValueError(
+                            f"duplicate group name {gname!r} across config "
+                            f"fragments: first in {seen_group_names[gname]!r}, "
+                            f"again in {fpath!r}"
+                        )
+                    seen_group_names[gname] = fpath
+                    all_groups.append(g)
+
+    # If _defaults had groups, prepend them (already deduplicated above
+    # because _defaults_files were loaded separately).
+    base_groups = base.pop("groups", None)
+    if isinstance(base_groups, list):
+        for g in base_groups:
+            if isinstance(g, dict):
+                gname = g.get("name", "<unnamed>")
+                if gname in seen_group_names:
+                    raise ValueError(
+                        f"duplicate group name {gname!r}: defined in both "
+                        f"_defaults and {seen_group_names[gname]!r}"
+                    )
+                seen_group_names[gname] = "_defaults"
+                all_groups.insert(0, g)
+
+    base["groups"] = all_groups
+    return base
 
 
 def _validate_selftest_detector(cfg: Config) -> None:
@@ -1084,6 +1289,7 @@ __all__ = [
     "SUPPORTED_API_VERSIONS",
     "AlertThresholds",
     "AuthConfig",
+    "AzureAuthConfig",
     "Config",
     "DatasourceConfig",
     "DefaultsConfig",
@@ -1093,9 +1299,11 @@ __all__ = [
     "EnsembleConfig",
     "ExporterConfig",
     "ExporterLabelsConfig",
+    "GCPAuthConfig",
     "GrafanaAnnotationsSinkConfig",
     "GroupConfig",
     "HighAvailabilityConfig",
+    "OAuth2Config",
     "OTLPConfig",
     "QueryCacheConfig",
     "QueryConfig",
@@ -1106,8 +1314,10 @@ __all__ = [
     "SafetyConfig",
     "SelfTestConfig",
     "ServerConfig",
+    "SigV4Config",
     "SinkConfig",
     "TelemetryConfig",
+    "TenantConfig",
     "load_config",
     "parse_duration",
 ]

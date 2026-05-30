@@ -53,6 +53,16 @@ The JSON Schema `$id` is stable for the entire v1.x line. Any `# yaml-language-s
 
 promforecast follows the exact same stability rules. Shared concepts (`id`, `group`, and other label contracts) are kept in sync via `LABELS_CONTRACT.md`.
 
+## Automated Config Migration
+
+`promanomaly migrate-config` upgrades config files across `apiVersion` changes mechanically. Supported migrations:
+
+| From | To | Changes |
+|------|----|---------|
+| `promanomaly.io/v1alpha1` | `promanomaly.io/v1` | `apiVersion` rewrite only (byte-identical schema) |
+
+Use `--dry-run` to preview the diff before writing. The migration is idempotent and never changes detection semantics: a migrated config produces identical output metrics to the original. See [operations.md](operations.md#config-schema-migration) for usage.
+
 ---
 
 This is the complete, operator-friendly reference. Upgrading inside v1.x never requires editing your config files.

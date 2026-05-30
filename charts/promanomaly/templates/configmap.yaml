@@ -25,7 +25,8 @@ data:
           /etc/promanomaly-datasource-auth and referenced by file, so they
           never land in this ConfigMap. Expected Secret keys per type:
           bearer -> token; basic -> password (+ auth.username here);
-          mtls -> ca.crt / tls.crt / tls.key.
+          mtls -> ca.crt / tls.crt / tls.key;
+          oauth2 -> client_secret; azure -> client_secret.
         */}}
         {{- if eq .Values.datasource.auth.type "bearer" }}
         token_file: /etc/promanomaly-datasource-auth/token
@@ -38,6 +39,45 @@ data:
         key_file: /etc/promanomaly-datasource-auth/tls.key
         {{- end }}
         {{- end }}
+        {{- if eq .Values.datasource.auth.type "sigv4" }}
+        sigv4:
+          region: {{ .Values.datasource.auth.sigv4.region | quote }}
+          {{- with .Values.datasource.auth.sigv4.profile }}
+          profile: {{ . | quote }}
+          {{- end }}
+        {{- else if eq .Values.datasource.auth.type "gcp" }}
+        gcp:
+          {{- with .Values.datasource.auth.gcp.credentials_file }}
+          credentials_file: {{ . | quote }}
+          {{- end }}
+        {{- else if eq .Values.datasource.auth.type "azure" }}
+        azure:
+          {{- with .Values.datasource.auth.azure.client_id }}
+          client_id: {{ . | quote }}
+          {{- end }}
+          {{- with .Values.datasource.auth.azure.tenant_id }}
+          tenant_id: {{ . | quote }}
+          {{- end }}
+          {{- if .Values.datasource.auth.azure.existingSecret }}
+          client_secret_file: /etc/promanomaly-datasource-auth/client_secret
+          {{- end }}
+        {{- else if eq .Values.datasource.auth.type "oauth2" }}
+        oauth2:
+          token_url: {{ .Values.datasource.auth.oauth2.token_url | quote }}
+          client_id: {{ .Values.datasource.auth.oauth2.client_id | quote }}
+          {{- if .Values.datasource.auth.oauth2.existingSecret }}
+          client_secret_file: /etc/promanomaly-datasource-auth/client_secret
+          {{- end }}
+          {{- with .Values.datasource.auth.oauth2.scopes }}
+          scopes:
+{{ toYaml . | indent 12 }}
+          {{- end }}
+        {{- end }}
+      {{- if .Values.datasource.tenant.id }}
+      tenant:
+        id: {{ .Values.datasource.tenant.id | quote }}
+        header: {{ .Values.datasource.tenant.header | quote }}
+      {{- end }}
     server:
       listen: {{ .Values.server.listen | quote }}
       refresh_interval: {{ .Values.server.refresh_interval | quote }}
