@@ -8,6 +8,7 @@ from typing import Any
 
 import pandas as pd
 import pytest
+from click.testing import CliRunner
 
 from promanomaly.source import PromQLSource, QueryResult, QuerySeries
 
@@ -16,6 +17,49 @@ from promanomaly.source import PromQLSource, QueryResult, QuerySeries
 class StubResponse:
     series: list[QuerySeries] = field(default_factory=list)
     error: Exception | None = None
+
+
+class _QueryResult:
+    """Lightweight stand-in for :class:`QueryResult` used by CLI stubs."""
+
+    def __init__(self, series: list[QuerySeries]) -> None:
+        self.series = series
+        self.truncated = False
+
+
+class _CLIStubSource:
+    """Minimal async-compatible source stub for CLI command tests.
+
+    The CLI commands construct a :class:`PromQLSource` internally, so
+    tests monkeypatch the ``PromQLSource`` symbol in the CLI module with
+    a factory that returns this stub.  The ``calls`` list records every
+    range query the CLI issued so assertions can inspect the PromQL.
+    """
+
+    def __init__(self, responder: Any) -> None:
+        self._responder = responder
+        self.calls: list[dict[str, Any]] = []
+
+    async def start(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    async def range_query(
+        self,
+        promql: str,
+        end: float,
+        window_seconds: float,
+        step_seconds: float,
+        max_series: int | None = None,
+    ) -> Any:
+        self.calls.append(
+            {"promql": promql, "end": end, "window": window_seconds, "step": step_seconds}
+        )
+        return self._responder(
+            promql=promql, end=end, window_seconds=window_seconds, step_seconds=step_seconds
+        )
 
 
 class StubSource(PromQLSource):
@@ -75,6 +119,25 @@ def make_label_only_series(label: str, value: str) -> QuerySeries:
 @pytest.fixture
 def stub_source() -> StubSource:
     return StubSource()
+
+
+@pytest.fixture
+def cli_stub_source() -> Any:
+    """Return a callable ``(monkeypatch, responder)`` that patches the CLI
+    module's ``PromQLSource`` and returns a stub with ``.calls``."""
+    import promanomaly.cli as cli_module
+
+    def _factory(monkeypatch: pytest.MonkeyPatch, responder: Any) -> _CLIStubSource:
+        stub = _CLIStubSource(responder)
+        monkeypatch.setattr(cli_module, "PromQLSource", lambda *_a, **_kw: stub)
+        return stub
+
+    return _factory
+
+
+@pytest.fixture
+def cli_runner() -> CliRunner:
+    return CliRunner()
 
 
 def make_series(labels: dict[str, str], samples: pd.DataFrame) -> QuerySeries:

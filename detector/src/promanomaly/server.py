@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-from .anomalies import collect_firing
+from .anomalies import collect_blast_radius, collect_firing
 from .config import Config, ReloadAuthConfig
 from .detectors import list_meta
 from .inspect import InspectError, inspect_series
@@ -104,11 +104,15 @@ def build_app(application: Application) -> FastAPI:
             min_severity=min_severity,
             limit=max(0, limit),
         )
+        blast = collect_blast_radius(application._store)
+        if group is not None:
+            blast = [r for r in blast if r.group == group]
         body: dict[str, Any] = {
             "count": len(firing),
             "min_severity": min_severity,
             "group": group,
             "anomalies": [f.as_dict() for f in firing],
+            "blast_radius": [r.as_dict() for r in blast],
         }
         # Opt-in metadata lint (off by default so the no-extra-TSDB-query
         # contract holds for the common scrape path). ``promanomaly top``

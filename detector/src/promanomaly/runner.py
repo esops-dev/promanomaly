@@ -63,6 +63,7 @@ from .plan import (
     effective_threshold,
     merge_params,
 )
+from .recurrence import compute_recurrence_samples
 from .selector import select_winner
 from .self_observability import estimate_samples_bytes
 from .severity import compute_severity
@@ -248,6 +249,12 @@ class Runner:
         # this facade; the runner delegates to it rather than owning
         # the heavy cache state directly.
         self._stratified = StratifiedFetcher(source=source, config=config)
+        # Tracks the last time recurrence analysis ran per group so it
+        # doesn't execute on every group refresh (the 4-week lookback
+        # makes frequent re-queries wasteful). Between refreshes, the
+        # last-good samples are carried forward via _recurrence_cache.
+        self._recurrence_last_run: dict[str, float] = {}
+        self._recurrence_cache: dict[str, list[Sample]] = {}
         # Surface stratified-config issues once at boot — but only on
         # single-replica deployments. In HA mode every follower would
         # otherwise log the same warning, multiplying the noise by the
@@ -306,6 +313,8 @@ class Runner:
         for removed in old_names - new_names:
             self._store.remove_group(removed)
             self._group_locks.pop(removed, None)
+            self._recurrence_cache.pop(removed, None)
+            self._recurrence_last_run.pop(removed, None)
         for added in new_names - old_names:
             self._group_locks[added] = asyncio.Lock()
         # Bound the rolling detector-success ledger to live groups so a
@@ -485,6 +494,30 @@ class Runner:
         # last good value during source outages, consistent with every
         # other snapshot metric.
         out.samples.extend(self._density_samples(group, out.samples))
+
+        # Recurrence pattern analysis. Opt-in per group; queries the
+        # TSDB for historical anomaly_outside_threshold and emits a 7x24
+        # firing-rate heatmap. Time-gated by recurrence.refresh_interval
+        # (default 1h) so the 4-week lookback query doesn't fire on every
+        # 1-minute group refresh. Between refreshes, the last-good
+        # recurrence samples are carried forward in the snapshot via
+        # _recurrence_cache.
+        if group.recurrence.enabled:
+            now = time.time()
+            last = self._recurrence_last_run.get(group.name, 0.0)
+            interval = group.recurrence.refresh_interval_seconds
+            if now - last >= interval:
+                try:
+                    recurrence_samples = await self._recurrence_samples(group)
+                    self._recurrence_cache[group.name] = recurrence_samples
+                    self._recurrence_last_run[group.name] = now
+                except Exception as exc:
+                    logger.warning(
+                        "recurrence_analysis_failed",
+                        group=group.name,
+                        error=str(exc),
+                    )
+            out.samples.extend(self._recurrence_cache.get(group.name, []))
 
         return out
 
@@ -1880,6 +1913,23 @@ class Runner:
                         )
                     )
         return out
+
+    async def _recurrence_samples(self, group: GroupConfig) -> list[Sample]:
+        """Query TSDB for historical outside-threshold and compute recurrence scores."""
+        # ``max by (id, group)`` collapses the per-detector series so the
+        # TSDB returns one value per (id, group, timestamp) — avoiding the
+        # multi-detector inflation where N detectors scoring the same id
+        # would otherwise contribute N observations per time step.
+        promql = f'max by (id, group) (anomaly_outside_threshold{{group="{group.name}"}})'
+        result = await self._source.range_query(
+            promql=promql,
+            end=time.time(),
+            window_seconds=group.recurrence.lookback_seconds,
+            step_seconds=group.recurrence.step_seconds,
+        )
+        if not result.series:
+            return []
+        return compute_recurrence_samples(result.series, group=group.name)
 
     def _update_operational_metrics(self, result: GroupRunResult) -> None:
         if result.succeeded:

@@ -80,6 +80,7 @@ from ._probe import (
 from ._probe import (
     stratified_summary_for_query as _stratified_summary_for_query,
 )
+from ._timeline import format_timeline_text, run_timeline
 from ._top import _print_top_text
 
 
@@ -582,6 +583,125 @@ def analyze(
         click.echo(json.dumps(findings, indent=2, sort_keys=True))
     else:
         _print_analyze_text(findings)
+
+
+@cli.command(name="timeline")
+@click.option(
+    "--from",
+    "from_",
+    required=True,
+    help=(
+        "Range start. RFC3339 (e.g. 2024-01-15T00:00:00Z), unix seconds, "
+        "or a relative '-1h' / '-6h' offset from --to."
+    ),
+)
+@click.option(
+    "--to",
+    "to_",
+    default="now",
+    show_default=True,
+    help="Range end. RFC3339, unix seconds, or 'now' (default).",
+)
+@click.option(
+    "--group",
+    "groups",
+    multiple=True,
+    help="Restrict to these groups (repeatable).",
+)
+@click.option(
+    "--datasource-url",
+    default="http://localhost:8428/",
+    show_default=True,
+    help="PromQL-compatible datasource URL.",
+)
+@click.option(
+    "--step",
+    default="15s",
+    show_default=True,
+    help="Sample step for the range queries.",
+)
+@click.option(
+    "--output",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    show_default=True,
+    help="Output format. 'json' is suitable for machine consumption.",
+)
+@click.option(
+    "--timeout",
+    default="30s",
+    show_default=True,
+    help="Datasource HTTP timeout.",
+)
+def timeline(
+    from_: str,
+    to_: str,
+    groups: tuple[str, ...],
+    datasource_url: str,
+    step: str,
+    output: str,
+    timeout: str,
+) -> None:
+    """Post-incident anomaly timeline over a historical window.
+
+    Queries the TSDB for ``anomaly_outside_threshold``,
+    ``anomaly_change_point_total``, and ``anomaly_severity`` history and
+    prints a time-ordered list of anomaly events — every firing start
+    and every change-point, with severity attached. Complements
+    ``analyze`` (raw-signal change-points) by operating on the *emitted
+    anomaly metrics*.
+    """
+    from ._timeline import METRIC_CHANGE_POINT, METRIC_OUTSIDE, METRIC_SEVERITY
+
+    try:
+        to_seconds = _parse_analyze_timestamp(to_, now=time.time())
+        from_seconds = _parse_analyze_timestamp(from_, now=to_seconds)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    if from_seconds >= to_seconds:
+        raise click.UsageError("--from must be before --to")
+
+    step_seconds = parse_duration(step)
+    window_seconds = to_seconds - from_seconds
+
+    # Build an optional group label matcher so only the requested
+    # groups' metrics are fetched.
+    group_filter = ""
+    if groups:
+        group_filter = '{group=~"' + "|".join(groups) + '"}'
+
+    metrics = [METRIC_OUTSIDE, METRIC_CHANGE_POINT, METRIC_SEVERITY]
+
+    async def _fetch() -> dict[str, list[QuerySeries]]:
+        source = PromQLSource(datasource_url, parse_duration(timeout))
+        result: dict[str, list[QuerySeries]] = {}
+        try:
+            await source.start()
+            for metric in metrics:
+                promql = f"{metric}{group_filter}"
+                qr = await source.range_query(
+                    promql=promql,
+                    end=to_seconds,
+                    window_seconds=window_seconds,
+                    step_seconds=step_seconds,
+                )
+                result[metric] = list(qr.series)
+        finally:
+            await source.close()
+        return result
+
+    try:
+        series_by_metric = asyncio.run(_fetch())
+    except SourceQueryError as exc:
+        click.echo(f"query failed: {exc}", err=True)
+        sys.exit(2)
+
+    events = run_timeline(series_by_metric)
+
+    if output == "json":
+        click.echo(json.dumps(events, indent=2, sort_keys=True))
+    else:
+        click.echo(format_timeline_text(events))
 
 
 @cli.command(name="calibrate-buckets")
@@ -1156,7 +1276,9 @@ __all__ = [
     "_safe_float",
     "_stratified_summary_for_query",
     "cli",
+    "format_timeline_text",
     "main",
+    "run_timeline",
 ]
 
 

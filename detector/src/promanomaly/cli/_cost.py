@@ -83,6 +83,7 @@ class GroupCostEstimate:
     short_queries_per_refresh: int = 0
     discovery_probe_queries_per_refresh: int = 0
     stratified_baseline_queries_per_day: float = 0.0
+    recurrence_queries_per_day: float = 0.0
     memory_bytes: float = 0.0
     cpu_cores: float = 0.0
     queries: list[QueryCostEstimate] = field(default_factory=list)
@@ -192,6 +193,12 @@ def estimate_cost(cfg: Config) -> list[GroupCostEstimate]:
             gest.stratified_baseline_queries_per_day += qest.stratified_baseline_queries_per_day
             gest.memory_bytes += qest.memory_bytes
             gest.cpu_cores += qest.cpu_cores
+        # Recurrence analysis: one TSDB range query per refresh_interval
+        # (not per group refresh), amortised to queries-per-day.
+        if group.recurrence.enabled:
+            recurrence_interval = group.recurrence.refresh_interval_seconds
+            if recurrence_interval > 0:
+                gest.recurrence_queries_per_day = round(86400.0 / recurrence_interval, 2)
         groups.append(gest)
     return groups
 
@@ -210,6 +217,7 @@ def run_estimate_cost(cfg: Config, *, strict: bool) -> int:
     short_total = 0
     probe_total = 0
     stratified_total = 0.0
+    recurrence_total = 0.0
     has_discovery = False
     for gest in groups:
         projected_total += gest.projected_series
@@ -218,6 +226,7 @@ def run_estimate_cost(cfg: Config, *, strict: bool) -> int:
         short_total += gest.short_queries_per_refresh
         probe_total += gest.discovery_probe_queries_per_refresh
         stratified_total += gest.stratified_baseline_queries_per_day
+        recurrence_total += gest.recurrence_queries_per_day
         group_has_discovery = any(q.is_discovery for q in gest.queries)
         has_discovery = has_discovery or group_has_discovery
         entry: dict[str, Any] = {
@@ -229,6 +238,7 @@ def run_estimate_cost(cfg: Config, *, strict: bool) -> int:
             "stratified_baseline_queries_per_day": round(
                 gest.stratified_baseline_queries_per_day, 2
             ),
+            "recurrence_queries_per_day": gest.recurrence_queries_per_day,
             "estimated_memory_bytes": int(gest.memory_bytes),
             "estimated_cpu_cores": round(gest.cpu_cores, 3),
         }
@@ -249,6 +259,7 @@ def run_estimate_cost(cfg: Config, *, strict: bool) -> int:
         "short_queries_per_refresh": short_total,
         "discovery_probe_queries_per_refresh": probe_total,
         "stratified_baseline_queries_per_day": round(stratified_total, 2),
+        "recurrence_queries_per_day": round(recurrence_total, 2),
         "estimated_memory_bytes": int(total_memory),
         "estimated_cpu_cores": round(total_cpu, 3),
         "refresh_interval_seconds": cfg.server.refresh_interval_seconds,

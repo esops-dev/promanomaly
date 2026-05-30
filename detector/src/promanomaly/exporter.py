@@ -200,6 +200,15 @@ _HELP: dict[str, tuple[str, str]] = {
             "per-detector metrics down to the winner."
         ),
     ),
+    "anomaly_recurrence_score": (
+        "gauge",
+        (
+            "Stratified firing-rate of anomaly_outside_threshold by "
+            "day_of_week x hour_of_day over a configurable lookback. "
+            "A high value at (Tue, 9) means this series fires often on "
+            "Tuesdays at 09:00 UTC. Opt-in per group via recurrence.enabled."
+        ),
+    ),
 }
 
 

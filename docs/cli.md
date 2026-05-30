@@ -18,6 +18,7 @@ promanomaly ships with a small, focused set of CLI commands for validation, test
 | `top`               | List the currently-firing series, ranked by severity |
 | `warmup`            | Report which series are still warming up, with an ETA to readiness |
 | `diagnose`          | Flag mis-tuned detectors (never-fires, fires-often, stuck warming, empty) |
+| `timeline`          | Post-incident anomaly timeline over a historical window |
 | `adapter`           | Run the Kubernetes external/custom metrics adapter |
 | `adapter-validate`  | Validate an adapter config file (schema only) |
 
@@ -252,6 +253,30 @@ promanomaly diagnose --target http://localhost:9092
 | `--timeout <s>`     | 30      | HTTP timeout |
 
 Pure analysis, no persisted state. Pairs with `backtest` (precision/recall on injected anomalies) and `calibrate-buckets` (stratified bucketing) to close the tuning loop. Parity with `promforecast diagnose`.
+
+## `timeline`
+
+Post-incident anomaly timeline. Queries the TSDB for `anomaly_outside_threshold`, `anomaly_change_point_total`, and `anomaly_severity` history and prints a time-ordered list of anomaly events — every firing start and every change-point, with severity attached. Complements `analyze` (which finds change-points in a *raw signal*) by operating on the *emitted anomaly metrics* — the retro view.
+
+```bash
+promanomaly timeline --from -6h --to now
+promanomaly timeline --from 2025-05-29T08:00:00Z --to 2025-05-29T12:00:00Z --group api --group web
+promanomaly timeline --from -24h --output json
+```
+
+**Flags**
+
+| Flag               | Default                    | Description |
+|--------------------|----------------------------|-------------|
+| `--from <ts>`      | (required)                 | Range start (RFC3339, unix seconds, or relative e.g. `-6h`) |
+| `--to <ts>`        | `now`                      | Range end |
+| `--group <name>`   | all                        | Restrict to these groups (repeatable) |
+| `--datasource-url` | `http://localhost:8428/`    | PromQL-compatible datasource URL |
+| `--step`           | `15s`                      | Sample step for the range queries |
+| `--output`         | `text`                     | `text` (human table) or `json` (machine-readable list of events) |
+| `--timeout`        | `30s`                      | Datasource HTTP timeout |
+
+Each event carries: `time`, `time_rfc3339`, `kind` (`anomaly` or `change_point`), `id`, `group`, `detector`, `detector_instance`, and `severity` (when available). Events are sorted by ascending time; ties break by kind then `id` for a deterministic order.
 
 ## `adapter`
 
