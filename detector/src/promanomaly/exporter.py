@@ -493,6 +493,23 @@ class OperationalMetrics:
             ["detector"],
             registry=self.registry,
         )
+        self._declare_sink_metrics()
+
+    # ------------------------------------------------------------------
+    # Push-sink metrics. Cardinality is bounded — one series per
+    # (sink, reason) and both label sets are closed enumerations.
+    # ------------------------------------------------------------------
+    def _declare_sink_metrics(self) -> None:
+        self.sink_failures_total = Counter(
+            "anomaly_sink_failures_total",
+            (
+                "Total push-sink failures bucketed by sink and reason. A sink "
+                "failure is isolated from the detection pipeline and never "
+                "blocks /metrics or readiness."
+            ),
+            ["sink", "reason"],
+            registry=self.registry,
+        )
 
     def render(self) -> bytes:
         return generate_latest(self.registry)

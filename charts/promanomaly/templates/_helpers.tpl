@@ -55,3 +55,68 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s-config" (include "promanomaly.fullname" .) -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+  Render the body of one sink (the fields below ``type:``) at column 0;
+  the caller indents the result for the scalar ``sink:`` mapping or each
+  ``sinks:`` list item. Shared by configmap.yaml so the two forms can
+  never drift. Input dict: ``sink`` (the sink values) and ``tokenPath``
+  (where the bearer token Secret is mounted, when one is set).
+
+  Optional fields (``timeout``, ``auth``, ``max_annotations_per_run``,
+  ``tags``) are emitted only when set: ``sinks:`` list entries are
+  user-supplied and may omit them, and the detector's config schema fills
+  the documented defaults. Only the typed block and its ``url`` are
+  required (the config schema enforces a block matching ``type``).
+*/}}
+{{- define "promanomaly.sinkFields" -}}
+{{- $sink := .sink -}}
+{{- $tokenPath := .tokenPath -}}
+type: {{ $sink.type | quote }}
+{{- if eq $sink.type "remote_write" }}
+{{- $rw := $sink.remote_write }}
+remote_write:
+  url: {{ $rw.url | quote }}
+  {{- with $rw.timeout }}
+  timeout: {{ . | quote }}
+  {{- end }}
+  {{- with $rw.auth }}
+  auth:
+    type: {{ .type | default "none" | quote }}
+    {{- if .existingSecret }}
+    token_file: {{ $tokenPath }}
+    {{- end }}
+  {{- end }}
+{{- else if eq $sink.type "grafana_annotations" }}
+{{- $ga := $sink.grafana_annotations }}
+grafana_annotations:
+  url: {{ $ga.url | quote }}
+  {{- with $ga.timeout }}
+  timeout: {{ . | quote }}
+  {{- end }}
+  {{- with $ga.auth }}
+  auth:
+    type: {{ .type | default "none" | quote }}
+    {{- if .existingSecret }}
+    token_file: {{ $tokenPath }}
+    {{- end }}
+  {{- end }}
+  {{- with $ga.max_annotations_per_run }}
+  max_annotations_per_run: {{ . }}
+  {{- end }}
+  {{- with $ga.tags }}
+  tags:
+{{ toYaml . | indent 4 }}
+  {{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+  Mount path for one sink's bearer-token Secret in the list (``sinks:``)
+  form. The sink ``type`` is unique per config, so it makes a stable
+  per-sink directory; ``_`` is not valid in a Kubernetes name so it is
+  rewritten to ``-`` for the volume name (the mount path keeps it).
+*/}}
+{{- define "promanomaly.sinkAuthDir" -}}
+{{- printf "/etc/promanomaly-sink-auth/%s" (. | replace "_" "-") -}}
+{{- end -}}

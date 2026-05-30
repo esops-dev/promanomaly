@@ -1,0 +1,30 @@
+# Exercise the multi-sink list (``sinks:``) configmap + per-sink Secret
+# mount branches. Both sink types are active at once, each with its own
+# bearer-token Secret mounted under /etc/promanomaly-sink-auth/<type>.
+sinks:
+  - type: remote_write
+    remote_write:
+      url: http://victoriametrics.monitoring.svc:8428/api/v1/write
+      timeout: 10s
+      auth:
+        type: bearer
+        existingSecret: remote-write-credentials
+  - type: grafana_annotations
+    grafana_annotations:
+      url: http://grafana.monitoring.svc:3000
+      timeout: 10s
+      auth:
+        type: bearer
+        existingSecret: grafana-credentials
+      tags:
+        - promanomaly
+      max_annotations_per_run: 50
+
+groups:
+  - name: ci_multi_sink
+    priority: 1
+    queries:
+      - id: queue_depth
+        promql: max(queue_depth) by (queue)
+        detectors:
+          - name: MAD

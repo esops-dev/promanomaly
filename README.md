@@ -96,6 +96,29 @@ The full multi-group production reference deployment — values, NetworkPolicy
 egress, ArgoCD `Application`, and Flux `HelmRepository`/`HelmRelease` —
 lives at [`examples/production/`](examples/production/).
 
+## Feeding anomaly signal to the platform
+
+Anomaly scores are most useful when the rest of your stack can act on
+them. promanomaly stays the signal *provider*; the systems that react
+(autoscalers, rollout controllers, dashboards, long-term storage) stay
+the decision-makers.
+
+- **Push sinks** ship each snapshot beyond `/metrics`: a Prometheus
+  `remote_write` sink for long-horizon anomaly history, and a Grafana
+  annotations sink that surfaces firings across every dashboard. See
+  [`docs/sinks.md`](docs/sinks.md).
+- **Kubernetes metrics adapter** re-serves anomaly signal through the
+  external/custom metrics APIs so HPA and KEDA can consume it. Opt-in via
+  [`charts/promanomaly-metrics-adapter/`](charts/promanomaly-metrics-adapter/);
+  see [`docs/adapter.md`](docs/adapter.md).
+- **Reaction recipes** — KEDA, HPA, and Argo Rollouts cohort-gated
+  canaries, with the autoscaling guard-rails baked in — live at
+  [`examples/k8s/`](examples/k8s/).
+- **GitOps config validation** — a composite GitHub Action validates your
+  config on every PR (schema, cardinality/cost, optional live probe), and
+  `promanomaly generate-rules` scaffolds a PrometheusRule from it. See
+  [`docs/gitops.md`](docs/gitops.md).
+
 ## Relationship with promforecast
 
 | | promforecast | promanomaly |

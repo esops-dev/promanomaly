@@ -1,0 +1,127 @@
+# Default values for promanomaly-metrics-adapter.
+#
+# This chart is OFF by default in the sense that you install it
+# deliberately. Read the README guard-rails before wiring an autoscaler
+# to anomaly signal: scaling raw on anomaly_score amplifies incidents.
+# Prefer anomaly_density (gated on confidence + duration) and always pair
+# an anomaly-driven scaler with a reactive fallback HPA.
+
+image:
+  repository: ghcr.io/esops-dev/promanomaly
+  tag: ""              # overrides Chart.appVersion when set
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# The adapter is stateless and horizontally scalable; 2 replicas give the
+# aggregation layer an HA backend without any coordination.
+replicaCount: 2
+
+# Datasource: the same PromQL-compatible TSDB the detector writes to.
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 10s
+  auth:
+    # none | bearer | basic | mtls — mirrors the detector chart.
+    type: none
+    username: ""        # basic-auth username (password comes from the Secret)
+    # Secret carrying the credential, mounted as files and referenced by
+    # path. Expected keys per type:
+    #   bearer -> token
+    #   basic  -> password   (username above)
+    #   mtls   -> ca.crt, tls.crt, tls.key
+    existingSecret: ""
+
+# Anomaly metrics exposed through the metrics APIs. The defaults are the
+# four the project supports; trim the list to reduce the discovery
+# surface. Scaling raw on anomaly_score is intentionally NOT a default.
+metrics:
+  - anomaly_severity
+  - anomaly_density
+  - anomaly_active_series
+  - anomaly_outside_threshold
+
+# Kubernetes object kinds exposed through custom.metrics.k8s.io. The
+# object name is matched against the same-named PromQL label.
+customResources:
+  - pods
+  - namespaces
+
+# Serving TLS. The aggregation layer only talks HTTPS to an APIService
+# backend, so a serving cert is mandatory in-cluster.
+tls:
+  # generate: chart mints a self-signed CA + serving cert and wires the
+  # APIService caBundle to it. Simple, but regenerates on every upgrade.
+  # For rotation-free certs set existingSecret (e.g. cert-manager).
+  existingSecret: ""        # name of a kubernetes.io/tls Secret to use
+  caBundle: ""             # base64 CA bundle for the APIService (existingSecret only)
+
+apiService:
+  # Register the two APIService objects with the aggregation layer.
+  # Disable only if you manage them out-of-band.
+  enabled: true
+  # Skip TLS verification of the adapter from the aggregation layer.
+  # Leave false; the chart wires the generated CA into caBundle.
+  insecureSkipTLSVerify: false
+  # APIService priority knobs (aggregation layer ordering).
+  groupPriorityMinimum: 100
+  versionPriority: 100
+
+service:
+  type: ClusterIP
+  port: 443
+  targetPort: 6443
+
+# The container serves HTTPS on this port.
+containerPort: 6443
+
+serviceAccount:
+  create: true
+  name: ""
+
+# Manage the adapter config out-of-band (Argo CD, Flux) instead of
+# letting the chart render it.
+existingConfigMap: ""
+
+rbac:
+  # Create the auth-delegator binding and the extension-apiserver
+  # authentication reader the aggregated apiserver needs, plus the
+  # ClusterRole letting the HPA controller read the metrics APIs.
+  create: true
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Deny ingress except from the aggregation layer (kube-apiserver). The
+# adapter has no /debug surface; this keeps the metrics API reachable
+# only via the cluster's apiserver proxy.
+networkPolicy:
+  enabled: true

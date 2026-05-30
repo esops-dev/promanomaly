@@ -31,7 +31,14 @@ datasource:
   timeout: 10s
   auth:
     type: none          # none | bearer | basic | mtls
-    existingSecret: ""  # secret name carrying the configured credential
+    username: ""        # basic-auth username (not sensitive; the password
+                        # comes from existingSecret)
+    # Secret carrying the credential, mounted as files and referenced by
+    # path so it never lands in the ConfigMap. Expected keys per type:
+    #   bearer -> token
+    #   basic  -> password   (username above)
+    #   mtls   -> ca.crt, tls.crt, tls.key
+    existingSecret: ""
 
 # Reload endpoint protection. The shipped NetworkPolicy denies ingress
 # to /-/reload and the debug endpoints by default; auth is defence in
@@ -163,6 +170,67 @@ telemetry:
     endpoint: ""           # e.g. "otel-collector.observability.svc:4317"
     insecure: true         # set false when the collector terminates TLS
     service_name: promanomaly
+
+# Optional push sink active alongside the always-on /metrics exporter.
+# Leave ``type`` empty for pull-only (the default). This scalar form
+# configures a single sink and is kept for backward compatibility; to run
+# several sinks at once, use the ``sinks:`` list below instead (set one or
+# the other, never both). A sink failure is isolated and counted on
+# ``anomaly_sink_failures_total``; it never blocks /metrics or readiness.
+sink:
+  # "" | remote_write | grafana_annotations
+  type: ""
+  # Push each successful snapshot to a Prometheus remote-write endpoint —
+  # the recommended path for long-horizon anomaly_density history.
+  remote_write:
+    url: ""               # e.g. http://victoriametrics:8428/api/v1/write
+    timeout: 10s
+    auth:
+      type: none          # none | bearer
+      # Secret with a `token` key for bearer auth, mounted and referenced
+      # by file. The chart wires only the bearer (token_file) shape here;
+      # for basic/mtls remote-write auth, manage the sink config via
+      # `existingConfigMap` instead.
+      existingSecret: ""
+  # Post anomaly firings and change-points to the Grafana annotations API
+  # so they surface across all dashboards.
+  grafana_annotations:
+    url: ""               # e.g. http://grafana.monitoring.svc:3000
+    timeout: 10s
+    auth:
+      type: none          # none | bearer
+      existingSecret: ""  # Secret with a `token` key (Grafana service-account token)
+    tags:
+      - promanomaly
+    max_annotations_per_run: 50
+
+# Several push sinks at once. When non-empty this takes precedence over the
+# scalar ``sink:`` above (set one or the other, never both). ``/metrics``
+# stays available regardless. Each entry has the same shape as ``sink:``;
+# a sink ``type`` may appear at most once so the
+# ``anomaly_sink_failures_total{sink=...}`` label stays unambiguous. Each
+# entry's bearer-token Secret is mounted under its own
+# ``/etc/promanomaly-sink-auth/<type>`` directory.
+#
+#   sinks:
+#     - type: remote_write
+#       remote_write:
+#         url: http://victoriametrics:8428/api/v1/write
+#         timeout: 10s
+#         auth:
+#           type: bearer
+#           existingSecret: remote-write-credentials
+#     - type: grafana_annotations
+#       grafana_annotations:
+#         url: http://grafana.monitoring.svc:3000
+#         timeout: 10s
+#         auth:
+#           type: bearer
+#           existingSecret: grafana-credentials
+#         tags:
+#           - promanomaly
+#         max_annotations_per_run: 50
+sinks: []
 
 # Inline detector groups. Mutually exclusive with ``existingConfigMap``.
 #

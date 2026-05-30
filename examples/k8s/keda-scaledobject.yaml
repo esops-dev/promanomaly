@@ -1,0 +1,62 @@
+# KEDA ScaledObject — scale a worker Deployment on anomalous backlog depth.
+#
+# This is the *good* shape for anomaly-driven scaling: react when the
+# queue is anomalously DEEP (anomaly_density on a queue-depth group), not
+# to how anomalous some latency metric looks. The guard-rails below are
+# the point of the example — copy them, don't strip them.
+#
+# Prerequisites:
+#   * promanomaly detecting a "queue_depths" group (see
+#     examples/configs/*.yaml).
+#   * KEDA installed (it talks to the Prometheus/VictoriaMetrics HTTP API
+#     directly via the `prometheus` scaler — no metrics adapter needed for
+#     this path).
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: queue-workers
+  namespace: workloads
+spec:
+  scaleTargetRef:
+    name: queue-workers           # the Deployment to scale
+  minReplicaCount: 3              # GUARD-RAIL: never scale below a safe floor
+  maxReplicaCount: 30            # GUARD-RAIL: hard ceiling caps blast radius
+  # GUARD-RAIL: cooldown + stabilization avoid flapping on a single
+  # anomalous tick. Anomaly signal is sharp; react to sustained state.
+  cooldownPeriod: 300
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 120
+        scaleDown:
+          stabilizationWindowSeconds: 600   # scale down slowly
+  triggers:
+    # Primary: scale on the *density* of anomalous backlog series, gated
+    # to only count when the anomaly is high-confidence AND sustained.
+    # `anomaly_density` is bounded-cardinality (a fraction 0-1), so this
+    # query is cheap and safe.
+    - type: prometheus
+      metadata:
+        serverAddress: http://victoriametrics.monitoring.svc:8428
+        # Fire scaling only when density is meaningful (>0.2 of the group
+        # anomalous). The `and on` gates on severity-density (which already
+        # folds in confidence and duration) so a low-severity or momentary
+        # blip does not move replicas.
+        query: |
+          max(
+            anomaly_density{group="queue_depths"}
+            and on (group) (anomaly_severity_density{group="queue_depths"} > 0.5)
+          )
+        threshold: "0.2"
+        activationThreshold: "0.1"
+    # GUARD-RAIL: reactive fallback. A plain backlog-length trigger keeps
+    # the workload safe if the detector or TSDB is unavailable, so the
+    # anomaly-driven trigger is never the *only* thing standing between
+    # you and an unbounded queue. KEDA scales to the max across triggers.
+    - type: prometheus
+      metadata:
+        serverAddress: http://victoriametrics.monitoring.svc:8428
+        query: sum(queue_depth{queue="orders"})
+        threshold: "1000"          # target backlog per replica

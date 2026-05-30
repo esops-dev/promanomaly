@@ -1,0 +1,55 @@
+# HorizontalPodAutoscaler — scale on anomaly signal via the metrics
+# adapter (charts/promanomaly-metrics-adapter).
+#
+# This path uses the Kubernetes external-metrics API served by the
+# adapter, so the HPA consumes anomaly_density like any other external
+# metric. Install the adapter chart first.
+#
+# GUARD-RAILS (same as the KEDA example, expressed in HPA terms):
+#   * External metric is anomaly_density (a bounded fraction), NOT
+#     anomaly_score.
+#   * A second `Resource` metric (CPU) is the reactive fallback — the HPA
+#     scales to the max desired across metrics, so CPU keeps the workload
+#     safe if anomaly signal is unavailable.
+#   * scaleDown stabilization is long to avoid flapping.
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: queue-workers
+  namespace: workloads
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: queue-workers
+  minReplicas: 3                  # GUARD-RAIL: safe floor
+  maxReplicas: 30               # GUARD-RAIL: blast-radius ceiling
+  metrics:
+    # Anomaly-driven: target an average anomaly_density across the group.
+    # Value is a milli-quantity ("200m" == 0.2). The adapter serves this
+    # from external.metrics.k8s.io.
+    - type: External
+      external:
+        metric:
+          name: anomaly_density
+          selector:
+            matchLabels:
+              group: queue_depths
+        target:
+          type: AverageValue
+          averageValue: "200m"
+    # GUARD-RAIL: reactive fallback on CPU. The HPA takes the max desired
+    # replica count across metrics, so this keeps scaling working even
+    # when the detector/adapter path is down.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 120
+    scaleDown:
+      stabilizationWindowSeconds: 600

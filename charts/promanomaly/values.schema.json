@@ -44,6 +44,7 @@
           "type": "object",
           "properties": {
             "type": {"type": "string", "enum": ["none", "bearer", "basic", "mtls"]},
+            "username": {"type": "string"},
             "existingSecret": {"type": "string"}
           }
         }
@@ -138,6 +139,11 @@
         }
       }
     },
+    "sink": {"$ref": "#/$defs/sink"},
+    "sinks": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/sink"}
+    },
     "groups": {"type": "array"},
     "existingConfigMap": {"type": "string"},
     "service": {"type": "object"},
@@ -164,5 +170,43 @@
     "strategy": {"type": "object"},
     "nameOverride": {"type": "string"},
     "fullnameOverride": {"type": "string"}
+  },
+  "$defs": {
+    "sink": {
+      "type": "object",
+      "properties": {
+        "type": {"type": "string", "enum": ["", "remote_write", "grafana_annotations"]},
+        "remote_write": {
+          "type": "object",
+          "properties": {
+            "url": {"type": "string"},
+            "timeout": {"type": "string"},
+            "auth": {
+              "type": "object",
+              "properties": {
+                "type": {"type": "string", "enum": ["none", "bearer"]},
+                "existingSecret": {"type": "string"}
+              }
+            }
+          }
+        },
+        "grafana_annotations": {
+          "type": "object",
+          "properties": {
+            "url": {"type": "string"},
+            "timeout": {"type": "string"},
+            "auth": {
+              "type": "object",
+              "properties": {
+                "type": {"type": "string", "enum": ["none", "bearer"]},
+                "existingSecret": {"type": "string"}
+              }
+            },
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "max_annotations_per_run": {"type": "integer", "minimum": 1}
+          }
+        }
+      }
+    }
   }
 }

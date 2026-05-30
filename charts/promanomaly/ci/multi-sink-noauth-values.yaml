@@ -1,0 +1,20 @@
+# Regression guard: a ``sinks:`` list entry that omits the optional
+# ``auth`` / ``timeout`` / ``tags`` / ``max_annotations_per_run`` fields.
+# These default in the detector's config schema, so the chart must render
+# them away rather than nil-pointer on the missing sub-objects.
+sinks:
+  - type: remote_write
+    remote_write:
+      url: http://victoriametrics.monitoring.svc:8428/api/v1/write
+  - type: grafana_annotations
+    grafana_annotations:
+      url: http://grafana.monitoring.svc:3000
+
+groups:
+  - name: ci_multi_sink_noauth
+    priority: 1
+    queries:
+      - id: queue_depth
+        promql: max(queue_depth) by (queue)
+        detectors:
+          - name: MAD

@@ -19,6 +19,25 @@ data:
       timeout: {{ .Values.datasource.timeout | quote }}
       auth:
         type: {{ .Values.datasource.auth.type | quote }}
+        {{- if .Values.datasource.auth.existingSecret }}
+        {{- /*
+          Credentials are mounted from datasource.auth.existingSecret at
+          /etc/promanomaly-datasource-auth and referenced by file, so they
+          never land in this ConfigMap. Expected Secret keys per type:
+          bearer -> token; basic -> password (+ auth.username here);
+          mtls -> ca.crt / tls.crt / tls.key.
+        */}}
+        {{- if eq .Values.datasource.auth.type "bearer" }}
+        token_file: /etc/promanomaly-datasource-auth/token
+        {{- else if eq .Values.datasource.auth.type "basic" }}
+        username: {{ .Values.datasource.auth.username | quote }}
+        password_file: /etc/promanomaly-datasource-auth/password
+        {{- else if eq .Values.datasource.auth.type "mtls" }}
+        ca_file: /etc/promanomaly-datasource-auth/ca.crt
+        cert_file: /etc/promanomaly-datasource-auth/tls.crt
+        key_file: /etc/promanomaly-datasource-auth/tls.key
+        {{- end }}
+        {{- end }}
     server:
       listen: {{ .Values.server.listen | quote }}
       refresh_interval: {{ .Values.server.refresh_interval | quote }}
@@ -119,6 +138,27 @@ data:
         insecure: {{ default true .otlp.insecure }}
         service_name: {{ default "promanomaly" .otlp.service_name | quote }}
     {{- end }}
+    {{- end }}
+    {{- /*
+      Optional push sink(s) (remote_write / grafana_annotations) active
+      alongside the always-on /metrics exporter. The ``sinks:`` list takes
+      precedence when non-empty; otherwise the scalar ``sink:`` form is
+      rendered when ``sink.type`` is set; pull-only when neither is set.
+      Setting both is rejected here (mirrors the detector's own config
+      validation) so the scalar isn't silently dropped by precedence.
+    */ -}}
+    {{- if and .Values.sinks .Values.sink.type }}
+    {{- fail "set either .Values.sink (scalar) or .Values.sinks (list), not both" }}
+    {{- end }}
+    {{- if .Values.sinks }}
+    sinks:
+      {{- range $sink := .Values.sinks }}
+      -
+{{ include "promanomaly.sinkFields" (dict "sink" $sink "tokenPath" (printf "%s/token" (include "promanomaly.sinkAuthDir" $sink.type))) | indent 8 }}
+      {{- end }}
+    {{- else if .Values.sink.type }}
+    sink:
+{{ include "promanomaly.sinkFields" (dict "sink" .Values.sink "tokenPath" "/etc/promanomaly-sink-auth/token") | indent 6 }}
     {{- end }}
     groups:
 {{ toYaml .Values.groups | indent 6 }}

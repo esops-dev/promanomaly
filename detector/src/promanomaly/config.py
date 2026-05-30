@@ -138,9 +138,35 @@ class AuthConfig(_ModelBase):
     token: str | None = None
     username: str | None = None
     password: str | None = None
+    # File-based credential sources, mirroring the existing ``*_file``
+    # mTLS fields. Mounting a Secret as a file and pointing ``token_file``
+    # / ``password_file`` at it keeps the credential out of the rendered
+    # ConfigMap and out of the process environment — the path the Helm
+    # charts wire up for ``datasource.auth.existingSecret``. When both an
+    # inline value and a ``*_file`` are set, the file wins.
+    token_file: str | None = None
+    password_file: str | None = None
     ca_file: str | None = None
     cert_file: str | None = None
     key_file: str | None = None
+
+    def resolved_token(self) -> str | None:
+        """Bearer token, read from ``token_file`` when set, else inline."""
+        return _read_secret_file(self.token_file) if self.token_file else self.token
+
+    def resolved_password(self) -> str | None:
+        """Basic-auth password, read from ``password_file`` when set, else inline."""
+        return _read_secret_file(self.password_file) if self.password_file else self.password
+
+
+def _read_secret_file(path: str) -> str:
+    """Read a credential from a mounted Secret file, trimming trailing newline.
+
+    Kubernetes Secret files and ``echo``-created tokens commonly carry a
+    trailing newline; a stray ``\\n`` in a bearer header silently breaks
+    auth, so it is stripped here.
+    """
+    return Path(path).read_text().strip()
 
 
 class DatasourceConfig(_ModelBase):
@@ -513,6 +539,108 @@ class TelemetryConfig(_ModelBase):
     otlp: OTLPConfig | None = None
 
 
+class RemoteWriteSinkConfig(_ModelBase):
+    """Push the snapshot to a Prometheus remote-write endpoint.
+
+    Runs after each successful group run, in addition to (never instead
+    of) ``/metrics`` — the pull exporter is always available. The
+    recommended path for long-horizon ``anomaly_density`` history that
+    outlives scrape retention and feeds recurrence analysis.
+
+    Auth mirrors :class:`AuthConfig` so operators reuse the datasource
+    auth shapes (bearer / basic / mTLS) they already know.
+    """
+
+    url: str
+    timeout: Duration = "10s"
+    auth: AuthConfig = Field(default_factory=AuthConfig)
+
+    @property
+    def timeout_seconds(self) -> float:
+        return parse_duration(self.timeout)
+
+
+class GrafanaAnnotationsSinkConfig(_ModelBase):
+    """Post anomaly firings and change-points to the Grafana annotations API.
+
+    Emits an annotation on each ``anomaly_outside_threshold`` 0->1
+    transition and each ``anomaly_change_point_total`` increment, tagged
+    with ``id`` / ``group`` / ``detector`` so they surface across *all*
+    dashboards (Grafana shows tag-matched annotations globally), even on
+    dashboards that don't query promanomaly metrics directly.
+
+    Rate-bounded by ``max_annotations_per_run`` so a fleet-wide event
+    can't flood the Grafana API; the overflow is dropped and counted via
+    ``anomaly_sink_failures_total{reason="rate_limited"}``.
+    """
+
+    # Grafana base URL, e.g. ``http://grafana.monitoring.svc:3000``.
+    url: str
+    timeout: Duration = "10s"
+    # Service-account / API token. Only ``bearer`` is supported here
+    # because that is the single auth shape the Grafana HTTP API accepts
+    # for the annotations endpoint; basic / mTLS are intentionally not
+    # offered to avoid implying support Grafana doesn't give us.
+    auth: AuthConfig = Field(default_factory=AuthConfig)
+    # Tags stamped on every annotation in addition to the per-event
+    # id / group / detector tags. A dashboard configured with a matching
+    # annotation query (e.g. tag ``promanomaly``) then shows them.
+    tags: list[str] = Field(default_factory=lambda: ["promanomaly"])
+    # Hard cap on annotations posted per run; protects the Grafana API
+    # from a fleet-wide firing storm. Overflow is dropped and counted.
+    max_annotations_per_run: int = Field(default=50, ge=1)
+
+    @property
+    def timeout_seconds(self) -> float:
+        return parse_duration(self.timeout)
+
+    @field_validator("auth")
+    @classmethod
+    def _only_bearer_or_none(cls, value: AuthConfig) -> AuthConfig:
+        if value.type not in ("none", "bearer"):
+            raise ValueError(
+                "sink.grafana_annotations.auth.type must be 'none' or 'bearer' "
+                "(the Grafana annotations API accepts only token auth)"
+            )
+        return value
+
+
+class SinkConfig(_ModelBase):
+    """One push sink active alongside the always-on ``/metrics`` exporter.
+
+    A single sink may be configured via the scalar ``sink:`` field, or
+    several via the ``sinks:`` list (see :class:`Config`); the scalar form
+    is retained for backward compatibility. The ``type`` selects which
+    nested block is consulted; the matching block is required and the
+    others must be absent.
+
+    A push-sink failure is always isolated from the detection pipeline:
+    it is logged and counted on ``anomaly_sink_failures_total`` but never
+    blocks ``/metrics`` or readiness.
+    """
+
+    type: Literal["remote_write", "grafana_annotations"]
+    remote_write: RemoteWriteSinkConfig | None = None
+    grafana_annotations: GrafanaAnnotationsSinkConfig | None = None
+
+    @model_validator(mode="after")
+    def _require_matching_block(self) -> SinkConfig:
+        blocks = {
+            "remote_write": self.remote_write,
+            "grafana_annotations": self.grafana_annotations,
+        }
+        selected = blocks[self.type]
+        if selected is None:
+            raise ValueError(f"sink.type={self.type!r} requires a sink.{self.type} block")
+        extras = sorted(name for name, block in blocks.items() if name != self.type and block)
+        if extras:
+            raise ValueError(
+                f"sink.type={self.type!r} but unrelated sink block(s) {extras} are also set; "
+                "configure exactly one sink"
+            )
+        return self
+
+
 _DISCOVER_VARIABLE_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
@@ -703,7 +831,56 @@ class Config(_ModelBase):
     exporter: ExporterConfig = Field(default_factory=ExporterConfig)
     highAvailability: HighAvailabilityConfig = Field(default_factory=HighAvailabilityConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
+    # Optional push sink(s) active alongside the always-on ``/metrics``
+    # exporter. Both default to pull-only.
+    #
+    # ``sink`` is the scalar single-sink form, retained for backward
+    # compatibility. ``sinks`` is the list form: ``/metrics`` is always
+    # available and each configured push sink runs after every successful
+    # run. The two are mutually exclusive — set one or neither, never
+    # both — and :meth:`effective_sinks` normalises whichever was given
+    # into a single list the runtime consumes.
+    sink: SinkConfig | None = None
+    sinks: list[SinkConfig] | None = None
     groups: list[GroupConfig]
+
+    @model_validator(mode="after")
+    def _validate_sinks(self) -> Config:
+        if self.sink is not None and self.sinks is not None:
+            raise ValueError(
+                "set either 'sink' (single) or 'sinks' (list), not both; "
+                "'sink' is the backward-compatible scalar form of 'sinks'"
+            )
+        if self.sinks is not None:
+            if not self.sinks:
+                raise ValueError("'sinks' must list at least one sink, or be omitted for pull-only")
+            # Each sink's ``type`` is its ``sink`` label value on
+            # ``anomaly_sink_failures_total``; duplicate types would
+            # collide on that label and make per-sink failure counts
+            # ambiguous, so a type may appear at most once. Two sinks of
+            # the same kind to different targets is intentionally not
+            # supported (it drifts toward unbounded sink fan-out).
+            types = [s.type for s in self.sinks]
+            dupes = sorted({t for t in types if types.count(t) > 1})
+            if dupes:
+                raise ValueError(
+                    f"duplicate sink type(s) {dupes} in 'sinks'; each sink type may "
+                    "appear at most once so anomaly_sink_failures_total{sink=...} stays unambiguous"
+                )
+        return self
+
+    def effective_sinks(self) -> list[SinkConfig]:
+        """Normalise the scalar and list sink forms into one list.
+
+        Returns ``[]`` when pull-only. The runtime only ever consults
+        this, so the scalar / list distinction stays confined to config
+        parsing.
+        """
+        if self.sinks is not None:
+            return list(self.sinks)
+        if self.sink is not None:
+            return [self.sink]
+        return []
 
     @model_validator(mode="after")
     def _validate_ha_requires_redis(self) -> Config:
@@ -886,6 +1063,7 @@ __all__ = [
     "EnsembleConfig",
     "ExporterConfig",
     "ExporterLabelsConfig",
+    "GrafanaAnnotationsSinkConfig",
     "GroupConfig",
     "HighAvailabilityConfig",
     "OTLPConfig",
@@ -894,9 +1072,11 @@ __all__ = [
     "RedisConfig",
     "ReloadAuthConfig",
     "ReloadConfig",
+    "RemoteWriteSinkConfig",
     "SafetyConfig",
     "SelfTestConfig",
     "ServerConfig",
+    "SinkConfig",
     "TelemetryConfig",
     "load_config",
     "parse_duration",

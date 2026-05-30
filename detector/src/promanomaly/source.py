@@ -20,6 +20,7 @@ import pandas as pd
 
 from .cache import TTLCache
 from .config import AuthConfig
+from .httpauth import build_httpx_auth
 
 # Shared connection pool sized for the typical 10k-series workload. The
 # httpx default of 10 concurrent connections bottlenecks against a fast
@@ -121,17 +122,7 @@ class PromQLSource:
             "base_url": self._base_url,
             "limits": _HTTP_LIMITS,
         }
-        if self._auth.type == "bearer" and self._auth.token:
-            kwargs["headers"] = {"Authorization": f"Bearer {self._auth.token}"}
-        elif self._auth.type == "basic" and self._auth.username:
-            kwargs["auth"] = httpx.BasicAuth(self._auth.username, self._auth.password or "")
-        elif self._auth.type == "mtls":
-            cert = self._auth.cert_file
-            key = self._auth.key_file
-            if cert and key:
-                kwargs["cert"] = (cert, key)
-            if self._auth.ca_file:
-                kwargs["verify"] = self._auth.ca_file
+        kwargs.update(build_httpx_auth(self._auth))
         self._client = httpx.AsyncClient(**kwargs)
 
     async def close(self) -> None:

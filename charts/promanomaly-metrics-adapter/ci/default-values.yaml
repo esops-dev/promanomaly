@@ -1,0 +1,3 @@
+# Default install: chart-generated self-signed serving cert + APIServices.
+datasource:
+  url: http://victoriametrics.monitoring.svc:8428/

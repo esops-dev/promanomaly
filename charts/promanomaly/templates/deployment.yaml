@@ -1,3 +1,27 @@
+{{- /*
+  Bearer-token Secret mounts for the active push sink(s). The scalar
+  ``sink:`` form mounts a single Secret at /etc/promanomaly-sink-auth; the
+  ``sinks:`` list form mounts each sink's Secret under its own
+  /etc/promanomaly-sink-auth/<type> directory (the sink type is unique).
+  ``$sinkMounts`` is a list of {name, secret, path} consumed by the
+  volumeMounts and volumes blocks below so the two never drift.
+*/ -}}
+{{- $sinkMounts := list -}}
+{{- if .Values.sinks -}}
+  {{- range $sink := .Values.sinks -}}
+    {{- /* ``auth`` is optional on a list entry, so traverse with dig. */ -}}
+    {{- $secret := dig $sink.type "auth" "existingSecret" "" $sink -}}
+    {{- if $secret -}}
+      {{- $name := printf "sink-auth-%s" (replace "_" "-" $sink.type) -}}
+      {{- $sinkMounts = append $sinkMounts (dict "name" $name "secret" $secret "path" (include "promanomaly.sinkAuthDir" $sink.type)) -}}
+    {{- end -}}
+  {{- end -}}
+{{- else if .Values.sink.type -}}
+  {{- $scalarSecret := dig .Values.sink.type "auth" "existingSecret" "" .Values.sink -}}
+  {{- if $scalarSecret -}}
+    {{- $sinkMounts = append $sinkMounts (dict "name" "sink-auth" "secret" $scalarSecret "path" "/etc/promanomaly-sink-auth") -}}
+  {{- end -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -87,12 +111,32 @@ spec:
             - name: config
               mountPath: /etc/promanomaly
               readOnly: true
+            {{- if .Values.datasource.auth.existingSecret }}
+            - name: datasource-auth
+              mountPath: /etc/promanomaly-datasource-auth
+              readOnly: true
+            {{- end }}
+            {{- range $sinkMounts }}
+            - name: {{ .name }}
+              mountPath: {{ .path }}
+              readOnly: true
+            {{- end }}
             - name: tmp
               mountPath: /tmp
       volumes:
         - name: config
           configMap:
             name: {{ include "promanomaly.configMapName" . }}
+        {{- if .Values.datasource.auth.existingSecret }}
+        - name: datasource-auth
+          secret:
+            secretName: {{ .Values.datasource.auth.existingSecret | quote }}
+        {{- end }}
+        {{- range $sinkMounts }}
+        - name: {{ .name }}
+          secret:
+            secretName: {{ .secret | quote }}
+        {{- end }}
         - name: tmp
           emptyDir: {}
       {{- with .Values.nodeSelector }}

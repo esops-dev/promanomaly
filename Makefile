@@ -85,8 +85,10 @@ chart-deps: ## Resolve umbrella subchart dependencies.
 chart-lint: chart-deps ## helm lint + kubeconform on rendered manifests.
 	helm lint $(CHART_DIR)/promanomaly
 	helm lint $(CHART_DIR)/promanomaly-stack
-	helm template $(CHART_DIR)/promanomaly       | kubeconform -strict -summary -ignore-missing-schemas
-	helm template $(CHART_DIR)/promanomaly-stack | kubeconform -strict -summary -ignore-missing-schemas
+	helm lint $(CHART_DIR)/promanomaly-metrics-adapter
+	helm template $(CHART_DIR)/promanomaly                  | kubeconform -strict -summary -ignore-missing-schemas
+	helm template $(CHART_DIR)/promanomaly-stack            | kubeconform -strict -summary -ignore-missing-schemas
+	helm template $(CHART_DIR)/promanomaly-metrics-adapter  | kubeconform -strict -summary -ignore-missing-schemas
 	@if command -v yamllint >/dev/null; then \
 	  yamllint -c .chart-testing-lintconf.yaml \
 	    $(CHART_DIR)/promanomaly/Chart.yaml \
@@ -94,7 +96,10 @@ chart-lint: chart-deps ## helm lint + kubeconform on rendered manifests.
 	    $(CHART_DIR)/promanomaly/ci \
 	    $(CHART_DIR)/promanomaly-stack/Chart.yaml \
 	    $(CHART_DIR)/promanomaly-stack/values.yaml \
-	    $(CHART_DIR)/promanomaly-stack/ci; \
+	    $(CHART_DIR)/promanomaly-stack/ci \
+	    $(CHART_DIR)/promanomaly-metrics-adapter/Chart.yaml \
+	    $(CHART_DIR)/promanomaly-metrics-adapter/values.yaml \
+	    $(CHART_DIR)/promanomaly-metrics-adapter/ci; \
 	else \
 	  echo "yamllint not installed — skipping (ct lint will run it in CI)"; \
 	fi
@@ -104,7 +109,7 @@ chart-lint: chart-deps ## helm lint + kubeconform on rendered manifests.
 .PHONY: chart-matrix
 chart-matrix: chart-deps ## Render each chart with every ci/*-values.yaml + kubeconform.
 	@set -e; \
-	for chart in $(CHART_DIR)/promanomaly $(CHART_DIR)/promanomaly-stack; do \
+	for chart in $(CHART_DIR)/promanomaly $(CHART_DIR)/promanomaly-stack $(CHART_DIR)/promanomaly-metrics-adapter; do \
 	  for vf in $$chart/ci/*-values.yaml; do \
 	    echo "--- $$chart :: $$(basename $$vf) ---"; \
 	    helm template $$chart --values $$vf \

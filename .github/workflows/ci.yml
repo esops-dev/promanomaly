@@ -64,6 +64,24 @@ jobs:
           path: detector/coverage.xml
           if-no-files-found: ignore
 
+  validate-action:
+    name: Config-validation Action (dogfood)
+    # Exercises the composite action.yml on an example config so the
+    # published GitOps validation Action can't regress. No datasource is
+    # available in CI, so this runs the static checks only (schema +
+    # --estimate-cost --strict); --probe / --lint-metadata are covered by
+    # the unit tests, which stub the datasource.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate an example config via the action
+        uses: ./
+        with:
+          config: examples/configs/node-exporter.yaml
+          estimate-cost: "true"
+          strict: "true"
+
   community-prophet:
     name: Community ProphetResidual (lint + test with Prophet stubbed)
     # Prophet's real install pulls cmdstan / pystan and is multi-minute on
@@ -71,7 +89,7 @@ jobs:
     # ``Prophet(...).fit(...).predict(...)``, so we lint + test the
     # community package against a tiny Prophet stub (tests/conftest.py)
     # without installing the real thing — the third-party plug-in path
-    # documented in the v0.4 roadmap.
+    # documented in the roadmap.
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -137,7 +155,7 @@ jobs:
       - name: ct lint
         run: |
           ct lint \
-            --charts charts/promanomaly,charts/promanomaly-stack \
+            --charts charts/promanomaly,charts/promanomaly-stack,charts/promanomaly-metrics-adapter \
             --validate-maintainers=false \
             --check-version-increment=false \
             --target-branch ${{ github.event.repository.default_branch }}
@@ -146,6 +164,7 @@ jobs:
         run: |
           helm lint --strict charts/promanomaly
           helm lint --strict charts/promanomaly-stack
+          helm lint --strict charts/promanomaly-metrics-adapter
 
       - name: Install kubeconform
         run: |
@@ -156,8 +175,9 @@ jobs:
 
       - name: kubeconform
         run: |
-          helm template charts/promanomaly       | kubeconform -strict -summary -ignore-missing-schemas
-          helm template charts/promanomaly-stack | kubeconform -strict -summary -ignore-missing-schemas
+          helm template charts/promanomaly                  | kubeconform -strict -summary -ignore-missing-schemas
+          helm template charts/promanomaly-stack            | kubeconform -strict -summary -ignore-missing-schemas
+          helm template charts/promanomaly-metrics-adapter  | kubeconform -strict -summary -ignore-missing-schemas
 
       - name: chart-testing values matrix (lint + render + kubeconform)
         # ct lint already exercises the ci/ values files, but we
@@ -170,7 +190,7 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           fail=0
-          for chart in charts/promanomaly charts/promanomaly-stack; do
+          for chart in charts/promanomaly charts/promanomaly-stack charts/promanomaly-metrics-adapter; do
             for vf in "$chart"/ci/*-values.yaml; do
               echo "::group::render $chart with $(basename "$vf")"
               if ! helm template "$chart" --values "$vf" \

@@ -1,0 +1,45 @@
+{{- if not .Values.existingConfigMap }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "adapter.configMapName" . }}
+  labels: {{- include "adapter.labels" . | nindent 4 }}
+data:
+  adapter.yaml: |
+    datasource:
+      url: {{ .Values.datasource.url | quote }}
+      timeout: {{ .Values.datasource.timeout | quote }}
+      auth:
+        type: {{ .Values.datasource.auth.type | quote }}
+        {{- if .Values.datasource.auth.existingSecret }}
+        {{- /*
+          Credentials mounted from datasource.auth.existingSecret at
+          /etc/promanomaly-adapter/datasource-auth and referenced by file.
+          Secret keys per type: bearer -> token; basic -> password
+          (+ auth.username here); mtls -> ca.crt / tls.crt / tls.key.
+        */}}
+        {{- if eq .Values.datasource.auth.type "bearer" }}
+        token_file: /etc/promanomaly-adapter/datasource-auth/token
+        {{- else if eq .Values.datasource.auth.type "basic" }}
+        username: {{ .Values.datasource.auth.username | quote }}
+        password_file: /etc/promanomaly-adapter/datasource-auth/password
+        {{- else if eq .Values.datasource.auth.type "mtls" }}
+        ca_file: /etc/promanomaly-adapter/datasource-auth/ca.crt
+        cert_file: /etc/promanomaly-adapter/datasource-auth/tls.crt
+        key_file: /etc/promanomaly-adapter/datasource-auth/tls.key
+        {{- end }}
+        {{- end }}
+    listen: ":{{ .Values.containerPort }}"
+    tls:
+      cert_file: /etc/promanomaly-adapter/tls/tls.crt
+      key_file: /etc/promanomaly-adapter/tls/tls.key
+    timeout: {{ .Values.datasource.timeout | quote }}
+    metrics:
+      {{- range .Values.metrics }}
+      - {{ . | quote }}
+      {{- end }}
+    custom_resources:
+      {{- range .Values.customResources }}
+      - {{ . | quote }}
+      {{- end }}
+{{- end }}
