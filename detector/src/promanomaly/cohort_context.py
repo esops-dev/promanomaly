@@ -102,7 +102,7 @@ def build_cohort_context(
         # Partition series by cohort key.
         buckets: dict[tuple[tuple[str, str], ...], list[np.ndarray[Any, Any]]] = {}
         for series in series_list:
-            if not series.samples.shape[0]:
+            if series.samples.empty:
                 continue
             key = cohort_key_for(series.labels, cohort_label)
             values = series.samples["y"].to_numpy(dtype=float, copy=False)

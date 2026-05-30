@@ -286,6 +286,10 @@ class ReloadAuthConfig(_ModelBase):
 
 class ReloadConfig(_ModelBase):
     enabled: bool = True
+    # When True (the default), the detector watches the mounted ConfigMap
+    # for changes and triggers a reload automatically. Disabling this
+    # restricts reloads to explicit ``/-/reload`` calls or SIGHUP.
+    watch_configmap: bool = True
     auth: ReloadAuthConfig = Field(default_factory=ReloadAuthConfig)
 
 

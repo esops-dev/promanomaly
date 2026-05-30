@@ -15,10 +15,13 @@ never serve a poisoned snapshot.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
 
 from .snapshot import GroupSnapshot, SnapshotStore
+
+logger = logging.getLogger(__name__)
 
 
 class SharedSnapshotCache:
@@ -57,10 +60,12 @@ class SharedSnapshotCache:
         try:
             payload = encode_snapshot(snapshot)
         except Exception:
+            logger.debug("snapshot_encode_failed", exc_info=True)
             return
         try:
             self._client.set(self._key_for(snapshot.group), payload, ex=self._ttl)
         except Exception:
+            logger.debug("snapshot_publish_failed", exc_info=True)
             return
 
     def load_all(self) -> list[GroupSnapshot]:
@@ -81,6 +86,7 @@ class SharedSnapshotCache:
                 return []
             raws = self._client.mget(keys)
         except Exception:
+            logger.debug("snapshot_load_all_failed", exc_info=True)
             return []
         results: list[GroupSnapshot] = []
         for raw in raws:
@@ -95,6 +101,7 @@ class SharedSnapshotCache:
         try:
             self._client.delete(self._key_for(group))
         except Exception:
+            logger.debug("snapshot_remove_failed", exc_info=True)
             return
 
     def _key_for(self, group: str) -> str:

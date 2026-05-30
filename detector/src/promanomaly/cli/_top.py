@@ -19,7 +19,9 @@ def _format_duration(seconds: float) -> str:
         parts.append(f"{hours}h")
     if minutes:
         parts.append(f"{minutes}m")
-    if secs and not hours:
+    if secs and not hours and not minutes:
+        # Show seconds only when no larger unit is present, keeping the
+        # output compact ("1h5m" not "1h5m30s", "45s" not "0h0m45s").
         parts.append(f"{secs}s")
     return "".join(parts) or "0s"
 

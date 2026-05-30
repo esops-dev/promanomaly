@@ -19,10 +19,12 @@ with ``promanomaly.`` so they don't collide with downstream conventions.
 
 from __future__ import annotations
 
-import contextlib
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type hints
     from .config import TelemetryConfig
@@ -135,8 +137,10 @@ class Telemetry:
         # Shutdown failures are observability-side and must not block the
         # rest of the application shutdown sequence — tracing is
         # observability, not control flow.
-        with contextlib.suppress(Exception):  # pragma: no cover - defensive
+        try:  # pragma: no cover - defensive
             self._provider.shutdown()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("telemetry_provider_shutdown_failed", exc_info=True)
 
     @contextmanager
     def span(self, name: str, **attributes: Any) -> Iterator[Any]:

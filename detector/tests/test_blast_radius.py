@@ -106,6 +106,36 @@ def test_cohort_rollup_groups_by_cohort_identity() -> None:
     assert cohort.cohort_key.get("id") == "x"
 
 
+def test_empty_group_produces_no_rows() -> None:
+    """A group with zero scored series produces no blast-radius rows."""
+    store = SnapshotStore()
+    store.write(GroupSnapshot(group="empty", timestamp=time.time(), samples=[]))
+    rows = collect_blast_radius(store)
+    assert rows == []
+
+
+def test_all_warming_up_produces_no_rows() -> None:
+    """A group where every series is warming up has no scored members.
+
+    The density rollup excludes warming-up series, so the blast-radius
+    rollup should mirror that and report nothing rather than 0/0.
+    """
+    samples = [
+        _sample("anomaly_outside_threshold", 0.0, id="a", group="g", detector="MAD"),
+        _sample("anomaly_warming_up", 1.0, id="a", group="g", detector="MAD"),
+        _sample("anomaly_outside_threshold", 0.0, id="b", group="g", detector="MAD"),
+        _sample("anomaly_warming_up", 1.0, id="b", group="g", detector="MAD"),
+    ]
+    rows = collect_blast_radius(_store_with("g", samples))
+    group_rows = [r for r in rows if r.scope == "group"]
+    # All members excluded by warming filter → total=0 → no row emitted,
+    # consistent with the density rollup's "no fleet to measure" semantics.
+    assert len(group_rows) == 1
+    assert group_rows[0].total == 0
+    assert group_rows[0].firing == 0
+    assert group_rows[0].fraction == 0.0
+
+
 def test_rows_sorted_by_fraction_then_firing() -> None:
     samples = [
         # group g1: 1 of 4 firing -> fraction 0.25

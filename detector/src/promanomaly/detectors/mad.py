@@ -100,6 +100,7 @@ class MAD:
                 "MAD-units cutoff used by recursive_trim to drop "
                 "contaminating points from the second-pass baseline."
             ),
+            minimum=0.0,
         ),
     )
 

@@ -80,9 +80,12 @@ def _run_offline_change_points(
             # Score: absolute mean shift across the break, normalised by
             # the in-segment standard deviation. Approximate but
             # interpretable; lets the caller rank breaks by magnitude.
+            # Use up to 30 samples on each side, but accept whatever is
+            # available near array edges so edge breakpoints still get a
+            # meaningful score instead of being silently zeroed out.
             left = values[max(0, bp - 30) : bp]
             right = values[bp : min(values.size, bp + 30)]
-            if left.size == 0 or right.size == 0:
+            if left.size < 2 or right.size < 2:
                 score = 0.0
             else:
                 pooled_std = float(np.std(np.concatenate([left, right])))

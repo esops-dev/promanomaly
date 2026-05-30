@@ -25,6 +25,7 @@ OPTIONAL_SCORE_COLUMNS: tuple[str, ...] = (
     "baseline_lower",
     "baseline_upper",
     "change_point",
+    "anomaly_type",
 )
 
 

@@ -310,8 +310,8 @@ def _scoring_window_seconds(merged: dict[str, Any], default_window: float) -> fl
 
 def _nlogn(points: int) -> float:
     """``n log2 n`` with a floor so tiny / zero windows don't blow up."""
-    n = max(points, 1)
-    return n * math.log2(n + 1)
+    n = max(points, 2)
+    return n * math.log2(n)
 
 
 __all__ = [

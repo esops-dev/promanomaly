@@ -60,12 +60,15 @@ def _analyse_bucket_structure(
         }
 
     centred = aggregated - float(np.mean(aggregated))
-    variance = float(np.dot(centred, centred))
+    # Lag-0 autocovariance (== variance * N). The ACF at lag k is the
+    # ratio autocovariance(k) / autocovariance(0), so dividing each
+    # lag's dot product by this value produces correlations in [-1, 1].
+    c0 = float(np.dot(centred, centred))
     # Float noise on a strictly-constant input still produces a tiny
-    # positive variance; treat anything below numerical noise as
-    # constant so the recommendation surface doesn't claim periodicity
-    # on a flat signal.
-    if variance <= 1e-9:
+    # positive c0; treat anything below numerical noise as constant so
+    # the recommendation surface doesn't claim periodicity on a flat
+    # signal.
+    if c0 <= 1e-9:
         return {
             "status": "constant_signal",
             "samples": int(aggregated.size),
@@ -76,8 +79,9 @@ def _analyse_bucket_structure(
     # of one week if the window doesn't cover it.
     max_lag = min(aggregated.size // 2, int(8 * 86400.0 / step_seconds))
     acf = np.zeros(max_lag, dtype=float)
+    acf[0] = 1.0  # ACF at lag 0 is always 1.0 by definition
     for lag in range(1, max_lag):
-        acf[lag] = float(np.dot(centred[lag:], centred[:-lag])) / variance
+        acf[lag] = float(np.dot(centred[lag:], centred[:-lag])) / c0
 
     # Find local maxima in the ACF — those are candidate periods. Skip
     # the very-short-lag noise (< step minutes) which is autocorrelation

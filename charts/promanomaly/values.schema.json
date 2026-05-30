@@ -92,6 +92,7 @@
       "properties": {
         "listen": {"type": "string"},
         "refresh_interval": {"type": "string"},
+        "ready_endpoint": {"type": "boolean"},
         "expose_warmup_endpoint": {"type": "boolean"},
         "selftest": {
           "type": "object",
@@ -99,6 +100,20 @@
             "enabled": {"type": "boolean"},
             "detector": {"type": "string"},
             "threshold": {"type": "number", "exclusiveMinimum": 0}
+          }
+        },
+        "reload": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "watch_configmap": {"type": "boolean"},
+            "auth": {
+              "type": "object",
+              "properties": {
+                "type": {"type": "string", "enum": ["none", "bearer", "mtls"]},
+                "existingSecret": {"type": "string"}
+              }
+            }
           }
         }
       }
@@ -109,8 +124,11 @@
         "max_series_per_query": {"type": "integer", "minimum": 1},
         "max_total_series": {"type": "integer", "minimum": 1},
         "series_overflow": {"type": "string", "enum": ["drop_lowest_priority", "reject", "sample"]},
+        "detect_timeout": {"type": "string"},
+        "query_timeout": {"type": "string"},
         "on_source_failure": {"type": "string", "enum": ["serve_stale", "drop_scores", "fail_ready"]},
         "fail_ready_after": {"type": "integer", "minimum": 1},
+        "max_stratified_cache_entries": {"type": "integer", "minimum": 1},
         "query_cache": {
           "type": "object",
           "properties": {
@@ -139,9 +157,27 @@
     "defaults": {
       "type": "object",
       "properties": {
+        "window": {"type": "string"},
+        "step": {"type": "string"},
+        "min_points": {"type": "integer", "minimum": 1},
         "warmup_policy": {
           "type": "string",
           "enum": ["emit_warming_up", "suppress", "emit_with_flag"]
+        },
+        "min_abs_delta": {"type": "number", "minimum": 0},
+        "min_relative_delta": {"type": "number", "minimum": 0},
+        "emit_baseline": {"type": "boolean"},
+        "emit_change_points": {"type": "boolean"},
+        "emit_baseline_stability": {"type": "boolean"},
+        "emit_duration": {"type": "boolean"},
+        "emit_severity": {"type": "boolean"},
+        "emit_anomaly_type": {"type": "boolean"},
+        "density_by": {"type": "array", "items": {"type": "string"}},
+        "alert_thresholds": {
+          "type": "object",
+          "properties": {
+            "score": {"type": "number", "exclusiveMinimum": 0}
+          }
         }
       }
     },
