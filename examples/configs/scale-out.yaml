@@ -1,0 +1,90 @@
+# Active/active horizontal scale-out + per-group cadence + load shedding.
+#
+# The resilience topology for an estate too large for one process to
+# score within a refresh interval. Three replicas each own a
+# disjoint shard of the series (rendezvous hashing on the series key) and
+# run concurrently; the union of their /metrics covers the whole estate.
+#
+# Deployment notes:
+# - The Helm chart renders a StatefulSet of ``scaleOut.shards`` pods when
+#   ``scaleOut.enabled=true``; each pod self-assigns its shard index from
+#   its StatefulSet ordinal (POD_NAME) — no per-pod config.
+# - ``scaleOut`` and ``highAvailability`` are mutually exclusive: HA is
+#   active/passive (one leader), scale-out is active/active (N shards).
+# - ``safety.max_total_series`` is enforced PER SHARD here, so the whole
+#   estate ceiling is ``max_total_series x shards`` (15000 x 3 = 45000).
+# - Demonstrates per-group ``refresh_interval`` overrides and
+#   priority-aware load shedding (``safety.max_concurrent_groups``).
+# See docs/operations.md and docs/production-checklist.md.
+
+apiVersion: promanomaly.io/v1
+
+datasource:
+  url: http://victoriametrics:8428/
+  timeout: 10s
+
+server:
+  listen: ":9092"
+  # Default cadence for groups without their own refresh_interval.
+  refresh_interval: 1m
+  reload:
+    enabled: true
+    watch_configmap: true
+  ready_endpoint: true
+
+safety:
+  # Per-shard cap: the whole-estate ceiling is this x scaleOut.shards.
+  max_series_per_query: 2000
+  max_total_series: 15000
+  on_source_failure: serve_stale
+  # Priority-aware load shedding: at most 2 groups run at once. Under
+  # TSDB backpressure the scheduler prefers higher-priority groups and
+  # sheds (skips) low-priority runs that can't get a slot within their
+  # refresh interval, surfacing them on anomaly_group_skipped_total.
+  max_concurrent_groups: 2
+
+# Active/active sharding. Mutually exclusive with highAvailability.
+scaleOut:
+  enabled: true
+  shards: 3
+
+defaults:
+  window: 1h
+  step: 15s
+  min_points: 60
+  warmup_policy: emit_warming_up
+  emit_duration: true
+  emit_severity: true
+  alert_thresholds:
+    score: 3.0
+
+groups:
+  # Hot, cheap signal — scored more often than the server default.
+  - name: error_rates
+    priority: 10                # admitted ahead of lower-priority groups
+    refresh_interval: 30s
+    queries:
+      - id: api_error_rate
+        promql: |
+          sum by (service) (rate(http_requests_total{code=~"5.."}[5m]))
+            /
+          sum by (service) (rate(http_requests_total[5m]))
+        min_relative_delta: 0.05
+        detectors:
+          - name: MAD
+          - name: ZScoreEWMA
+            params:
+              alpha: 0.05
+
+  # Expensive stratified baseline — refreshed rarely so it doesn't
+  # compete with the hot group on every tick.
+  - name: weekly_latency
+    priority: 1
+    refresh_interval: 5m
+    queries:
+      - id: api_p95_latency
+        promql: histogram_quantile(0.95, sum by (service, le) (rate(http_request_duration_seconds_bucket[5m])))
+        detectors:
+          - name: HourOfDayMAD
+            params:
+              lookback: 2w

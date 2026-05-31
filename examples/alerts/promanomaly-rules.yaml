@@ -277,3 +277,27 @@ spec:
               → export pipeline is not surfacing anomalies even though the
               process is up — check for a config/threshold mistake or an
               exporter regression. See anomaly_selftest_failures_total.
+
+        - alert: AnomalyGroupStarved
+          # Priority-aware load shedding (safety.max_concurrent_groups):
+          # under sustained TSDB backpressure the scheduler sheds
+          # low-priority group runs (reason="backpressure") or a group
+          # cannot finish within its refresh interval (reason="overrun").
+          # A skip delays a score; it never suppresses a detected anomaly
+          # (the last good snapshot stays per serve_stale). Sustained
+          # shedding means the detector is starved of capacity — raise the
+          # concurrency cap, lengthen the group's refresh_interval, or
+          # lighten its config.
+          expr: rate(anomaly_group_skipped_total[15m]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "promanomaly is shedding runs for {{ $labels.group }} ({{ $labels.reason }})"
+            description: |
+              Group {{ $labels.group }} has had runs skipped
+              (reason={{ $labels.reason }}) over the last 15 minutes. The
+              detector cannot keep every group on its cadence under the
+              current load. Scores for this group are delayed, not
+              suppressed. Raise safety.max_concurrent_groups, lengthen the
+              group's refresh_interval, or split its heavy queries.

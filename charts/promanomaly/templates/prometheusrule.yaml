@@ -261,4 +261,22 @@ spec:
               See anomaly_selftest_failures_total. Requires server.selftest.enabled.
         {{- end }}
         {{- end }}
+        {{- with $rules.anomalyGroupStarved }}
+        {{- if .enabled }}
+        - alert: AnomalyGroupStarved
+          expr: rate(anomaly_group_skipped_total[15m]) > 0
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "promanomaly is shedding runs for {{ "{{" }} $labels.group {{ "}}" }} ({{ "{{" }} $labels.reason {{ "}}" }})"
+            description: |
+              Group {{ "{{" }} $labels.group {{ "}}" }} has had runs skipped
+              (reason={{ "{{" }} $labels.reason {{ "}}" }}) over the last 15 minutes.
+              The detector cannot keep every group on its cadence under the current
+              load. Scores for this group are delayed, not suppressed. Raise
+              safety.max_concurrent_groups, lengthen the group's refresh_interval,
+              or split its heavy queries.
+        {{- end }}
+        {{- end }}
 {{- end }}

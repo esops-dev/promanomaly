@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
+from apscheduler.events import EVENT_JOB_MAX_INSTANCES
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI
@@ -39,8 +40,10 @@ from .ha import HAComponents, build_ha_components, run_follower_loop, stop_ha
 from .leader import resolve_identity
 from .logging import configure_logging, get_logger
 from .runner import Runner
+from .scheduling import LoadShedder
 from .selftest import run_selftest
 from .server import build_app as _build_app
+from .sharding import ShardAssignment, resolve_shard_index
 from .sinks import Sink, build_sinks
 from .source import PromQLSource, QueryResult
 from .state import SnapshotStore
@@ -75,13 +78,23 @@ class Application:
         # touches telemetry config requires a restart, which is documented
         # in docs/telemetry.md alongside the zero-overhead caveat.
         self._telemetry = Telemetry.from_config(config.telemetry)
+        # Active/active scale-out: resolve this replica's shard from the
+        # StatefulSet pod ordinal (or an explicit override) once at boot.
+        # ``None`` when scale-out is off, so the runner's per-series shard
+        # filter is a no-op and behaviour matches the single-replica MVP.
+        self._shard = _resolve_shard(config)
         self._runner = Runner(
             config=config,
             source=self._source,
             store=self._store,
             operational=self._ops,
             telemetry=self._telemetry,
+            shard=self._shard,
         )
+        # Priority-aware admission gate for group scheduling. A pass-
+        # through (no shedding) unless ``safety.max_concurrent_groups``
+        # is set, so default scheduling is byte-identical to before.
+        self._load_shedder = LoadShedder(config.safety.max_concurrent_groups)
         self._exporter = Exporter(self._store, self._ops, self._source)
         # Optional push sinks (remote_write / grafana_annotations) running
         # alongside the always-on /metrics exporter. Empty when pull-only.
@@ -110,6 +123,10 @@ class Application:
         # it. Single-replica leaves this dict empty.
         self._running_group_tasks: dict[str, set[asyncio.Task[None]]] = {}
         self._identity = resolve_identity(config.highAvailability.identity)
+        if self._shard is not None:
+            # Publish which shard this replica owns so an operator can see
+            # the partition (and confirm every shard index is covered).
+            self._ops.shard.labels(instance=self._identity).set(float(self._shard.index))
         self._stamp_config_hash(config)
         if self._ha_enabled:
             self._ops.leader_elected.labels(instance=self._identity).set(0.0)
@@ -133,6 +150,12 @@ class Application:
         for sink in self._sinks:
             await sink.start()
         self._scheduler = AsyncIOScheduler()
+        # Register the overrun listener exactly once for the scheduler's
+        # lifetime. APScheduler's add_listener appends without de-duping,
+        # so installing it inside _reschedule_jobs (which reruns on every
+        # reload) would stack duplicate listeners and multiply the
+        # anomaly_group_skipped_total{reason="overrun"} counter per reload.
+        self._scheduler.add_listener(self._on_job_max_instances, EVENT_JOB_MAX_INSTANCES)
         self._reschedule_jobs(self._scheduler)
         self._scheduler.start()
         # SIGHUP must be wired here, not in serve(), because only inside
@@ -202,6 +225,24 @@ class Application:
                 logger.error("reload_validation_failed", error=str(exc))
                 return False, f"validation failed: {exc}"
 
+            # Scale-out sharding is resolved once at boot from the pod
+            # ordinal; the shard assignment is baked into the runner and
+            # the anomaly_shard gauge. A hot reload can't safely change it
+            # (the replica count / ordinals only change via a StatefulSet
+            # rollout, which restarts pods anyway). Reject the reload
+            # rather than silently keep scoring the old slice under the new
+            # shard count — that would leave the estate partially scored.
+            if new_config.scaleOut != self._config.scaleOut:
+                logger.error(
+                    "reload_scaleout_change_rejected",
+                    old_shards=self._config.scaleOut.shards,
+                    new_shards=new_config.scaleOut.shards,
+                )
+                return False, (
+                    "scaleOut changes require a pod restart (roll the StatefulSet), "
+                    "not a hot reload; the previous config stays active"
+                )
+
             self._runner.replace_config(new_config)
             # Close stale tenant sources — the runner will lazily create
             # new ones on the next group run with the new config's tenants.
@@ -231,6 +272,10 @@ class Application:
             await self._swap_sinks(new_config)
             self._config = new_config
             self._stamp_config_hash(new_config)
+            # Pick up a changed concurrency cap without dropping the live
+            # running count (lowering it just admits fewer new runs until
+            # the count drains; raising it wakes any queued waiters).
+            self._load_shedder.set_max_concurrent(new_config.safety.max_concurrent_groups)
             if self._scheduler is not None:
                 self._reschedule_jobs(self._scheduler)
             # Trigger an immediate run for any groups that may have
@@ -259,33 +304,45 @@ class Application:
         # but a full rebuild keeps reload semantics simple and avoids
         # subtle drift between the live job set and the new config.
         scheduler.remove_all_jobs()
-        interval = self._config.server.refresh_interval_seconds
-        # APScheduler's IntervalTrigger defers the first run by one
-        # full interval; the immediate first run is fired from startup()
-        # separately so /metrics has content before that delay.
+        # Per-group refresh cadence: a group's own ``refresh_interval``
+        # wins, else ``server.refresh_interval``. The per-group lock
+        # already prevents overlap; APScheduler's IntervalTrigger defers
+        # the first run by one full interval, so the immediate first run
+        # is fired from startup() separately for /metrics warmth.
         for group in self._config.groups:
             scheduler.add_job(
                 self._tick,
-                trigger=IntervalTrigger(seconds=interval),
+                trigger=IntervalTrigger(seconds=self._config.group_refresh_seconds(group)),
                 args=[group.name],
                 id=f"group:{group.name}",
                 replace_existing=True,
                 max_instances=1,
                 coalesce=True,
             )
-        # End-to-end detection self-test, on the same cadence as the
-        # detector runs. Gated inside ``_selftest_tick`` by the leader flag
-        # like ``_tick``, so it fires on every replica but only the leader
-        # runs it in HA mode.
+        # End-to-end detection self-test, on the server cadence. Gated
+        # inside ``_selftest_tick`` by the leader flag like ``_tick``, so
+        # it fires on every replica but only the leader runs it in HA mode.
         if self._config.server.selftest.enabled:
             scheduler.add_job(
                 self._selftest_tick,
-                trigger=IntervalTrigger(seconds=interval),
+                trigger=IntervalTrigger(seconds=self._config.server.refresh_interval_seconds),
                 id="selftest",
                 replace_existing=True,
                 max_instances=1,
                 coalesce=True,
             )
+
+    def _on_job_max_instances(self, event: Any) -> None:
+        # APScheduler emits EVENT_JOB_MAX_INSTANCES when a group's previous
+        # run is still in flight at the next fire time (we run each group
+        # with max_instances=1). That overrun is a real degraded signal —
+        # the group can't keep up with its cadence — so it is counted with
+        # reason="overrun" rather than letting the coalesce vanish silently.
+        job_id = getattr(event, "job_id", "") or ""
+        if not job_id.startswith("group:"):
+            return
+        group_name = job_id[len("group:") :]
+        self._ops.group_skipped_total.labels(group=group_name, reason="overrun").inc()
 
     async def _tick(self, group_name: str) -> None:
         # In HA mode followers must never run the detector pipeline —
@@ -296,7 +353,48 @@ class Application:
         # behaviour identical when the leader changes mid-flight.
         if self._ha_enabled and not self._is_leader:
             return
-        await self._safe_group_run(group_name)
+        await self._admit_and_run(group_name)
+
+    async def _admit_and_run(self, group_name: str) -> None:
+        """Run a group under the priority-aware admission gate.
+
+        Uncapped (``safety.max_concurrent_groups`` unset) this is a
+        straight pass-through to ``_safe_group_run``. Capped, the gate
+        admits at most ``max_concurrent_groups`` runs at once, prefers
+        higher-``priority`` groups when saturated, and sheds (skips) a run
+        that can't get a slot within its own refresh interval — counted on
+        ``anomaly_group_skipped_total{reason="backpressure"}``.
+        """
+        if self._load_shedder.max_concurrent is None:
+            await self._safe_group_run(group_name)
+            return
+        group = self._group_by_name(group_name)
+        priority = group.priority if group is not None else 1
+        # Admission deadline is half the refresh interval, not a full one,
+        # so a shed resolves *before* the group's next tick fires. A
+        # full-interval wait would still be blocking when APScheduler
+        # tries to fire again (max_instances=1), tripping a spurious
+        # EVENT_JOB_MAX_INSTANCES (reason="overrun") on top of the
+        # backpressure shed and double-reporting one root cause. Halving
+        # keeps overrun ("the run is too slow") and backpressure
+        # ("admission is saturated") as distinct, non-overlapping signals.
+        refresh = self._config.group_refresh_seconds(group) if group is not None else 0.0
+        deadline = refresh / 2.0
+        admitted = await self._load_shedder.acquire(priority=priority, deadline_seconds=deadline)
+        if not admitted:
+            self._ops.group_skipped_total.labels(group=group_name, reason="backpressure").inc()
+            logger.info("group_run_shed", group=group_name, reason="backpressure")
+            return
+        try:
+            await self._safe_group_run(group_name)
+        finally:
+            self._load_shedder.release()
+
+    def _group_by_name(self, name: str) -> Any | None:
+        for group in self._config.groups:
+            if group.name == name:
+                return group
+        return None
 
     async def _safe_group_run(self, group_name: str) -> None:
         # Register the task so a leadership loss can cancel it. We do
@@ -600,6 +698,21 @@ def _build_query_cache(
     )
 
 
+def _resolve_shard(config: Config) -> ShardAssignment | None:
+    """Build this replica's shard assignment, or ``None`` when scale-out is off.
+
+    Returns ``None`` unless ``scaleOut.enabled`` (so the runner's shard
+    filter is skipped entirely in the common single-replica case). When
+    enabled, the index comes from ``scaleOut.shard_index`` or the
+    StatefulSet pod ordinal; an out-of-range resolution raises at boot.
+    """
+    scale_out = config.scaleOut
+    if not scale_out.enabled:
+        return None
+    index = resolve_shard_index(scale_out.shard_index, shards=scale_out.shards)
+    return ShardAssignment(index=index, count=scale_out.shards)
+
+
 def _maybe_build_redis(config: Config) -> Any | None:
     """Construct a Redis client iff any consumer in the config needs one.
 
@@ -652,10 +765,11 @@ def serve(config_path: str | Path) -> None:
             api_version=config.apiVersion,
             replacement=CURRENT_API_VERSION,
         )
-    if config.aggressive_refresh:
+    for group_name, effective in config.aggressive_refresh_groups():
         logger.warning(
             "aggressive_refresh_interval",
-            refresh_interval_seconds=config.server.refresh_interval_seconds,
+            group=group_name,
+            refresh_interval_seconds=effective,
             window_seconds=config.defaults.window_seconds,
             recommended_minimum_seconds=config.defaults.window_seconds / 6.0,
             note="refresh_interval below window/6 — rolling baseline lags",

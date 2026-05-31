@@ -68,6 +68,7 @@ from .recurrence import compute_recurrence_samples
 from .selector import select_winner
 from .self_observability import estimate_samples_bytes
 from .severity import compute_severity
+from .sharding import ShardAssignment
 from .source import PromQLSource, QueryResult, QuerySeries, SourceQueryError
 from .state import GroupSnapshot, Sample, SnapshotStore
 from .stratified import (
@@ -222,11 +223,16 @@ class Runner:
         *,
         executor: concurrent.futures.ThreadPoolExecutor | None = None,
         telemetry: Telemetry | None = None,
+        shard: ShardAssignment | None = None,
     ) -> None:
         self._config = config
         self._source = source
         self._store = store
         self._ops = operational
+        # Active/active scale-out: when set, only series whose key hashes
+        # to this shard are scored. ``None`` (single-shard / scale-out
+        # off) owns everything, so the per-series filter is a no-op.
+        self._shard = shard
         # OpenTelemetry tracing is optional and zero-overhead when disabled.
         # ``Telemetry.disabled()`` returns a singleton with no-op spans so
         # callers can ``with self._telemetry.span(...)`` unconditionally.
@@ -367,6 +373,11 @@ class Runner:
             self._group_locks.pop(removed, None)
             self._recurrence_cache.pop(removed, None)
             self._recurrence_last_run.pop(removed, None)
+            # Drop the sticky series count too: leaving it behind would
+            # permanently subtract a phantom count from the cross-group
+            # max_total_series budget (shrinking it for surviving groups)
+            # and inflate anomaly_shard_series_count until restart.
+            self._last_series_count.pop(removed, None)
         for added in new_names - old_names:
             self._group_locks[added] = asyncio.Lock()
         # Bound the rolling detector-success ledger to live groups so a
@@ -497,12 +508,12 @@ class Runner:
             elif result.succeeded:
                 self._store.reset_source_failure_streak(group_name)
 
+            # Updates the sticky per-group series count (drives the
+            # cross-group cap) and the operational gauges. Only the
+            # success path writes the sticky count, so a failed run never
+            # silently shrinks the budget for other groups.
             self._update_operational_metrics(result)
             if result.succeeded:
-                # Sticky series count drives the cross-group cap on the
-                # next pass. Only update on success — failed runs must
-                # not silently shrink the budget for other groups.
-                self._last_series_count[group_name] = result.series_count
                 self._store.write(
                     GroupSnapshot(
                         group=group_name,
@@ -545,7 +556,16 @@ class Runner:
         # to the snapshot so followers serve it and serve_stale keeps the
         # last good value during source outages, consistent with every
         # other snapshot metric.
-        out.samples.extend(self._density_samples(group, out.samples))
+        #
+        # Suppressed in sharded mode: each shard sees only its slice of
+        # the group's entities, so an in-process density would be a
+        # per-shard fraction — partial *and* emitted once per shard,
+        # violating the "sharding never multiplies series" contract.
+        # Operators compute true fleet density via a recording rule over
+        # the per-series anomaly_outside_threshold (the shard union is
+        # complete). See docs/operations.md.
+        if not self._is_sharded:
+            out.samples.extend(self._density_samples(group, out.samples))
 
         # Recurrence pattern analysis. Opt-in per group; queries the
         # TSDB for historical anomaly_outside_threshold and emits a 7x24
@@ -554,7 +574,13 @@ class Runner:
         # 1-minute group refresh. Between refreshes, the last-good
         # recurrence samples are carried forward in the snapshot via
         # _recurrence_cache.
-        if group.recurrence.enabled:
+        #
+        # In sharded mode only the group's owner shard emits it: the
+        # analysis re-reads the *complete* history from the TSDB (every
+        # shard's scores land there), so it is correct on any shard, but
+        # emitting from all shards would multiply the heatmap series.
+        # Gating to one shard keeps a single, correct copy.
+        if group.recurrence.enabled and self._shard_owns_group(group.name):
             now = time.time()
             last = self._recurrence_last_run.get(group.name, 0.0)
             interval = group.recurrence.refresh_interval_seconds
@@ -663,7 +689,12 @@ class Runner:
 
         seen_keys: list[tuple[tuple[str, str], ...]] = []
         for variant in variants:
-            seen_keys.append(variant.label_key)
+            # Track absence only for variants this shard owns, so the
+            # per-shard discovery tracker scopes itself to its slice and
+            # ``anomaly_signal_missing`` is emitted by exactly one shard.
+            # Scoring is still sharded per series inside the variant pass.
+            if self._shard_owns_key(variant.label_key):
+                seen_keys.append(variant.label_key)
             await self._process_query_variant(
                 group=group,
                 query=query,
@@ -765,7 +796,46 @@ class Runner:
         use that detector — we don't want to double-log here).
         """
         self._check_cohort_with_auto_select()
+        self._check_cohort_with_scaleout()
         self._check_stratified_findings()
+
+    def _check_cohort_with_scaleout(self) -> None:
+        """Cohort detector under active/active sharding -> split cohort.
+
+        Sharding partitions by series key, so a cohort's members hash to
+        different shards and each shard's Cohort detector sees only its
+        own slice of the population — a wrong baseline. Warn (don't fail)
+        so the operator moves cohort groups to an unsharded deployment or
+        accepts the partitioned comparison knowingly. Only fires when
+        this replica is genuinely sharded (``count > 1``).
+        """
+        if not self._is_sharded:
+            return
+        assert self._shard is not None  # narrowed by _is_sharded
+        for group in self._config.groups:
+            for query in group.queries:
+                for entry in query.detectors:
+                    try:
+                        cls = get(entry.name)
+                    except UnknownDetectorError:
+                        continue
+                    if is_cohort_aware(cls):
+                        logger.warning(
+                            "cohort_with_scaleout",
+                            group=group.name,
+                            query=query.id,
+                            detector=entry.name,
+                            instance=entry.instance,
+                            shards=self._shard.count,
+                            note=(
+                                "Cohort-aware detectors need cross-member "
+                                "visibility, but scaleOut sharding splits a "
+                                "cohort's members across shards so each shard "
+                                "scores against a partial population. Run "
+                                "cohort groups in a separate unsharded "
+                                "deployment, or accept the per-shard comparison."
+                            ),
+                        )
 
     def _check_cohort_with_auto_select(self) -> None:
         """Cohort + ``auto_select: true`` -> silently-suppressed output.
@@ -941,7 +1011,6 @@ class Runner:
                 qresult, plans = await self._fetch_and_plan(
                     group,
                     effective_query,
-                    inflight_series_count=out.series_count,
                     template_query=query,
                 )
         except SourceQueryError as exc:
@@ -991,7 +1060,12 @@ class Runner:
             out.dropped[REASON_CARDINALITY] = out.dropped.get(REASON_CARDINALITY, 0) + 1
             self._ops.series_dropped_total.labels(group=group.name, reason=REASON_CARDINALITY).inc()
 
-        if effective_query.expect:
+        # Whole-query ``expect`` absence is evaluated against the full
+        # fetch (so every shard agrees the query did/didn't return data),
+        # but emitted by only the group's owner shard. ``anomaly_signal_missing``
+        # carries the (id, group) join labels, so a per-shard duplicate
+        # would break the "sharding never multiplies series" contract.
+        if effective_query.expect and self._shard_owns_group(group.name):
             misses = self._store.record_expect_observation(
                 group.name, effective_query.id, has_results=bool(qresult.series)
             )
@@ -1008,13 +1082,26 @@ class Runner:
                     )
                 )
 
+        # Active/active scale-out: keep only the series this shard owns,
+        # then enforce max_total_series against that owned slice so the
+        # cap is per-shard (estate ceiling = max_total_series x shards).
+        # Sharding before the cap — not after — is what makes the cap
+        # per-shard rather than an estate-wide cap split N ways.
+        owned_series = self._shard_owned_series(qresult.series)
+        scored_series, capped = self._cap_to_total_series_budget(
+            group.name, owned_series, inflight=out.series_count
+        )
+        if capped:
+            out.dropped[REASON_CARDINALITY] = out.dropped.get(REASON_CARDINALITY, 0) + 1
+            self._ops.series_dropped_total.labels(group=group.name, reason=REASON_CARDINALITY).inc()
+
         # Cohort detectors need cross-member visibility. Build the
         # per-cohort baseline once here (rather than re-deriving it per
         # member) so every member sees the same numbers. Cheap no-op
         # when no plan in the query opts into ``cohort_aware``.
-        cohort_context = build_cohort_context(plans, qresult.series)
+        cohort_context = build_cohort_context(plans, scored_series)
 
-        for series in qresult.series:
+        for series in scored_series:
             out.series_count += 1
             produced = await self._score_series(
                 group=group,
@@ -1026,12 +1113,75 @@ class Runner:
             )
             out.samples.extend(produced)
 
+    @property
+    def _is_sharded(self) -> bool:
+        """True when this replica scores a strict subset of the estate."""
+        return self._shard is not None and self._shard.count > 1
+
+    def _shard_owned_series(self, series: list[QuerySeries]) -> list[QuerySeries]:
+        """Filter ``series`` to those this shard owns under scale-out.
+
+        Returns the input unchanged when sharding is off or single-shard.
+        Ownership is decided by rendezvous hashing on the series label
+        key, so every replica partitions the same fetched series into
+        disjoint, non-overlapping slices that union to the whole estate.
+        """
+        if not self._is_sharded:
+            return series
+        assert self._shard is not None  # narrowed by _is_sharded
+        return [s for s in series if self._shard.owns(s.label_key)]
+
+    def _shard_owns_group(self, group_name: str) -> bool:
+        """Whether this shard owns a group's whole-group emitted series.
+
+        Group-level signals that are not per-input-series — recurrence
+        heatmaps, and whole-query ``expect`` absence — must be emitted by
+        exactly one shard so the partition never multiplies a series. The
+        owner is chosen by hashing a synthetic per-group key, which
+        spreads ownership across shards rather than piling every group's
+        aggregates on shard 0. Always True when not sharded.
+        """
+        if not self._is_sharded:
+            return True
+        assert self._shard is not None  # narrowed by _is_sharded
+        return self._shard.owns((("__group__", group_name),))
+
+    def _shard_owns_key(self, key: tuple[tuple[str, str], ...]) -> bool:
+        """Whether this shard owns an arbitrary series/variant label key."""
+        if not self._is_sharded:
+            return True
+        assert self._shard is not None  # narrowed by _is_sharded
+        return self._shard.owns(key)
+
+    def _cap_to_total_series_budget(
+        self, group_name: str, series: list[QuerySeries], *, inflight: int
+    ) -> tuple[list[QuerySeries], bool]:
+        """Trim ``series`` to the remaining ``max_total_series`` budget.
+
+        Applied to the shard-owned series so the cap is enforced **per
+        shard**: each replica scores up to ``max_total_series`` of its own
+        slice, making the estate ceiling ``max_total_series x shards`` (as
+        documented for scale-out). With no sharding the owned set is the
+        whole fetch, so behaviour is identical to the single-replica cap.
+        The cross-group budget reads other groups' sticky owned counts
+        plus this group's in-flight owned count.
+        """
+        cap = self._config.safety.max_total_series
+        if not cap:
+            return series, False
+        other_groups_total = sum(
+            count for name, count in self._last_series_count.items() if name != group_name
+        )
+        running_budget = max(0, cap - other_groups_total - inflight)
+        if len(series) > running_budget:
+            return series[:running_budget], True
+        return series, False
+
     async def _fetch_and_plan(
         self,
         group: GroupConfig,
         query: QueryConfig,
         *,
-        inflight_series_count: int = 0,
         template_query: QueryConfig | None = None,
     ) -> tuple[QueryResult, list[_DetectorPlan]]:
         defaults = self._config.defaults
@@ -1086,20 +1236,12 @@ class Runner:
                 max_series=self._config.safety.max_series_per_query,
             )
 
-        # Enforce max_total_series across all groups + queries in the
-        # current pass. Each group runs in its own scheduler tick, so
-        # "total so far" reads from:
-        #   - the latest successful series counts of *other* groups
-        #     (sticky in self._last_series_count), plus
-        #   - whatever this group has already accumulated in this pass.
-        cap = self._config.safety.max_total_series
-        if cap:
-            other_groups_total = sum(
-                count for name, count in self._last_series_count.items() if name != group.name
-            )
-            running_budget = max(0, cap - other_groups_total - inflight_series_count)
-            if len(result.series) > running_budget:
-                result = QueryResult(series=result.series[:running_budget], truncated=True)
+        # The cross-group max_total_series cap is NOT applied here: it is
+        # enforced in _process_query_variant *after* the shard filter, so
+        # the cap counts only the series this shard actually scores (a
+        # per-shard cap). _fetch_and_plan returns the full fetch so the
+        # caller can still evaluate whole-query signals (expect: absence)
+        # against the complete result before sharding.
         return result, plans
 
     def _merge_params(
@@ -2027,6 +2169,20 @@ class Runner:
         if result.succeeded:
             self._ops.group_memory_bytes.labels(group=result.group).set(
                 estimate_samples_bytes(result.samples)
+            )
+            # Canonical write of the sticky per-group series count (drives
+            # the cross-group max_total_series cap and the shard gauge
+            # below). Must precede the shard-series-count sum so the gauge
+            # reflects this run.
+            self._last_series_count[result.group] = result.series_count
+        # Scale-out: expose how many series this shard scored across all
+        # groups so an operator can confirm the partition is even. Set
+        # only in sharded mode — a single-shard replica owns everything,
+        # so the gauge would just mirror the global series total.
+        if self._is_sharded:
+            assert self._shard is not None  # narrowed by _is_sharded
+            self._ops.shard_series_count.labels(shard=str(self._shard.index)).set(
+                float(sum(self._last_series_count.values()))
             )
 
 

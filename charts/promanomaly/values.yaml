@@ -17,6 +17,8 @@ replicaCount: 1        # in single-replica mode this MUST stay at 1.
                        # to bump (typically to 2 or 3) and the chart
                        # automatically flips to a RollingUpdate strategy
                        # via the override below.
+                       # Ignored when scaleOut.enabled=true — the
+                       # StatefulSet runs exactly scaleOut.shards replicas.
 
 strategy:
   # Recreate is correct for the single-replica MVP. The chart's helper
@@ -105,6 +107,15 @@ safety:
   # Only honoured when on_source_failure: fail_ready. A single
   # transient TSDB blip must not take the pod out of the service.
   fail_ready_after: 3
+  # Priority-aware load shedding. Unset (null) leaves group scheduling
+  # unbounded — every group runs on its own cadence with no admission
+  # control. Set to an integer to cap how many groups run at once; under
+  # TSDB backpressure the scheduler then prefers higher-priority groups
+  # and sheds (skips) low-priority runs that can't get a slot within
+  # their refresh interval, surfacing them on
+  # anomaly_group_skipped_total{reason="backpressure"}. See
+  # docs/operations/degraded-modes.md.
+  maxConcurrentGroups: null
   # In-process LRU+TTL cache for overlapping PromQL responses. The
   # Redis-backed HA variant is selected with ``backend: redis`` and
   # requires the ``redis:`` block below. See docs/operations.md for
@@ -149,6 +160,24 @@ highAvailability:
   renew_deadline: 10s
   retry_period: 2s
   snapshot_ttl: 5m
+
+# Active/active horizontal scale-out. Orthogonal to (and mutually
+# exclusive with) highAvailability: HA is active/passive (one leader does
+# all detection), scale-out is active/active (``shards`` replicas each
+# score a disjoint slice of the series via rendezvous hashing and run
+# concurrently). When enabled the chart renders a StatefulSet instead of
+# the Deployment so each pod gets a stable ordinal — the shard index,
+# self-assigned from POD_NAME with no per-pod config — plus a headless
+# Service for stable pod DNS. ``replicaCount`` is ignored in this mode;
+# the StatefulSet runs exactly ``shards`` replicas. Remember that
+# ``safety.max_total_series`` becomes a PER-SHARD cap, so the estate
+# ceiling is ``max_total_series x shards`` (see docs/operations.md).
+scaleOut:
+  enabled: false
+  shards: 1
+  # Leave unset so each pod derives its index from its StatefulSet
+  # ordinal. Pin only for non-StatefulSet topologies.
+  shard_index: null
 
 defaults:
   window: 1h
@@ -437,3 +466,11 @@ prometheusRule:
       enabled: true
       for: 5m
       severity: critical
+    # AnomalyGroupStarved fires when the priority-aware scheduler sheds
+    # group runs under sustained backpressure (safety.max_concurrent_groups)
+    # or a group overruns its refresh interval. A skip delays a score, it
+    # never suppresses a detected anomaly. Dormant unless shedding occurs.
+    anomalyGroupStarved:
+      enabled: true
+      for: 15m
+      severity: warning

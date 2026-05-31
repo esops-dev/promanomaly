@@ -86,6 +86,13 @@ class GroupCostEstimate:
     recurrence_queries_per_day: float = 0.0
     memory_bytes: float = 0.0
     cpu_cores: float = 0.0
+    # Effective refresh cadence (per-group override or server default) and
+    # the derived short-query rate. Per-group cadences make a raw
+    # per-refresh count misleading — a 30s group and a 5m group issuing
+    # one query each are 10x apart in TSDB load — so the rate is what an
+    # operator sizes the backend against.
+    refresh_interval_seconds: float = 0.0
+    short_queries_per_minute: float = 0.0
     queries: list[QueryCostEstimate] = field(default_factory=list)
 
 
@@ -94,6 +101,7 @@ def estimate_query_cost(
     cfg: Config,
     group_name: str,
     query: Any,
+    refresh_seconds: float | None = None,
 ) -> QueryCostEstimate:
     """Project one query's worst-case cost without touching the TSDB.
 
@@ -157,10 +165,16 @@ def estimate_query_cost(
     # more (or less) work this query's longest window implies.
     anchor_points = max(default_window / step_seconds, 1.0)
     work_factor = _nlogn(window_points) / _nlogn(int(anchor_points))
-    refresh_seconds = max(cfg.server.refresh_interval_seconds, 1e-9)
+    # A faster per-group cadence packs more passes per minute, so the
+    # steady-state CPU scales inversely with the *group's* refresh, not
+    # the server default. Falls back to the server default when unset.
+    effective_refresh = (
+        refresh_seconds if refresh_seconds is not None else (cfg.server.refresh_interval_seconds)
+    )
+    effective_refresh = max(effective_refresh, 1e-9)
     cpu_cores = (
         (projected_series * detector_count / _ANCHOR_SERIES)
-        * (_ANCHOR_REFRESH_SECONDS / refresh_seconds)
+        * (_ANCHOR_REFRESH_SECONDS / effective_refresh)
         * work_factor
     )
 
@@ -183,9 +197,15 @@ def estimate_cost(cfg: Config) -> list[GroupCostEstimate]:
     """Project per-group cost across the whole config."""
     groups: list[GroupCostEstimate] = []
     for group in cfg.groups:
-        gest = GroupCostEstimate(group=group.name)
+        refresh_seconds = cfg.group_refresh_seconds(group)
+        gest = GroupCostEstimate(group=group.name, refresh_interval_seconds=refresh_seconds)
         for query in group.queries:
-            qest = estimate_query_cost(cfg=cfg, group_name=group.name, query=query)
+            qest = estimate_query_cost(
+                cfg=cfg,
+                group_name=group.name,
+                query=query,
+                refresh_seconds=refresh_seconds,
+            )
             gest.queries.append(qest)
             gest.projected_series += qest.projected_series
             gest.short_queries_per_refresh += qest.short_queries_per_refresh
@@ -193,6 +213,12 @@ def estimate_cost(cfg: Config) -> list[GroupCostEstimate]:
             gest.stratified_baseline_queries_per_day += qest.stratified_baseline_queries_per_day
             gest.memory_bytes += qest.memory_bytes
             gest.cpu_cores += qest.cpu_cores
+        # Short-query rate folds the per-group cadence in so a too-aggressive
+        # per-group interval shows up as outsized TSDB load pre-deploy.
+        if refresh_seconds > 0:
+            gest.short_queries_per_minute = round(
+                gest.short_queries_per_refresh * 60.0 / refresh_seconds, 2
+            )
         # Recurrence analysis: one TSDB range query per refresh_interval
         # (not per group refresh), amortised to queries-per-day.
         if group.recurrence.enabled:
@@ -215,6 +241,7 @@ def run_estimate_cost(cfg: Config, *, strict: bool) -> int:
     total_memory = 0.0
     total_cpu = 0.0
     short_total = 0
+    short_per_minute_total = 0.0
     probe_total = 0
     stratified_total = 0.0
     recurrence_total = 0.0
@@ -224,6 +251,7 @@ def run_estimate_cost(cfg: Config, *, strict: bool) -> int:
         total_memory += gest.memory_bytes
         total_cpu += gest.cpu_cores
         short_total += gest.short_queries_per_refresh
+        short_per_minute_total += gest.short_queries_per_minute
         probe_total += gest.discovery_probe_queries_per_refresh
         stratified_total += gest.stratified_baseline_queries_per_day
         recurrence_total += gest.recurrence_queries_per_day
@@ -233,7 +261,9 @@ def run_estimate_cost(cfg: Config, *, strict: bool) -> int:
             "group": gest.group,
             "status": "estimate",
             "projected_series": gest.projected_series,
+            "refresh_interval_seconds": gest.refresh_interval_seconds,
             "short_queries_per_refresh": gest.short_queries_per_refresh,
+            "short_queries_per_minute": gest.short_queries_per_minute,
             "discovery_probe_queries_per_refresh": (gest.discovery_probe_queries_per_refresh),
             "stratified_baseline_queries_per_day": round(
                 gest.stratified_baseline_queries_per_day, 2
@@ -257,6 +287,7 @@ def run_estimate_cost(cfg: Config, *, strict: bool) -> int:
         "max_total_series": cfg.safety.max_total_series,
         "over_budget": over_budget,
         "short_queries_per_refresh": short_total,
+        "short_queries_per_minute": round(short_per_minute_total, 2),
         "discovery_probe_queries_per_refresh": probe_total,
         "stratified_baseline_queries_per_day": round(stratified_total, 2),
         "recurrence_queries_per_day": round(recurrence_total, 2),

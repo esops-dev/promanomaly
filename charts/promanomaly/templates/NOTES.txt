@@ -10,6 +10,19 @@ hot-reloads on change (validation failure rolls back automatically).
 
 Datasource:
   URL: {{ .Values.datasource.url }}
+{{- if .Values.scaleOut.enabled }}
+
+Scale-out (active/active sharding) is ENABLED:
+  - A StatefulSet of {{ .Values.scaleOut.shards }} shard(s) is running; each pod
+    scores a disjoint slice of the series (shard index from its ordinal).
+  - safety.max_total_series is a PER-SHARD cap, so the estate ceiling is
+    max_total_series x shards. Size it per shard, not for the whole estate.
+  - To resize, change scaleOut.shards (the StatefulSet replicas follow it);
+    do NOT ``kubectl scale`` the StatefulSet directly.
+  - Set max_series_per_query above your largest single query's cardinality:
+    a query truncated at that cap shards non-deterministically.
+  See docs/operations.md (Horizontal Scale-Out).
+{{- end }}
 
 Config schema: this chart renders ``apiVersion: promanomaly.io/v1``
 (stable since the v1.0 release). The legacy ``promanomaly.io/v1alpha1``
