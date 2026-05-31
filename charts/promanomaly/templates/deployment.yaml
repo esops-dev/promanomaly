@@ -1,4 +1,10 @@
 {{- /*
+  Single-replica / active-passive HA topology renders a Deployment.
+  Active/active scale-out (``scaleOut.enabled``) renders a StatefulSet
+  instead (statefulset.yaml) so each replica gets a stable shard ordinal.
+*/ -}}
+{{- if not .Values.scaleOut.enabled -}}
+{{- /*
   Bearer-token Secret mounts for the active push sink(s). The scalar
   ``sink:`` form mounts a single Secret at /etc/promanomaly-sink-auth; the
   ``sinks:`` list form mounts each sink's Secret under its own
@@ -151,3 +157,4 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+{{- end }}

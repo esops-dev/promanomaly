@@ -280,6 +280,96 @@ Two new operational metrics:
 
 **Sizing.** Three replicas is the typical HA setup. Anything past that is leader-election overhead without benefit — only one replica runs detectors at any moment.
 
+## Horizontal Scale-Out (active/active sharding)
+
+HA mode is **active/passive**: leader election guarantees exactly one replica runs detection, which is correct but caps total throughput at a single process. When one process can no longer score the whole estate within a refresh interval, switch to **active/active scale-out**: `N` replicas each own a disjoint shard of the series and run concurrently.
+
+```yaml
+scaleOut:
+  enabled: true
+  shards: 3        # run 3 replicas, each scoring ~1/3 of the series
+```
+
+The two modes are **mutually exclusive** — `scaleOut.enabled` and `highAvailability.enabled` both `true` is rejected at boot. Pick by question:
+
+| Question | Mode |
+|----------|------|
+| "I want redundancy; one process can keep up." | **HA** (active/passive) |
+| "One process can't score everything within a refresh." | **Scale-out** (active/active) |
+
+How it works:
+
+- **Stable shard index.** The chart renders a **StatefulSet** of `shards` pods (`pod-0`…`pod-N-1`); each derives its shard index from the pod ordinal in `POD_NAME` — no per-pod config. (Pin `scaleOut.shard_index` only for non-StatefulSet topologies.)
+- **Series partition.** Each replica computes a **rendezvous hash** (highest-random-weight) of every candidate series key and scores only the series that hash to its shard. The partition is disjoint and the union covers the whole estate. The hash is process-stable (BLAKE2b, not Python's salted `hash`), so all replicas agree on ownership.
+- **Resharding is minimal.** Scaling `shards` up or down moves only ~`1/shards` of the series (the consistent-hashing property), and a newly-started pod runs its first detection pass *immediately* on boot, so a moved series is re-scored on acquisition rather than after a tick — mirroring the HA failover rule.
+- **Scraping.** The regular `Service` selects every shard's pod, so the existing `ServiceMonitor` collects all shards; their `/metrics` union is the whole estate. A headless Service (`<name>-headless`) backs the StatefulSet's stable DNS.
+
+Two operational metrics expose the partition:
+
+- `anomaly_shard{instance="<pod>"}` — the shard index this replica owns.
+- `anomaly_shard_series_count{shard="<n>"}` — series scored by that shard, so you can confirm the partition is even.
+
+**`max_total_series` becomes a per-shard cap.** Each replica enforces `safety.max_total_series` against *its own* shard's series (the cap is applied after the shard filter), so the whole-estate ceiling is `max_total_series × shards`. Size it as `(expected total series / shards) × headroom`, not the whole estate — see the sizing table in the [production checklist](production-checklist.md).
+
+**Set `max_series_per_query` above your largest single query's cardinality.** `max_series_per_query` is a *per-query fetch* ceiling applied at the TSDB, **before** sharding — every shard fetches the same (TSDB-ordered) first `max_series_per_query` series and then keeps its slice. So sharding distributes scoring *within* that ceiling; it cannot scale a single query beyond it. Worse, if a query *truncates* (you'll see `anomaly_series_dropped_total{reason="cardinality_overflow"}`), different shards may fetch different truncated subsets and the partition is no longer guaranteed complete. Keep `max_series_per_query` comfortably above any single query's true cardinality so no query truncates; scale the *estate* by adding more queries/series, not by relying on sharding to subset one oversized query.
+
+**No per-shard redundancy.** Scale-out is throughput, not availability — there is no leader/follower within a shard. If a shard's pod is down, that shard's slice of the estate goes unscored until Kubernetes reschedules it (Prometheus staleness handles the gap), and that shard's owner-only signals (recurrence, `expect:`/discovery absence) pause with it. Layer a `PodDisruptionBudget` and sane resource requests on the StatefulSet; if you need both redundancy *and* horizontal scale, that's a future "leader-per-shard" direction, not this release.
+
+**Scaling — change `scaleOut.shards`, not the replica count.** The chart ties the StatefulSet's `replicas` to `scaleOut.shards`, so resizing is a single Helm value change that moves both together. Do **not** `kubectl scale` the StatefulSet directly: dropping replicas below `shards` orphans a shard's series (no pod owns that index and those series go unscored), and adding replicas past `shards` makes the extra pod fail at boot (its ordinal is out of range). Keep replicas == shards.
+
+**TSDB query load is not reduced by sharding.** PromQL returns all of a metric's series, so every shard still runs the *full* query and then discards the series it doesn't own — sharding scales detection *compute*, not query throughput. If the TSDB read volume is the constraint, enable a shared query cache (`safety.query_cache.backend: redis` + `safety.redis.url`) so the shards' identical fetches collapse onto one TSDB hit per cache bucket.
+
+**Group-level rollups under sharding.** A few signals are whole-group aggregates rather than per-series, and are handled so the partition never multiplies a series:
+
+- **`anomaly_density`** (fleet density rollup) is **suppressed** in sharded mode — each shard sees only its slice, so an in-process value would be a partial fraction. Compute true fleet density with a recording rule over the per-series `anomaly_outside_threshold` (the shard union is complete), per [patterns](patterns.md).
+- **Recurrence** heatmaps and **`expect:` / discovery `anomaly_signal_missing`** are emitted by a single *owner shard* (chosen by hashing the group / series identity), so each appears exactly once across the fleet. Recurrence re-reads the complete history from the TSDB, so the single copy is correct.
+
+**Limitation — cohort detectors.** Sharding partitions by series key, so a cohort's members hash to different shards and each shard's Cohort detector would see only a partial population. Run cohort groups in a separate unsharded deployment (or accept the per-shard comparison). The detector logs `cohort_with_scaleout` at boot when it detects this combination.
+
+## Per-Group Refresh Intervals
+
+`server.refresh_interval` sets the default cadence for every group. A group can override it so cheap fast-moving signals and expensive stratified/cohort groups coexist in one detector without a global compromise:
+
+```yaml
+server:
+  refresh_interval: 1m       # default for groups without an override
+groups:
+  - name: error_rates
+    refresh_interval: 30s     # score hot signals more often
+    queries: [ ... ]
+  - name: stratified_latency
+    refresh_interval: 5m      # expensive multi-week baseline — refresh rarely
+    queries: [ ... ]
+```
+
+- An unset group `refresh_interval` falls back to `server.refresh_interval` — default behaviour is unchanged.
+- The per-group lock already prevents a group's runs from overlapping; each group runs on its own scheduler cadence.
+- The `refresh_interval >= window/6` quality guard is enforced **per group** at boot — a too-tight override logs `aggressive_refresh_interval{group}` just like a too-tight server default.
+- Stratified detectors' separate baseline-refresh cadence is independent and composes with the per-group short-window cadence.
+- `validate --estimate-cost` accounts for per-group cadences — each group reports its `refresh_interval_seconds` and a `short_queries_per_minute` rate, so a too-aggressive interval shows up as outsized TSDB load before deploy.
+
+## Priority-Aware Scheduling and Load Shedding
+
+By default group scheduling is unbounded — every group runs on its cadence with no admission control. When the TSDB is occasionally slow or throttled, cap concurrency so the detector protects its most important groups first:
+
+```yaml
+safety:
+  max_concurrent_groups: 4    # at most 4 groups run at once
+groups:
+  - name: critical_slos
+    priority: 10              # admitted ahead of lower-priority groups under load
+    queries: [ ... ]
+```
+
+Under contention the scheduler orders pending runs by `priority` (the same field that drives cardinality overflow) and, when a group can't get a slot within its refresh interval, **sheds** the run rather than queuing unboundedly. Shedding is visible, never silent:
+
+- `anomaly_group_skipped_total{group, reason="backpressure"}` — no slot within the interval under `max_concurrent_groups`.
+- `anomaly_group_skipped_total{group, reason="overrun"}` — the previous run was still in flight at the next tick.
+
+A skip **delays** a score; it never **suppresses** a detected anomaly — the last good snapshot stays in place per `serve_stale`, and the `AnomalyGroupStarved` reference alert fires on sustained shedding. This is a *scheduling* concern, not a *silencing* one; see [degraded-modes](operations/degraded-modes.md).
+
+The cap governs *scheduled ticks*. The immediate first run fired on boot, on HA leader-acquisition, and after a config reload runs every group once regardless, so `/metrics` is populated promptly even with a low cap; admission control kicks in from the first scheduled tick onward. (Reload is operator-triggered, so a reload of a many-group config briefly fans out all groups at once — size the TSDB for that burst, or stagger heavy groups across deployments.)
+
 ## Dynamic Series Discovery
 
 Hand-writing one query per cohort member doesn't scale past a handful of services. `discover:` lets one templated query fan out across the distinct values of a label at runtime:

@@ -277,6 +277,7 @@ class OperationalMetrics:
         self._declare_runner_metrics()
         self._declare_cache_metrics()
         self._declare_leader_metrics()
+        self._declare_scaleout_metrics()
         self._declare_discovery_metrics()
         self._declare_self_observability_metrics()
         self._declare_selftest_metrics()
@@ -363,6 +364,18 @@ class OperationalMetrics:
             ["group", "detector"],
             registry=self.registry,
         )
+        self.group_skipped_total = Counter(
+            "anomaly_group_skipped_total",
+            (
+                "Group runs skipped by the priority-aware scheduler, bucketed by "
+                "reason: 'backpressure' (no concurrency slot within the refresh "
+                "interval under safety.max_concurrent_groups) or 'overrun' (the "
+                "previous run was still in flight at the next tick). A skip delays "
+                "a score; it never suppresses a detected anomaly."
+            ),
+            ["group", "reason"],
+            registry=self.registry,
+        )
 
     # ------------------------------------------------------------------
     # Cache-owned metrics. Cardinality is bounded — one set of series per
@@ -411,6 +424,25 @@ class OperationalMetrics:
             "anomaly_leader_transitions_total",
             "Total times this replica has acquired the leader Lease.",
             ["instance"],
+            registry=self.registry,
+        )
+
+    # ------------------------------------------------------------------
+    # Scale-out metrics (active/active sharding only). Cardinality is
+    # bounded — one ``anomaly_shard`` series per replica and one
+    # ``anomaly_shard_series_count`` series per shard index.
+    # ------------------------------------------------------------------
+    def _declare_scaleout_metrics(self) -> None:
+        self.shard = Gauge(
+            "anomaly_shard",
+            "Shard index owned by this replica in scaleOut mode (0 in single-shard mode).",
+            ["instance"],
+            registry=self.registry,
+        )
+        self.shard_series_count = Gauge(
+            "anomaly_shard_series_count",
+            "Series scored by this shard across all groups in the latest runs.",
+            ["shard"],
             registry=self.registry,
         )
 

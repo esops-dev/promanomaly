@@ -1,5 +1,6 @@
-{{- if .Values.highAvailability.enabled -}}
-# Lease-API permissions required by the HA leader-election loop.
+{{- if and .Values.highAvailability.enabled (not .Values.scaleOut.enabled) -}}
+# Lease-API permissions required by the HA leader-election loop. Never
+# emitted in scale-out mode (active/active sharding needs no Lease).
 # Only the get/list/watch/create/update verbs on coordination.k8s.io
 # Leases are required — no cluster-scoped permissions, scoped to a
 # single Lease resource by name. Renders only when HA is enabled so

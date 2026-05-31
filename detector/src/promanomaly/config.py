@@ -446,9 +446,62 @@ class HighAvailabilityConfig(_ModelBase):
         return parse_duration(self.snapshot_ttl)
 
 
+class ScaleOutConfig(_ModelBase):
+    """Active/active horizontal sharding via consistent hashing.
+
+    Orthogonal to :class:`HighAvailabilityConfig`. HA mode is
+    active/passive — one leader runs the scheduler, followers serve a
+    cached ``/metrics`` — which caps total detection throughput at a
+    single process. Scale-out mode is active/active: ``shards`` replicas
+    each own a disjoint slice of the series (assigned by rendezvous /
+    highest-random-weight hashing on the series key) and run
+    concurrently, so throughput scales horizontally. The union of the
+    replicas' ``/metrics`` covers the whole estate.
+
+    Off by default (``shards: 1``, ``enabled: false``) — the MVP topology
+    is a single replica. The two modes are mutually exclusive: enabling
+    both is rejected at load time (leader-per-shard layering is a
+    documented future direction, not this release).
+
+    Each replica's ``shard_index`` is resolved at boot from the
+    StatefulSet pod ordinal (the trailing ``-N`` of ``POD_NAME``); set
+    ``shard_index`` explicitly only for non-StatefulSet topologies or
+    tests. ``max_total_series`` becomes a *per-shard* cap, so the whole
+    estate's ceiling is ``max_total_series x shards`` — see
+    docs/operations.md for sizing.
+    """
+
+    enabled: bool = False
+    # Total number of shards the estate is partitioned across. With a
+    # StatefulSet this equals the replica count. Rendezvous hashing keeps
+    # resharding on a count change to ~1/shards of the keys.
+    shards: int = Field(default=1, ge=1)
+    # Explicit shard index override. Normally unset — the runtime derives
+    # it from the pod ordinal so each replica self-assigns. Must be in
+    # ``[0, shards)`` when set; validated at load time.
+    shard_index: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_index_in_range(self) -> ScaleOutConfig:
+        if self.shard_index is not None and self.shard_index >= self.shards:
+            raise ValueError(
+                f"scaleOut.shard_index={self.shard_index} must be < scaleOut.shards={self.shards}"
+            )
+        return self
+
+
 class SafetyConfig(_ModelBase):
     max_series_per_query: int = Field(default=1000, ge=1)
     max_total_series: int = Field(default=20000, ge=1)
+    # Upper bound on how many groups run concurrently. ``None`` (default)
+    # leaves group scheduling unbounded — every group runs on its own
+    # cadence with no admission control, the historical behaviour. When
+    # set, a priority-aware gate admits at most this many group runs at
+    # once; under saturation lower-``priority`` groups are shed (skipped,
+    # never queued unboundedly) and the skip is surfaced on
+    # ``anomaly_group_skipped_total{reason="backpressure"}``. See
+    # docs/operations/degraded-modes.md.
+    max_concurrent_groups: int | None = Field(default=None, ge=1)
     detect_timeout: Duration = "5s"
     on_source_failure: Literal["serve_stale", "drop_scores", "fail_ready"] = "serve_stale"
     # Only consulted in fail_ready mode: after this many consecutive
@@ -913,6 +966,13 @@ class GroupConfig(_ModelBase):
     ensemble: EnsembleConfig | None = None
     auto_select: AutoSelect = False
     auto_select_interval: Duration = "24h"
+    # Per-group refresh cadence override. ``None`` (default) falls back to
+    # ``server.refresh_interval``. Lets a cheap fast-moving group (error
+    # rates every 30s) and an expensive stratified/cohort group (every 5m)
+    # coexist in one detector without a global compromise. The per-group
+    # lock already prevents overlap; the ``refresh_interval >= window/6``
+    # quality guard is enforced per group at boot.
+    refresh_interval: Duration | None = None
     recurrence: RecurrenceConfig = Field(default_factory=RecurrenceConfig)
     # Per-group tenant override. When set, this tenant header is injected
     # on every PromQL request for this group instead of the datasource-level
@@ -924,6 +984,18 @@ class GroupConfig(_ModelBase):
     @property
     def auto_select_interval_seconds(self) -> float:
         return parse_duration(self.auto_select_interval)
+
+    @property
+    def refresh_interval_override_seconds(self) -> float | None:
+        """This group's explicit refresh cadence in seconds, or ``None``.
+
+        ``None`` signals the caller to fall back to
+        ``server.refresh_interval``; see
+        :meth:`Config.group_refresh_seconds`.
+        """
+        if self.refresh_interval is None:
+            return None
+        return parse_duration(self.refresh_interval)
 
     @field_validator("name")
     @classmethod
@@ -969,6 +1041,7 @@ class Config(_ModelBase):
     defaults: DefaultsConfig = Field(default_factory=DefaultsConfig)
     exporter: ExporterConfig = Field(default_factory=ExporterConfig)
     highAvailability: HighAvailabilityConfig = Field(default_factory=HighAvailabilityConfig)
+    scaleOut: ScaleOutConfig = Field(default_factory=ScaleOutConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     # Optional push sink(s) active alongside the always-on ``/metrics``
     # exporter. Both default to pull-only.
@@ -1020,6 +1093,21 @@ class Config(_ModelBase):
         if self.sink is not None:
             return [self.sink]
         return []
+
+    @model_validator(mode="after")
+    def _validate_scaleout_exclusive_with_ha(self) -> Config:
+        # Active/active sharding and active/passive leader election are
+        # two answers to "how many replicas do detection work" and don't
+        # compose in this release (leader-per-shard is a documented
+        # future direction). Reject the combination at boot rather than
+        # let an operator deploy a topology whose behaviour is undefined.
+        if self.scaleOut.enabled and self.highAvailability.enabled:
+            raise ValueError(
+                "scaleOut.enabled and highAvailability.enabled are mutually exclusive; "
+                "scale-out is active/active sharding, HA is active/passive leader election. "
+                "Pick one (leader-per-shard layering is not supported in this release)."
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_ha_requires_redis(self) -> Config:
@@ -1091,6 +1179,19 @@ class Config(_ModelBase):
             raise ValueError(f"duplicate group name: {names}")
         return groups
 
+    def group_refresh_seconds(self, group: GroupConfig) -> float:
+        """Effective refresh cadence for ``group`` in seconds.
+
+        Returns the group's own ``refresh_interval`` when set, else falls
+        back to ``server.refresh_interval``. Single source of truth for
+        the scheduler, the cost estimator, and the aggressive-refresh
+        guard so per-group cadence is computed identically everywhere.
+        """
+        override = group.refresh_interval_override_seconds
+        if override is not None:
+            return override
+        return self.server.refresh_interval_seconds
+
     @property
     def aggressive_refresh(self) -> bool:
         # Operational guard: ``refresh_interval`` should be at least
@@ -1098,8 +1199,28 @@ class Config(_ModelBase):
         # six or more passes per window's worth of data and the rolling
         # baseline lags. The roadmap is explicit that this is a warning,
         # not a hard fail — main.py logs at boot when this returns True.
+        # Reflects the *server* default; per-group overrides are surfaced
+        # separately via :meth:`aggressive_refresh_groups`.
         floor = self.defaults.window_seconds / 6.0
         return self.server.refresh_interval_seconds < floor
+
+    def aggressive_refresh_groups(self) -> list[tuple[str, float]]:
+        """Groups whose effective refresh is below the ``window/6`` floor.
+
+        Returns ``(group_name, effective_refresh_seconds)`` for every
+        group running too aggressively for its rolling window — including
+        groups that inherit an aggressive server default. The boot path
+        logs one ``aggressive_refresh_interval`` line per entry so a
+        too-tight per-group override is as visible as a too-tight global
+        one.
+        """
+        floor = self.defaults.window_seconds / 6.0
+        offending: list[tuple[str, float]] = []
+        for group in self.groups:
+            effective = self.group_refresh_seconds(group)
+            if effective < floor:
+                offending.append((group.name, effective))
+        return offending
 
 
 def load_config(path: str | Path) -> Config:

@@ -20,7 +20,7 @@
     "replicaCount": {
       "type": "integer",
       "minimum": 1,
-      "description": "Replica count. Single-replica mode requires 1; bump only when highAvailability.enabled=true."
+      "description": "Replica count. Single-replica mode requires 1; bump only when highAvailability.enabled=true. Ignored when scaleOut.enabled=true (the StatefulSet runs scaleOut.shards replicas)."
     },
     "highAvailability": {
       "type": "object",
@@ -32,6 +32,15 @@
         "renew_deadline": {"type": "string"},
         "retry_period": {"type": "string"},
         "snapshot_ttl": {"type": "string"}
+      }
+    },
+    "scaleOut": {
+      "type": "object",
+      "description": "Active/active horizontal sharding. Mutually exclusive with highAvailability; renders a StatefulSet of `shards` replicas, each scoring a disjoint slice of the series.",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "shards": {"type": "integer", "minimum": 1},
+        "shard_index": {"type": ["integer", "null"], "minimum": 0}
       }
     },
     "datasource": {
@@ -128,6 +137,7 @@
         "query_timeout": {"type": "string"},
         "on_source_failure": {"type": "string", "enum": ["serve_stale", "drop_scores", "fail_ready"]},
         "fail_ready_after": {"type": "integer", "minimum": 1},
+        "maxConcurrentGroups": {"type": ["integer", "null"], "minimum": 1},
         "max_stratified_cache_entries": {"type": "integer", "minimum": 1},
         "query_cache": {
           "type": "object",

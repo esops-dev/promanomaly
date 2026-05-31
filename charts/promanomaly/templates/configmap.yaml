@@ -105,6 +105,9 @@ data:
       {{- with .Values.safety.fail_ready_after }}
       fail_ready_after: {{ . }}
       {{- end }}
+      {{- with .Values.safety.maxConcurrentGroups }}
+      max_concurrent_groups: {{ . }}
+      {{- end }}
       {{- with .Values.safety.query_cache }}
       query_cache:
         enabled: {{ .enabled }}
@@ -133,6 +136,19 @@ data:
       renew_deadline: {{ .Values.highAvailability.renew_deadline | quote }}
       retry_period: {{ .Values.highAvailability.retry_period | quote }}
       snapshot_ttl: {{ .Values.highAvailability.snapshot_ttl | quote }}
+    {{- end }}
+    {{- if .Values.scaleOut.enabled }}
+    scaleOut:
+      enabled: true
+      shards: {{ .Values.scaleOut.shards }}
+      {{- /*
+        shard_index is normally left unset: each replica self-assigns from
+        its StatefulSet pod ordinal (POD_NAME, injected via the Downward
+        API). Only rendered when an operator pins it explicitly.
+      */}}
+      {{- with .Values.scaleOut.shard_index }}
+      shard_index: {{ . }}
+      {{- end }}
     {{- end }}
     defaults:
       window: {{ .Values.defaults.window | quote }}

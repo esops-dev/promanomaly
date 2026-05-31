@@ -16,12 +16,24 @@ A single 1-CPU replica comfortably handles **~10 000 series at 1-minute refresh*
 | 1 000 – 10 000   | 1 m     | 1     | 512 Mi | 1 or 2 (HA)       |
 | 10 000 – 25 000  | 1 m     | 2     | 1 Gi   | 2 (HA)            |
 | 25 000 – 50 000  | 2 m     | 4     | 2 Gi   | 2–3 (HA)          |
-| > 50 000         | varies  | —     | —      | Shard by group    |
+| > 50 000         | varies  | —     | —      | Scale out (shard) |
 
 **Always run** `promanomaly validate --config <file> --estimate-cost` for a config-specific projection (projected series, TSDB queries per refresh, and coarse CPU/memory estimate).
 
 **Refresh-interval impact**  
-CPU scales linearly with `1 / refresh_interval`. Keep `refresh_interval` no smaller than `defaults.window / 6` (the detector warns on aggressive settings).
+CPU scales linearly with `1 / refresh_interval`. Keep `refresh_interval` no smaller than `defaults.window / 6` (the detector warns on aggressive settings). With per-group `refresh_interval` overrides, the cost estimator reports each group's `short_queries_per_minute` so a fast group's load is visible at PR time.
+
+**Scaling past one process (`scaleOut`)**  
+A single process — HA leader included — caps detection at what one CPU can score within a refresh. Past that ceiling, switch to active/active scale-out: `shards` replicas each score `total / shards` series. Sizing extends the single-replica model by dividing the estate across shards:
+
+| Total series | Mode | `scaleOut.shards` | Per-shard series | Per-shard CPU | `max_total_series` |
+|--------------|------|-------------------|------------------|---------------|--------------------|
+| ≤ 50 000     | HA (active/passive) | — | (whole estate) | as above | whole-estate cap |
+| 50 000 – 150 000 | Scale-out | 3 | ~`total/3` | 2 | per-shard (`total/3 × headroom`) |
+| 150 000 – 300 000 | Scale-out | 6 | ~`total/6` | 2 | per-shard |
+| > 300 000    | Scale-out | `ceil(total / 50 000)` | ~50 000 | 2 | per-shard |
+
+`safety.max_total_series` is enforced **per shard** in scale-out mode, so the whole-estate ceiling is `max_total_series × shards`. Size each shard's cap as `(expected total / shards) × headroom`, not the whole estate. Contrast with HA, where one replica enforces the cap against the whole estate. See [Horizontal Scale-Out](operations.md#horizontal-scale-out-activeactive-sharding).
 
 **Stratified detectors** add TSDB reads (not CPU). The cost estimator reports `stratified_baseline_queries_per_day` separately.
 
@@ -31,7 +43,8 @@ CPU scales linearly with `1 / refresh_interval`. Keep `refresh_interval` no smal
 |----------------------------|--------------------------------------------------|-------------|
 | **A. Single-replica Recreate** | < 10 k series, brief `/metrics` gap OK during deploys | `replicaCount: 1`<br>`strategy: Recreate`<br>`highAvailability.enabled: false` |
 | **B. HA leader-elected**   | Need continuous `/metrics` availability          | `replicaCount: 2`<br>`highAvailability.enabled: true`<br>`safety.redis.url: …` |
-| **C. Multi-cluster**       | Many clusters (per-cluster or federated)         | See [multi-cluster reference architectures](architecture/multi-cluster.md) |
+| **C. Active/active scale-out** | One process can't score the estate within a refresh | `scaleOut.enabled: true`<br>`scaleOut.shards: N` (renders a StatefulSet) |
+| **D. Multi-cluster**       | Many clusters (per-cluster or federated)         | See [multi-cluster reference architectures](architecture/multi-cluster.md) |
 
 ## Production-Readiness Checklist
 

@@ -39,6 +39,7 @@ All failures increment `anomaly_failures_total{group, detector, reason}` (bounde
 | Detector degrading            | `anomaly_detect_success_ratio{window="1h"} < 0.9`   | Inspect failures by detector |
 | Dead detection pipeline       | `anomaly_selftest_ok == 0` (opt-in self-test)        | Check threshold / exporter regression / global misconfig |
 | Leader churn (HA)             | `rate(anomaly_leader_transitions_total[15m]) > 2`    | Check Lease contention / pod restarts |
+| Group starvation (shedding)   | `rate(anomaly_group_skipped_total[15m]) > 0`         | Raise max_concurrent_groups / lengthen refresh / scale out |
 
 ## TSDB Read Failure
 
@@ -113,10 +114,34 @@ The detect/threshold/export path is failing to surface a known anomaly: check fo
 **Recovery**  
 Check Lease contention, pod restarts, and `lease_duration` / `retry_period` tuning. Brief churn is safe; sustained churn wastes runs.
 
+## Group Starvation (load shedding)
+
+When `safety.max_concurrent_groups` is set, the scheduler is a priority-aware gate: under sustained TSDB backpressure it admits at most that many group runs at once, prefers higher-`priority` groups, and **sheds** (skips) a run rather than queuing it unboundedly. Like every other degraded mode here, shedding is **visible, never silent** — a skip delays a score, it never suppresses a detected anomaly (the last good snapshot stays in place per `serve_stale`).
+
+| Reason | Meaning |
+|--------|---------|
+| `backpressure` | No concurrency slot freed within the group's refresh interval under `max_concurrent_groups`. |
+| `overrun` | The group's previous run was still in flight when the next tick fired (it can't keep up with its own cadence). |
+
+**Detection**  
+`rate(anomaly_group_skipped_total[15m]) > 0`
+
+**Recovery**  
+Sustained shedding means the detector is starved of capacity for the load. Options, cheapest first:
+
+- Raise `safety.max_concurrent_groups` (if CPU/TSDB headroom exists).
+- Lengthen the starved group's `refresh_interval` (per-group override) so it demands fewer passes.
+- Split the group's heavy queries, or move expensive stratified/cohort groups to their own deployment.
+- Scale out (`scaleOut.enabled`) so multiple replicas share the work.
+
+A `backpressure` skip on a **low**-priority group while high-priority groups stay fresh is the gate working as designed — raise the starved group's `priority` only if it genuinely matters more.
+
+**Shipped alert:** `AnomalyGroupStarved`
+
 ## Putting It Together
 
 - **Page** on `AnomalySourceFailing`, `AnomalyStale`, `AnomalySnapshotStale`, and (if the self-test is enabled) `AnomalyPipelineDead`.
-- **Ticket** on `AnomalyDetectorDegraded`.
+- **Ticket** on `AnomalyDetectorDegraded` and `AnomalyGroupStarved`.
 
 All other silencing, deploy damping, and flap suppression belongs in Alertmanager (silences + `for:` clauses).
 
