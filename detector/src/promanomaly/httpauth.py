@@ -132,7 +132,7 @@ class _CloudAuthEventHook:
                 ) from exc
             gcp_cfg = self._auth.gcp
             if gcp_cfg and gcp_cfg.credentials_file:
-                self._gcp_credentials, _ = google.auth.load_credentials_from_file(
+                self._gcp_credentials, _ = google.auth.load_credentials_from_file(  # type: ignore[no-untyped-call, unused-ignore]
                     gcp_cfg.credentials_file,
                     scopes=["https://www.googleapis.com/auth/monitoring.read"],
                 )
