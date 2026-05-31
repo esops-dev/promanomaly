@@ -49,6 +49,27 @@ def test_wasserstein_statistic() -> None:
     assert float(row["score"]) > 0.0
 
 
+def test_energy_statistic() -> None:
+    detector = DistributionShift()
+    df = variance_shift(n=200, noise_low=0.1, noise_high=2.0, change_at=100)
+    row = detector.fit_score(df, "", {"statistic": "energy"}).iloc[-1]
+    assert float(row["score"]) > 0.0
+
+
+def test_energy_is_not_wasserstein() -> None:
+    # The "energy" statistic must compute the energy distance, not alias
+    # the Wasserstein branch. They share the MAD normalisation but are
+    # distinct two-sample distances, so their scores on a shifted window
+    # must differ (regression guard: the energy branch previously called
+    # wasserstein_distance and produced byte-identical scores).
+    detector = DistributionShift()
+    df = variance_shift(n=200, noise_low=0.1, noise_high=2.0, change_at=100)
+    energy = float(detector.fit_score(df, "", {"statistic": "energy"}).iloc[-1]["score"])
+    wasserstein = float(detector.fit_score(df, "", {"statistic": "wasserstein"}).iloc[-1]["score"])
+    assert energy > 0.0
+    assert energy != pytest.approx(wasserstein)
+
+
 def test_invalid_statistic_raises() -> None:
     detector = DistributionShift()
     df = clean_baseline(n=100)

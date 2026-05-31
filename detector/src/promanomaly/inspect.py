@@ -72,6 +72,13 @@ def parse_label_selector(value: str | None) -> dict[str, str]:
     Returns an empty dict for ``None`` or the empty string — meaning
     "match anything", consistent with how ``promtool query`` treats an
     empty matcher.
+
+    Values may be bare (``endpoint=/api/users``) or quoted
+    (``endpoint="/api/users"``) — matching surrounding single or double
+    quotes are stripped. ``/metrics`` renders label values *with* quotes
+    and operators think in PromQL, so accepting the quoted form avoids a
+    silent zero-match when a selector is copy-pasted from a scrape or a
+    PromQL matcher.
     """
     if not value:
         return {}
@@ -87,11 +94,18 @@ def parse_label_selector(value: str | None) -> dict[str, str]:
             )
         key, _, val = raw.partition("=")
         key = key.strip()
-        val = val.strip()
+        val = _strip_matching_quotes(val.strip())
         if not key:
             raise InspectError("bad_selector", f"label selector entry {raw!r}: empty key")
         selector[key] = val
     return selector
+
+
+def _strip_matching_quotes(val: str) -> str:
+    """Drop one layer of matching surrounding single or double quotes."""
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+        return val[1:-1]
+    return val
 
 
 def _resolve(config: Config, metric_id: str) -> _ResolvedQuery:

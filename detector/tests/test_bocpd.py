@@ -118,3 +118,34 @@ def test_change_point_column_present() -> None:
     df = clean_baseline(n=120)
     row = detector.fit_score(df, "", {}).iloc[-1]
     assert "change_point" in row.index
+
+
+def test_short_window_does_not_saturate() -> None:
+    """A window no longer than ``lag`` must not fire a spurious change-point.
+
+    The score is the posterior mass at run lengths <= lag; when the window
+    has <= lag samples every run length is "recent", so without a guard the
+    cumulative mass is trivially ~1.0 and fires on any signal. A clean
+    baseline that short must report no change-point.
+    """
+    detector = BOCPD()
+    df = clean_baseline(n=12, mean=10.0, noise=0.1)  # n <= default lag (15)
+    row = detector.fit_score(df, "", {}).iloc[-1]
+    assert float(row["score"]) == 0.0
+    assert not bool(row["change_point"])
+    assert not bool(row["is_outside"])
+    # The baseline is still a usable estimate of the (single) regime mean.
+    assert float(row["baseline"]) == pytest.approx(10.0, abs=1.0)
+
+
+def test_short_window_guard_respects_lag_param() -> None:
+    # With a smaller lag the same window is long enough to leave a tail,
+    # so the guard does not suppress scoring.
+    detector = BOCPD()
+    df = clean_baseline(n=12, mean=10.0, noise=0.1)
+    guarded = detector.fit_score(df, "", {"lag": 15}).iloc[-1]
+    scored = detector.fit_score(df, "", {"lag": 3}).iloc[-1]
+    assert float(guarded["score"]) == 0.0
+    # lag=3 leaves run-length states beyond the recent window, so the
+    # detector computes a real (here still-low, clean-baseline) score.
+    assert float(scored["score"]) < 0.5

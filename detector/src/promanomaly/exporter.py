@@ -15,6 +15,7 @@ private :class:`CollectorRegistry`.
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from collections import defaultdict
@@ -95,6 +96,22 @@ _HELP: dict[str, tuple[str, str]] = {
         (
             "Detector baseline value (rolling median for MAD, local median for "
             "Hampel, cross-cohort median for Cohort)."
+        ),
+    ),
+    "anomaly_baseline_upper": (
+        "gauge",
+        (
+            "Upper edge of the detector's expected band, when the detector "
+            "models an explicit interval (e.g. STLResidualMAD). Omitted by "
+            "detectors that emit only a point baseline."
+        ),
+    ),
+    "anomaly_baseline_lower": (
+        "gauge",
+        (
+            "Lower edge of the detector's expected band, when the detector "
+            "models an explicit interval (e.g. STLResidualMAD). Omitted by "
+            "detectors that emit only a point baseline."
         ),
     ),
     "anomaly_warming_up": (
@@ -222,12 +239,31 @@ def render_label_value(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
+def render_value(value: float) -> str:
+    """Render a float in Prometheus exposition form.
+
+    Non-finite values map to the canonical ``NaN`` / ``+Inf`` / ``-Inf``
+    tokens the exposition format defines. Python's default float
+    stringification emits lowercase ``nan`` / ``inf`` / ``-inf``; Go's
+    ``ParseFloat`` (and VictoriaMetrics) accept those case-insensitively,
+    but the canonical spelling keeps ``/metrics`` portable across every
+    Prometheus-compatible parser rather than relying on that leniency.
+    Finite values stringify unchanged.
+    """
+    if math.isfinite(value):
+        return repr(value)
+    if math.isnan(value):
+        return "NaN"
+    return "+Inf" if value > 0 else "-Inf"
+
+
 def _format_sample(sample: Sample) -> str:
     """One ``metric{labels} value`` line."""
+    value = render_value(sample.value)
     if sample.labels:
         label_pairs = ",".join(f'{k}="{render_label_value(v)}"' for k, v in sample.labels)
-        return f"{sample.metric}{{{label_pairs}}} {sample.value}"
-    return f"{sample.metric} {sample.value}"
+        return f"{sample.metric}{{{label_pairs}}} {value}"
+    return f"{sample.metric} {value}"
 
 
 def render_samples(samples: Iterable[Sample]) -> str:

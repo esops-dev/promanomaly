@@ -8,10 +8,16 @@ outliers.
 This is still baseline detection, not forecasting: it scores residuals
 against historical structure, it does not predict future values.
 
-Score is the ratio of the ESD test statistic to the critical value —
-values above 1.0 indicate the residual is an outlier at the configured
-significance level. Normalised so the default
-``alert_thresholds.score=3.0`` fires on clearly significant outliers.
+Score is the ratio of the ESD test statistic to the critical value: a
+score of ~1.0 means the latest residual sits exactly at the configured
+``alpha`` significance boundary, and higher scores are progressively more
+extreme outliers. Note this scale differs from the sigma-multiplier scale
+of MAD/Hampel — the universal default ``alert_thresholds.score=3.0`` is
+deliberately conservative here (it fires only well past the significance
+boundary), so groups that want firing at the ESD significance level should
+set a lower per-query/per-detector ``alert_thresholds.score`` (e.g. ~1.0).
+The detector leaves ``is_outside`` to the runner's threshold check rather
+than asserting its own significance verdict.
 """
 
 from __future__ import annotations

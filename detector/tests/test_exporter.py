@@ -51,6 +51,23 @@ def test_label_escaping() -> None:
     assert render_label_value("line\nbreak") == "line\\nbreak"
 
 
+def test_non_finite_values_use_canonical_tokens() -> None:
+    # The exposition format requires NaN / +Inf / -Inf (Python's default
+    # float stringification emits lowercase nan / inf / -inf). Render the
+    # canonical spelling so /metrics is portable across every parser.
+    samples = [
+        Sample(metric="anomaly_score", labels=(("id", "n"),), value=float("nan")),
+        Sample(metric="anomaly_score", labels=(("id", "p"),), value=float("inf")),
+        Sample(metric="anomaly_score", labels=(("id", "m"),), value=float("-inf")),
+    ]
+    out = render_samples(samples)
+    assert 'anomaly_score{id="n"} NaN' in out
+    assert 'anomaly_score{id="p"} +Inf' in out
+    assert 'anomaly_score{id="m"} -Inf' in out
+    # No lowercase leakage.
+    assert " nan" not in out and " inf" not in out and " -inf" not in out
+
+
 def test_render_rejects_colon_in_metric() -> None:
     samples = [Sample(metric="bad:name", labels=(), value=1.0)]
     with pytest.raises(InvalidMetricNameError):

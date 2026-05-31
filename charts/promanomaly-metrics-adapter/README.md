@@ -1,50 +1,35 @@
-# promanomaly-metrics-adapter
+# promanomaly Metrics Adapter
 
-An **opt-in** Kubernetes external/custom metrics adapter for promanomaly.
+An **opt-in**, stateless Kubernetes external/custom metrics adapter for promanomaly.
 
-It is a stateless aggregated apiserver that re-serves the anomaly metrics
-the detector already wrote to the TSDB through
-`external.metrics.k8s.io` / `custom.metrics.k8s.io`, so your existing HPA
-and KEDA tooling can consume anomaly signal like any other metric.
+It re-exposes the anomaly metrics written by the detector to the TSDB through the standard Kubernetes `external.metrics.k8s.io` and `custom.metrics.k8s.io` APIs. This lets HPA and KEDA scale on anomaly signals exactly like any other metric.
 
-promanomaly stays the metrics **provider**; the autoscaler stays the
-**decision-maker**. The adapter never makes a reaction decision itself.
+promanomaly is the **metrics provider**. The autoscaler remains the **decision maker**.
 
-## Guard-rails (read first)
+## Guard-rails (Read First)
 
-Anomaly signal is a *sharp* scaling input. Wire it carefully:
+Anomaly signals are sharp scaling inputs. Use them carefully:
 
-- **Scale on `anomaly_density`**, not raw `anomaly_score`. "Add workers
-  when the backlog is anomalously deep" is sound; "scale on how
-  anomalous a latency metric looks" *amplifies* incidents — a latency
-  spike scales you up, which can deepen the spike.
-- **Gate on `anomaly_confidence_score` and `anomaly_duration_seconds`.**
-  React to sustained, high-confidence anomalies, not single-tick blips.
-- **Always pair an anomaly-driven scaler with a reactive fallback HPA**
-  (CPU/memory or queue length). If the detector or TSDB is unavailable,
-  the fallback keeps the workload safe.
+- **Scale on `anomaly_density`** (fraction of a group that is anomalous), not raw `anomaly_score`.
+- **Gate on `anomaly_severity`** (already includes confidence and duration).
+- **Always pair** an anomaly-driven scaler with a traditional reactive HPA fallback (CPU, memory, or queue depth).
 
-The default `metrics` list deliberately omits scaling presets for
-`anomaly_score`. Worked recipes with these guard-rails baked in live in
-[`examples/k8s/`](../../examples/k8s/).
+Safe configuration examples are in [`examples/k8s/`](../../examples/k8s/).
 
-## What it exposes
+## Exposed Metrics
 
-| Metric | Good for |
-| --- | --- |
-| `anomaly_density` | Fraction of a group currently anomalous — the recommended scaling input. |
-| `anomaly_severity` | Operator-facing 0-1 severity; gate scaling on it. |
-| `anomaly_active_series` | Count of firing series in a group. |
-| `anomaly_outside_threshold` | Per-series firing flag (0/1). |
+| Metric                        | Recommended Use                              |
+|-------------------------------|----------------------------------------------|
+| `anomaly_density`             | Primary scaling signal (fraction anomalous)  |
+| `anomaly_severity`            | 0–1 normalized severity for gating           |
+| `anomaly_active_series`       | Count of currently firing series             |
+| `anomaly_outside_threshold`   | Per-series 0/1 firing flag                   |
 
-Both API groups are served:
+Both API groups are supported:
+- `external.metrics.k8s.io` — recommended for KEDA and HPA `External` metrics.
+- `custom.metrics.k8s.io` — for HPA `Object` and `Pods` metrics.
 
-- **`external.metrics.k8s.io`** — cluster-scoped, the path KEDA's
-  `external` trigger and HPA `External` metric source use. Recommended.
-- **`custom.metrics.k8s.io`** — the same signals associated with objects
-  (pods, namespaces) for HPA `Object`/`Pods` rules.
-
-## Install
+## Quick Install
 
 ```bash
 helm install promanomaly-adapter charts/promanomaly-metrics-adapter \
@@ -52,45 +37,37 @@ helm install promanomaly-adapter charts/promanomaly-metrics-adapter \
   --set datasource.url=http://victoriametrics.monitoring.svc:8428/
 ```
 
-Verify:
+Verify it is registered:
 
 ```bash
 kubectl get apiservices | grep metrics.k8s.io
+
 kubectl get --raw "/apis/external.metrics.k8s.io/v1beta1" | jq .
 ```
 
 ## TLS
 
-The aggregation layer only talks HTTPS to an APIService backend, so a
-serving cert is mandatory.
+The Kubernetes aggregation layer requires HTTPS.
 
-- **Default**: the chart mints a self-signed CA + serving cert and wires
-  the APIService `caBundle` to it. Simple, but it **regenerates on every
-  `helm upgrade`** (a brief reconcile blip).
-- **Rotation-free**: set `tls.existingSecret` to a `kubernetes.io/tls`
-  Secret (e.g. from cert-manager) and `tls.caBundle` to its CA. No churn.
-- **Skip verification**: `apiService.insecureSkipTLSVerify: true` if you
-  accept the aggregation layer not verifying the adapter cert.
+The chart can:
+- Automatically generate a self-signed serving certificate (default, simple).
+- Use an existing `kubernetes.io/tls` Secret via `tls.existingSecret` (recommended for production, e.g. from cert-manager).
 
-## Key values
+## Key Configuration Values
 
-| Key | Default | Description |
-| --- | --- | --- |
-| `datasource.url` | `http://victoriametrics:8428/` | TSDB the detector writes to. |
-| `datasource.auth.type` | `none` | `none`/`bearer`/`basic`/`mtls`. |
-| `datasource.auth.existingSecret` | `""` | Secret with the credential (keys: `token`/`password`/`ca.crt`+`tls.crt`+`tls.key`), mounted and referenced by file. |
-| `metrics` | the four above | Anomaly metrics to expose. |
-| `customResources` | `[pods, namespaces]` | Object kinds for custom metrics. |
-| `tls.existingSecret` | `""` | Use a managed serving cert instead of generating one. |
-| `apiService.enabled` | `true` | Register the two APIService objects. |
-| `apiService.insecureSkipTLSVerify` | `false` | Skip aggregation-layer cert verification. |
-| `rbac.create` | `true` | auth-delegator + auth-reader + HPA metrics-reader RBAC. |
-| `networkPolicy.enabled` | `true` | Restrict ingress to the serving port. |
+| Key                                 | Default                  | Description |
+|-------------------------------------|--------------------------|-------------|
+| `datasource.url`                    | —                        | URL of the TSDB written by the detector |
+| `datasource.auth.type`              | `none`                   | `none` / `bearer` / `basic` / `mtls` |
+| `datasource.auth.existingSecret`    | `""`                     | Secret containing credentials |
+| `metrics`                           | Core anomaly metrics     | Metrics to expose |
+| `customResources`                   | `[pods, namespaces]`     | Kubernetes objects for custom metrics |
+| `tls.existingSecret`                | `""`                     | Use a managed TLS Secret |
+| `apiService.insecureSkipTLSVerify`  | `false`                  | Skip TLS verification (not recommended in production) |
+| `networkPolicy.enabled`             | `true`                   | Restrict ingress |
 
-## How it differs from k8s-prometheus-adapter
+## How It Differs from prometheus-adapter
 
-This adapter is purpose-built for the bounded set of anomaly metrics
-promanomaly emits, with the guard-rails documented above. It reads the
-same TSDB the detector writes to and translates label selectors directly
-into PromQL matchers. For arbitrary Prometheus metrics, use the
-general-purpose [prometheus-adapter](https://github.com/kubernetes-sigs/prometheus-adapter).
+This adapter is purpose-built and opinionated specifically for promanomaly’s anomaly metrics. It includes built-in guard-rails and directly translates label selectors into PromQL.
+
+For exposing arbitrary Prometheus metrics, use the general-purpose [prometheus-adapter](https://github.com/kubernetes-sigs/prometheus-adapter) instead.

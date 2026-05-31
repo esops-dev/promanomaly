@@ -114,8 +114,11 @@ class DistributionShift:
             mad = float(np.median(np.abs(baseline - baseline_median)))
             score = dist / mad if mad > 0.0 else 0.0
         elif statistic == "energy":
-            # Energy distance approximation via sorted samples.
-            dist = float(stats.wasserstein_distance(baseline, recent))
+            # Energy distance: sensitive to differences across the whole
+            # distribution (not just the optimal-transport cost Wasserstein
+            # measures), normalised by the baseline MAD like the
+            # Wasserstein branch so the two share a score scale.
+            dist = float(stats.energy_distance(baseline, recent))
             mad = float(np.median(np.abs(baseline - baseline_median)))
             score = dist / mad if mad > 0.0 else 0.0
         else:

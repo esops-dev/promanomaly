@@ -740,6 +740,14 @@ values.
   ESD pass searches for.
 - `alpha` (default `0.05`) — significance level for the ESD test.
 
+**Score scale.** The score is the ESD test statistic divided by its
+critical value: ~1.0 means the latest residual sits exactly at the
+`alpha` significance boundary, and higher is more extreme. This is **not**
+the sigma-multiplier scale that `MAD`/`Hampel` use, so the universal
+default `alert_thresholds.score: 3.0` is conservative here — it fires only
+well past significance. To fire at the ESD significance level, set a lower
+per-query (or per-detector) `alert_thresholds.score`, e.g. `1.0`.
+
 **When to choose it.** Strongly seasonal signals where you want
 robust outlier detection that doesn't false-fire on the daily shape.
 More powerful than `HourOfDayMAD` for detecting subtle outliers in
