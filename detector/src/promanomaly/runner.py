@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextvars
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -93,6 +94,7 @@ REASON_DETECTOR_EXCEPTION = "detector_exception"
 REASON_INSUFFICIENT_DATA = "insufficient_data"
 REASON_UNKNOWN_DETECTOR = "unknown_detector"
 REASON_QUERY_EXCEPTION = "query_exception"
+REASON_SERIES_EXCEPTION = "series_exception"
 REASON_CARDINALITY = "cardinality_overflow"
 
 # Per-dimension cap on the fleet-density slice partition
@@ -1103,14 +1105,36 @@ class Runner:
 
         for series in scored_series:
             out.series_count += 1
-            produced = await self._score_series(
-                group=group,
-                query=effective_query,
-                plans=plans,
-                series=series,
-                defaults=defaults,
-                cohort_context=cohort_context,
-            )
+            # Per-series failure isolation: the per-detector loop inside
+            # _score_series guards the detector math, but the surrounding
+            # threshold/ensemble/label/format code runs unguarded. A single
+            # malformed series must not abort scoring of the remaining
+            # series in this query or the rest of the group's run (the
+            # documented "one failure doesn't cascade" contract). Catch
+            # Exception — not BaseException — so leader-demotion task
+            # cancellation still propagates.
+            try:
+                produced = await self._score_series(
+                    group=group,
+                    query=effective_query,
+                    plans=plans,
+                    series=series,
+                    defaults=defaults,
+                    cohort_context=cohort_context,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "series_failed",
+                    group=group.name,
+                    query=effective_query.id,
+                    error=str(exc),
+                )
+                self._ops.failures_total.labels(
+                    group=group.name,
+                    detector="",
+                    reason=REASON_SERIES_EXCEPTION,
+                ).inc()
+                continue
             out.samples.extend(produced)
 
     @property
@@ -1633,6 +1657,18 @@ class Runner:
             samples.append(Sample(metric="anomaly_best_detector", labels=labels, value=1.0))
         if defaults.emit_baseline:
             samples.append(Sample(metric="anomaly_baseline", labels=labels, value=baseline))
+            # Optional baseline band. Only detectors that model an explicit
+            # interval (e.g. STLResidualMAD) populate these columns; the
+            # rest omit them. Emit each only when present and finite so a
+            # detector that doesn't produce a band never publishes a
+            # misleading 0.0 upper/lower edge.
+            for column, band_metric in (
+                ("baseline_upper", "anomaly_baseline_upper"),
+                ("baseline_lower", "anomaly_baseline_lower"),
+            ):
+                band = score_row.get(column)
+                if band is not None and math.isfinite(float(band)):
+                    samples.append(Sample(metric=band_metric, labels=labels, value=float(band)))
         if defaults.emit_duration:
             samples.append(
                 Sample(

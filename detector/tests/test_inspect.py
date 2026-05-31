@@ -44,6 +44,18 @@ def test_parse_label_selector_handles_empty_and_keys() -> None:
     assert parse_label_selector("a=1, b=2") == {"a": "1", "b": "2"}
 
 
+def test_parse_label_selector_strips_matching_quotes() -> None:
+    # /metrics renders label values with quotes and operators think in
+    # PromQL, so a copy-pasted quoted selector must match the same series
+    # as the bare form rather than silently matching nothing.
+    assert parse_label_selector('endpoint="/api/users"') == {"endpoint": "/api/users"}
+    assert parse_label_selector("endpoint='/api/users'") == {"endpoint": "/api/users"}
+    assert parse_label_selector('a="1", b=2') == {"a": "1", "b": "2"}
+    # Mismatched / non-enclosing quotes are left untouched.
+    assert parse_label_selector('a="1') == {"a": '"1'}
+    assert parse_label_selector('a=1"') == {"a": '1"'}
+
+
 def test_parse_label_selector_rejects_bare_key() -> None:
     with pytest.raises(InspectError) as exc:
         parse_label_selector("nope")

@@ -14,6 +14,7 @@ from promanomaly.exporter import OperationalMetrics
 from promanomaly.runner import (
     REASON_DETECTOR_EXCEPTION,
     REASON_QUERY_EXCEPTION,
+    REASON_SERIES_EXCEPTION,
     REASON_TIMEOUT,
     REASON_UNKNOWN_DETECTOR,
     Runner,
@@ -287,6 +288,113 @@ async def test_per_series_timeout_emits_counter(stub_source: StubSource) -> None
         ) == pytest.approx(1.0)
     finally:
         registry.unregister("Slow")
+
+
+@pytest.mark.asyncio
+async def test_per_series_exception_does_not_block_other_series(
+    stub_source: StubSource,
+) -> None:
+    # A failure in _score_series *outside* the guarded per-detector loop
+    # (threshold / ensemble / label / format code) must not abort scoring
+    # of the remaining series in the query — the "one failure doesn't
+    # cascade" contract. Simulate it by making _score_series raise for one
+    # series only.
+    good_a = clean_baseline(n=120)
+    good_b = point_spike(n=120)
+    stub_source.respond(
+        lambda _: StubResponse(
+            series=[
+                make_series({"instance": "host-a"}, good_a),
+                make_series({"instance": "host-b"}, good_b),
+            ]
+        )
+    )
+
+    cfg = _config(min_points=30)
+    runner, _store, ops = _runner(cfg, stub_source)
+
+    original = runner._score_series
+
+    async def flaky(*, series: Any, **kwargs: Any) -> Any:
+        if series.labels.get("instance") == "host-a":
+            raise RuntimeError("intentional series failure")
+        return await original(series=series, **kwargs)
+
+    runner._score_series = flaky  # type: ignore[method-assign]
+
+    result = await runner.run_group("g1")
+
+    assert result.succeeded
+    score_instances = {
+        s.label_dict["instance"] for s in result.samples if s.metric == "anomaly_score"
+    }
+    # host-b was scored even though host-a blew up.
+    assert "host-b" in score_instances
+    assert "host-a" not in score_instances
+    assert _collect(
+        ops,
+        "anomaly_failures_total",
+        labels={"detector": "", "reason": REASON_SERIES_EXCEPTION, "group": "g1"},
+    ) == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_baseline_band_emitted_when_detector_provides_it(
+    stub_source: StubSource,
+) -> None:
+    df = clean_baseline(n=120)
+    stub_source.respond(lambda _: StubResponse(series=[make_series({"instance": "h"}, df)]))
+
+    class BandDetector:
+        name: ClassVar[str] = "Band"
+        description: ClassVar[str] = "emits an explicit baseline band"
+        defaults: ClassVar[dict[str, Any]] = {}
+
+        def fit_score(self, df: pd.DataFrame, *_: Any, **__: Any) -> pd.DataFrame:
+            ts = float(df["timestamp"].iloc[-1])
+            return pd.DataFrame(
+                [
+                    {
+                        "timestamp": ts,
+                        "score": 0.0,
+                        "baseline": 10.0,
+                        "baseline_upper": 12.0,
+                        "baseline_lower": 8.0,
+                        "is_outside": False,
+                    }
+                ]
+            )
+
+    registry.register(BandDetector)  # type: ignore[arg-type]
+    try:
+        cfg = _config(detectors=[{"name": "Band"}])
+        runner, _store, _ops = _runner(cfg, stub_source)
+        result = await runner.run_group("g1")
+        assert result.succeeded
+        by_metric = {s.metric: s for s in result.samples if s.metric.startswith("anomaly_baseline")}
+        assert "anomaly_baseline_upper" in by_metric
+        assert "anomaly_baseline_lower" in by_metric
+        assert float(by_metric["anomaly_baseline_upper"].value) == pytest.approx(12.0)
+        assert float(by_metric["anomaly_baseline_lower"].value) == pytest.approx(8.0)
+    finally:
+        registry.unregister("Band")
+
+
+@pytest.mark.asyncio
+async def test_baseline_band_omitted_when_detector_has_no_band(
+    stub_source: StubSource,
+) -> None:
+    # MAD emits only a point baseline — the band metrics must not appear,
+    # so detectors that don't model a band never publish a bogus 0.0 edge.
+    df = clean_baseline(n=120)
+    stub_source.respond(lambda _: StubResponse(series=[make_series({"instance": "h"}, df)]))
+    cfg = _config(detectors=[{"name": "MAD"}])
+    runner, _store, _ops = _runner(cfg, stub_source)
+    result = await runner.run_group("g1")
+    metrics = {s.metric for s in result.samples}
+    assert "anomaly_baseline" in metrics
+    assert "anomaly_baseline_upper" not in metrics
+    assert "anomaly_baseline_lower" not in metrics
 
 
 @pytest.mark.asyncio

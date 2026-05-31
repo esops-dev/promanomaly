@@ -256,13 +256,25 @@ class BOCPD:
         # the cumulative mass at the recent run-lengths — the standard
         # way to surface the change-point signal from a BOCPD posterior.
         recent_lag = min(lag + 1, weights.size)
-        # Clamp into [0, 1] — the weights *should* be a normalised
-        # probability distribution, but the underlying floating-point
-        # logsumexp + scipy.special.gammaln path occasionally returns
-        # 1.0 + 1e-16 due to round-off. Clamping keeps the published
-        # score within the documented contract without changing the
-        # firing decision (the threshold is far from the edges).
-        cp_prob = float(min(1.0, max(0.0, weights[:recent_lag].sum())))
+        # Insufficient-points guard. The run-length posterior holds one
+        # more state than the number of observed samples, so when the
+        # window has no more than ``lag`` samples (``weights.size <=
+        # lag + 1``) the "recent" window already spans every run length.
+        # The cumulative mass is then trivially ~1.0 and would fire a
+        # spurious change-point on any signal — there is no older tail to
+        # contrast the recent mass against. Report no change-point in that
+        # regime, mirroring the other detectors' zero-score behaviour on
+        # too-short input. (Normally masked by ``min_points`` >> ``lag``.)
+        if weights.size <= lag + 1:
+            cp_prob = 0.0
+        else:
+            # Clamp into [0, 1] — the weights *should* be a normalised
+            # probability distribution, but the underlying floating-point
+            # logsumexp + scipy.special.gammaln path occasionally returns
+            # 1.0 + 1e-16 due to round-off. Clamping keeps the published
+            # score within the documented contract without changing the
+            # firing decision (the threshold is far from the edges).
+            cp_prob = float(min(1.0, max(0.0, weights[:recent_lag].sum())))
         # MAP-style baseline: weighted average of regime means by their
         # posterior run-length mass. Falls back to the overall mean if
         # the posterior is degenerate (all zero mass).

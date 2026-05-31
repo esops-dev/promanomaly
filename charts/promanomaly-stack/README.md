@@ -1,22 +1,29 @@
-# promanomaly-stack umbrella chart
+# promanomaly-stack Umbrella Chart
 
-Greenfield bundle: installs the [promanomaly](../promanomaly/README.md)
-detector plus a VictoriaMetrics single-node TSDB in one ``helm
-install``. Production users running an existing TSDB should install
-the ``promanomaly`` chart on its own and point its ``datasource.url``
-at their long-term TSDB instead.
+Greenfield bundle that installs the **promanomaly detector** + a **VictoriaMetrics single-node TSDB** in one `helm install`.
+
+> **Production note**: If you already have a VictoriaMetrics (or any Prometheus-compatible TSDB), install the plain [`promanomaly` chart](../promanomaly/README.md) instead and point `datasource.url` at your existing long-term store.
+
+## Quick Start
 
 ```bash
 helm repo add promanomaly https://esops-dev.github.io/promanomaly
+
 helm dependency update charts/promanomaly-stack
-helm install obs promanomaly/promanomaly-stack
+
+helm install obs promanomaly/promanomaly-stack \
+  --namespace monitoring \
+  --create-namespace
 ```
 
-Subchart values are nested under each subchart's name in
-``values.yaml``:
+## Configuration
+
+Subchart values are nested under each component:
 
 ```yaml
 promanomaly:
+  datasource:
+    url: http://{{ include "victoria-metrics-single.fullname" . }}:8428/
   groups:
     - name: example
       queries:
@@ -27,5 +34,10 @@ promanomaly:
 
 victoria-metrics-single:
   server:
-    retentionPeriod: 30
+    retentionPeriod: 30d          # adjust as needed
+    # ... other VM settings
 ```
+
+Full reference is in `charts/promanomaly-stack/values.yaml`.
+
+That’s it — one command gives you a working detector + storage for immediate testing or small-scale production. For larger setups, switch to the standalone `promanomaly` chart with your own TSDB.
