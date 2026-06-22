@@ -20,7 +20,7 @@ jobs:
       run:
         working-directory: detector
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -46,7 +46,7 @@ jobs:
       run:
         working-directory: detector
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: astral-sh/setup-uv@v7
         with:
@@ -73,7 +73,7 @@ jobs:
     # the unit tests, which stub the datasource.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Validate an example config via the action
         uses: ./
@@ -95,7 +95,7 @@ jobs:
       run:
         working-directory: community/promanomaly-prophet
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
@@ -131,7 +131,7 @@ jobs:
       run:
         working-directory: community/promanomaly-iforest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
@@ -160,7 +160,7 @@ jobs:
     name: Lint Helm charts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # chart-testing diffs against the base branch to find changed
           # charts; without history its --target-branch comparison sees
@@ -253,7 +253,7 @@ jobs:
     # diff automatically — no workflow change required.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Fetch promforecast LABELS_CONTRACT.md
         id: fetch
@@ -278,7 +278,7 @@ jobs:
     name: Build container image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: docker/setup-buildx-action@v4
 
